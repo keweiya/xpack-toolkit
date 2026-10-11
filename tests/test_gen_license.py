@@ -143,6 +143,33 @@ class DatabaseTests(unittest.TestCase):
         after = gen.preflight_database(str(self.db), serial_path=str(self.serial))
         self.assertEqual(after["licenseCount"], 1)
 
+    def test_child_nodes_migrate_to_new_license(self):
+        # 旧脚本证书绑定主节点 + 2 个子节点，重跑后子节点绑定迁移到新证书。
+        content, _ = gen.build("enterprise", "2099-12-31", 999, "YG",
+                               self.serial.read_text(), "lxware", 100000, False, True, "2.x")
+        text = gen.encode_license(content)
+        old = gen.row_from_content(content, text=text)
+        old["free_nodes"] = json.dumps([
+            {"id": 2, "addr": "192.168.1.2", "name": "node2", "isXpack": False},
+            {"id": 3, "addr": "192.168.1.3", "name": "node3", "isXpack": False},
+        ])
+        gen.apply_row(old, str(self.db), restart=False, serial_path=str(self.serial))
+
+        result = self._apply()
+        self.assertEqual(result["deleted"], 1)
+
+        # 新绑定证书继承了子节点绑定
+        with sqlite3.connect(self.db) as con:
+            con.row_factory = sqlite3.Row
+            master = str(con.execute("select id from nodes where name='local'").fetchone()["id"])
+            migrated = None
+            for raw in con.execute("select * from licenses"):
+                plain = gen.decrypt_row(dict(raw))
+                if plain.get("bind_node_id") == master:
+                    migrated = json.loads(plain.get("free_nodes") or "[]")
+            self.assertIsNotNone(migrated)
+            self.assertEqual(sorted(n["name"] for n in migrated), ["node2", "node3"])
+
     def test_serial_mismatch_rejected(self):
         content, _ = gen.build("enterprise", "2099-12-31", 999, "YG",
                                "f" * 32, "lxware", 100000, False, True, "2.x")

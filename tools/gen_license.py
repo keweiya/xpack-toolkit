@@ -330,6 +330,24 @@ def _is_toolkit_license(plain):
     return (content.get("annotations") or {}).get("lxware.cn/xpack-toolkit") == "true"
 
 
+def _collect_free_nodes(plain, out, seen):
+    """把一条已解密证书的子节点绑定列表并入 out（按 JSON 序列化去重）。"""
+    value = plain.get("free_nodes") or ""
+    if not value:
+        return
+    try:
+        nodes = json.loads(value)
+    except (ValueError, TypeError):
+        return
+    if not isinstance(nodes, list):
+        return
+    for node in nodes:
+        key = json.dumps(node, sort_keys=True, ensure_ascii=False)
+        if key not in seen:
+            seen.add(key)
+            out.append(node)
+
+
 def _unbound_value(stored):
     """bind_node_id 置空后的加密值。"""
     try:
@@ -410,6 +428,7 @@ def apply_row(row, db=XPACK_DB, restart=True, bind_node_id=None,
     """写库 + 绑定主节点。
 
     - 删除本工具之前生成的证书（带 xpack-toolkit 标记），避免重复累积；
+    - 旧脚本证书绑定的子节点（free_nodes）自动迁移到新证书；
     - 保留第三方/官方证书，若主节点已绑定则先解除绑定；
     - 插入新证书并绑定主节点。
 
@@ -426,15 +445,19 @@ def apply_row(row, db=XPACK_DB, restart=True, bind_node_id=None,
         con.execute("begin immediate")
         master_id = _master_id(con, bind_node_id)
 
-        # 盘点：本工具生成的证书直接删除；第三方/官方证书保留（主节点已绑定的先解绑）。
+        # 盘点：本工具生成的证书删除前先收集其子节点绑定（迁移到新证书）；
+        # 第三方/官方证书保留（主节点已绑定的先解绑）。
         unbound = 0
         deleted = 0
+        migrated_free_nodes = []
+        seen_free_nodes = set()
         for raw in [dict(r) for r in con.execute("select * from licenses").fetchall()]:
             try:
                 plain = _binding_fields(raw)
             except (ValueError, UnicodeError, TypeError):
                 plain = {}
             if _is_toolkit_license(plain):
+                _collect_free_nodes(plain, migrated_free_nodes, seen_free_nodes)
                 con.execute("delete from licenses where id=?", (raw["id"],))
                 deleted += 1
                 continue
@@ -451,8 +474,10 @@ def apply_row(row, db=XPACK_DB, restart=True, bind_node_id=None,
 
         _backup_database(db, backup)
 
-        # 绑定新证书：插入新行。
+        # 绑定新证书：继承旧脚本证书的子节点绑定（free_nodes），插入新行。
         row = dict(row, bind_node_id=master_id)
+        if migrated_free_nodes:
+            row["free_nodes"] = json.dumps(migrated_free_nodes)
         stamp = dt.datetime.now().astimezone().isoformat(" ")
         stored = encrypt_row(dict(row, updated_at=stamp, created_at=stamp))
         con.execute("insert into licenses (%s) values (%s)" % (
