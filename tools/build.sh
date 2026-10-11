@@ -128,7 +128,8 @@ for ARCH in "${ARCHES[@]}"; do
   # ---- 3) 清单（站点会逐项校验，不一致直接拒绝用）----
   note "生成 manifest.json"
   VERSION="$VERSION" ARCH="$ARCH" ORIG_SHA="$ORIG_SHA" REMOTE_BASE="$REMOTE_BASE" \
-    SIGN_CRT="$CERT" OUT="$WORK/manifest.json" CORE_OUT="$WORK/core" python3 - <<'PY'
+    SIGN_CRT="$CERT" OUT="$WORK/manifest.json" CORE_OUT="$WORK/core" \
+    CORE_MANIFEST="$WORK/core.manifest.json" python3 - <<'PY'
 import datetime, hashlib, json, os, pathlib, ssl
 core = pathlib.Path(os.environ["CORE_OUT"]).read_bytes()
 cert = pathlib.Path(os.environ["SIGN_CRT"])
@@ -139,7 +140,9 @@ man = {
     "size": len(core),
     "sha256": hashlib.sha256(core).hexdigest(),
     "orig_sha256": os.environ["ORIG_SHA"],
-    "patches": 5,
+    # 实际应用的补丁条数，从 patch_core.py 的清单里数，避免写死
+    "patches": len(json.loads(
+        pathlib.Path(os.environ["CORE_MANIFEST"]).read_text())["applied"]),
     "remote_base": os.environ["REMOTE_BASE"],
     "root_fingerprint": hashlib.sha256(
         ssl.PEM_cert_to_DER_cert(cert.read_text())).hexdigest(),
