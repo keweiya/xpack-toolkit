@@ -94,20 +94,39 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(result["status"], "Bound")
         self.assertTrue(result["offline"])
 
-    def test_reapply_preserves_and_unbinds(self):
+    def test_reapply_replaces_toolkit_license(self):
         self._apply()
         first = gen.preflight_database(str(self.db), serial_path=str(self.serial))
         self.assertEqual(first["licenseCount"], 1)
         self.assertEqual(len(first["boundLicenses"]), 1)
 
         result = self._apply()
-        self.assertEqual(result["unbound"], 1)  # 旧绑定已解除
+        self.assertEqual(result["deleted"], 1)  # 旧脚本证书被删除
+        self.assertEqual(result["unbound"], 0)  # 旧绑定随删除消失，无需解绑
 
         after = gen.preflight_database(str(self.db), serial_path=str(self.serial))
-        self.assertEqual(after["licenseCount"], 2)  # 旧证书保留，不删除
-        self.assertEqual(len(after["boundLicenses"]), 1)  # 仅新证书绑定
+        self.assertEqual(after["licenseCount"], 1)  # 只保留新脚本证书，不累积
+        self.assertEqual(len(after["boundLicenses"]), 1)
         self.assertEqual(after["boundLicenses"], [gen.verify_database(
             str(self.db), serial_path=str(self.serial))["licenseName"]])
+
+    def test_thirdparty_license_preserved_and_unbound(self):
+        # 第三方证书：不带 xpack-toolkit 标记，先绑定主节点。
+        content, _ = gen.build("enterprise", "2099-12-31", 999, "waaaater",
+                               self.serial.read_text(), "lxware", 100000, False, True, "2.x")
+        content["annotations"].pop("lxware.cn/xpack-toolkit", None)
+        text = gen.encode_license(content)
+        third = gen.row_from_content(content, text=text)
+        gen.apply_row(third, str(self.db), restart=False, serial_path=str(self.serial))
+
+        # 应用脚本证书：第三方保留、解绑，脚本证书插入并绑定。
+        result = self._apply()
+        self.assertEqual(result["deleted"], 0)   # 第三方不删除
+        self.assertEqual(result["unbound"], 1)   # 第三方的主节点绑定被解除
+
+        after = gen.preflight_database(str(self.db), serial_path=str(self.serial))
+        self.assertEqual(after["licenseCount"], 2)  # 第三方 + 脚本证书
+        self.assertEqual(len(after["boundLicenses"]), 1)
 
     def test_serial_mismatch_rejected(self):
         content, _ = gen.build("enterprise", "2099-12-31", 999, "YG",

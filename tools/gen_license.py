@@ -9,12 +9,14 @@ SIGN_KEY 时才做真实 RSA 签名，没有私钥就用占位符，内核不会
 授权内容：
     edition       enterprise（企业版）
     maxNodeCount  999
-    expiresAt     2099-12-31（永久）
+    expiresAt     9999-12-31（永久；product_pro 写 "0"）
     offline       true（不回连授权服务器）
-    annotations   lxware.cn/username=Bound, lxware.cn/edition=enterprise
+    annotations   lxware.cn/username=Bound, lxware.cn/edition=enterprise,
+                  lxware.cn/xpack-toolkit=true（脚本专属标记）
 
 写入数据库（xpack.db 的 licenses 表）时：
-    * 不删除、不移除任何既有证书/许可证行（保留原文）。
+    * 删除本工具之前生成的证书（带 xpack-toolkit 标记），避免重复累积；
+    * 保留第三方/官方证书，不删除、不移除；
     * 若主节点已绑定到其它证书，先把旧绑定解除（bind_node_id 置空）再绑定新证书；
       交互终端下可提示用户确认（--prompt-unbind），非交互默认自动解绑。
 
@@ -22,7 +24,7 @@ Usage:
   # 生成一份 999 节点、永久有效的企业版授权文件（不写库）
   python3 tools/gen_license.py --out /tmp/license.txt
 
-  # 直接写库 + 绑定主节点（保留旧证书，自动解除旧绑定）
+  # 直接写库 + 绑定主节点（删除脚本旧证书、保留第三方证书、自动解除旧绑定）
   python3 tools/gen_license.py --apply --db /opt/1panel/db/xpack.db
 
   # 只解析已有授权文件
@@ -225,6 +227,8 @@ def build(edition, expires, nodes, assignee, device_id, issuer,
             "lxware.cn/username": "Bound" if not trial else "Free",
             "lxware.cn/edition": edition,
             "lxware.cn/nodes": str(nodes),
+            # 本工具生成的证书专属标记：重跑时据此删除旧脚本证书，第三方/官方证书不受影响。
+            "lxware.cn/xpack-toolkit": "true",
         },
         "smsTotal": int(sms_total),
         "smsUsed": 0,
@@ -306,6 +310,18 @@ def _binding_fields(stored):
         return plain
 
 
+def _is_toolkit_license(plain):
+    """判断已解密的一行是否由本工具生成（license 内容带专属标记）。"""
+    text = plain.get("license") or ""
+    if not text:
+        return False
+    try:
+        content = decode_license(text)
+    except (ValueError, UnicodeError):
+        return False
+    return (content.get("annotations") or {}).get("lxware.cn/xpack-toolkit") == "true"
+
+
 def _unbound_value(stored):
     """bind_node_id 置空后的加密值。"""
     try:
@@ -370,8 +386,9 @@ def _backup_database(db, backup):
 
 
 class _ApplyResult(dict):
-    def __init__(self, backup, unbound=0, inserted=0, kept=0):
-        super().__init__(backup=backup, unbound=unbound, inserted=inserted, kept=kept)
+    def __init__(self, backup, unbound=0, inserted=0, kept=0, deleted=0):
+        super().__init__(backup=backup, unbound=unbound, inserted=inserted,
+                         kept=kept, deleted=deleted)
 
     def __fspath__(self):
         return self["backup"]
@@ -382,7 +399,11 @@ class _ApplyResult(dict):
 
 def apply_row(row, db=XPACK_DB, restart=True, bind_node_id=None,
               serial_path=None, prompt_unbind=False):
-    """写库 + 绑定主节点；保留全部既有证书，解除主节点的旧绑定。
+    """写库 + 绑定主节点。
+
+    - 删除本工具之前生成的证书（带 xpack-toolkit 标记），避免重复累积；
+    - 保留第三方/官方证书，若主节点已绑定则先解除绑定；
+    - 插入新证书并绑定主节点。
 
     ``prompt_unbind`` 为 True 且主节点已绑定时，先在交互终端询问是否解绑。
     """
@@ -397,14 +418,18 @@ def apply_row(row, db=XPACK_DB, restart=True, bind_node_id=None,
         con.execute("begin immediate")
         master_id = _master_id(con, bind_node_id)
 
-        # 盘点现有证书；主节点已绑定则先解除绑定（不删除任何行）。
-        rows = [dict(r) for r in con.execute("select * from licenses").fetchall()]
+        # 盘点：本工具生成的证书直接删除；第三方/官方证书保留（主节点已绑定的先解绑）。
         unbound = 0
-        for raw in rows:
+        deleted = 0
+        for raw in [dict(r) for r in con.execute("select * from licenses").fetchall()]:
             try:
                 plain = _binding_fields(raw)
             except (ValueError, UnicodeError, TypeError):
                 plain = {}
+            if _is_toolkit_license(plain):
+                con.execute("delete from licenses where id=?", (raw["id"],))
+                deleted += 1
+                continue
             if str(plain.get("bind_node_id") or "") == master_id:
                 if prompt_unbind:
                     answer = input("主节点已绑定证书「%s」，是否先解绑再绑定新证书？[Y/n] "
@@ -418,23 +443,13 @@ def apply_row(row, db=XPACK_DB, restart=True, bind_node_id=None,
 
         _backup_database(db, backup)
 
-        # 绑定新证书：优先复用同名行（保留既有字段），否则插入新行。
+        # 绑定新证书：插入新行。
         row = dict(row, bind_node_id=master_id)
-        existing = [r for r in rows if _binding_fields(r).get("license_name") == row["license_name"]]
-        inserted, kept = 0, 0
-        if existing:
-            stamp = dt.datetime.now().astimezone().isoformat(" ")
-            stored = encrypt_row(dict(row, updated_at=stamp))
-            keep_id = existing[0]["id"]
-            con.execute("update licenses set %s where id=?" % ",".join(
-                '"%s"=?' % k for k in stored), list(stored.values()) + [keep_id])
-            kept = 1
-        else:
-            stamp = dt.datetime.now().astimezone().isoformat(" ")
-            stored = encrypt_row(dict(row, updated_at=stamp, created_at=stamp))
-            con.execute("insert into licenses (%s) values (%s)" % (
-                ",".join(stored), ",".join("?" * len(stored))), list(stored.values()))
-            inserted = 1
+        stamp = dt.datetime.now().astimezone().isoformat(" ")
+        stored = encrypt_row(dict(row, updated_at=stamp, created_at=stamp))
+        con.execute("insert into licenses (%s) values (%s)" % (
+            ",".join(stored), ",".join("?" * len(stored))), list(stored.values()))
+        inserted, kept = 1, 0
 
         # 绑定 serial（不覆盖既有 serial）。
         if os.path.exists(serial_path):
@@ -457,7 +472,7 @@ def apply_row(row, db=XPACK_DB, restart=True, bind_node_id=None,
     if restart:
         subprocess.run(["systemctl", "restart", "1panel-core"], check=True)
         subprocess.run(["systemctl", "is-active", "--quiet", "1panel-core"], check=True)
-    return _ApplyResult(backup, unbound, inserted, kept)
+    return _ApplyResult(backup, unbound, inserted, kept, deleted)
 
 
 def verify_database(db=XPACK_DB, serial_path=None, bind_node_id=None):
@@ -577,8 +592,8 @@ def main():
         if a.apply:
             result = apply_row(row, a.db, not a.no_restart, a.bind_node_id,
                                a.serial_path, a.prompt_unbind)
-            print("已写入 %s（备份 %s）；解除旧绑定 %d，插入 %d，复用 %d"
-                  % (a.db, result["backup"], result["unbound"],
+            print("已写入 %s（备份 %s）；删除脚本旧证书 %d，解除旧绑定 %d，插入 %d，复用 %d"
+                  % (a.db, result["backup"], result["deleted"], result["unbound"],
                      result["inserted"], result["kept"]))
         return 0
 
@@ -610,8 +625,8 @@ def main():
     if a.apply:
         result = apply_row(row, a.db, not a.no_restart, a.bind_node_id,
                            a.serial_path, a.prompt_unbind)
-        print("已写入 %s（备份 %s）；解除旧绑定 %d，插入 %d，复用 %d"
-              % (a.db, result["backup"], result["unbound"],
+        print("已写入 %s（备份 %s）；删除脚本旧证书 %d，解除旧绑定 %d，插入 %d，复用 %d"
+              % (a.db, result["backup"], result["deleted"], result["unbound"],
                  result["inserted"], result["kept"]))
     return 0
 
