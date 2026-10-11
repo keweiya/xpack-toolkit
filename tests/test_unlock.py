@@ -85,8 +85,16 @@ if __name__ == "__main__":
     for x in ("edition", "expires", "nodes", "assignee", "out", "import-file", "db", "serial-path", "export-existing"):
         p.add_argument("--"+x)
     p.add_argument("--replace-root-fingerprint", action="append", default=[])
-    for x in ("offline", "apply", "no-restart", "verify-db"): p.add_argument("--"+x, action="store_true")
+    for x in ("offline", "apply", "no-restart", "verify-db", "preflight-db"): p.add_argument("--"+x, action="store_true")
     a = p.parse_args()
+    if a.preflight_db:
+        with sqlite3.connect("file:" + pathlib.Path(a.db).resolve().as_posix() + "?mode=ro", uri=True) as c:
+            local = c.execute("select id from nodes where local=1").fetchone()
+            rows = c.execute("select bind_node_id from licenses").fetchall()
+        if not local or any(str(row[0]) != str(local[0]) for row in rows):
+            raise SystemExit("Foreign-bound fixture license")
+        with open(os.environ["EVENT_LOG"], "a") as f: f.write("preflight-db\n")
+        raise SystemExit(0)
     if a.export_existing:
         with sqlite3.connect(a.db) as c: row = c.execute("select license from licenses").fetchone()
         if not row: raise SystemExit(10)
@@ -129,18 +137,32 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     for x in ("cert", "db", "bak"): p.add_argument("--"+x)
     p.add_argument("--restore", action="store_true"); p.add_argument("--show", action="store_true")
+    p.add_argument("--check-owned", action="store_true")
     a = p.parse_args()
     if a.show: raise SystemExit(0)
+    if a.check_owned:
+        pem = pathlib.Path(a.cert).read_text(); fp = fingerprint(pem)
+        with sqlite3.connect("file:" + pathlib.Path(a.db).resolve().as_posix() + "?mode=ro", uri=True) as c:
+            roots = c.execute("select key,value from core_settings where key in (?, ?, ?, ?)",
+                ("LicenseRootCertHKFingerprint", "LicenseRootCertCNFingerprint", "LicenseRootCertHK", "LicenseRootCertCN")).fetchall()
+        for key, value in roots:
+            allowed = {fp, OFFICIAL_FP["hk"], OFFICIAL_FP["cn"]} if key.endswith("Fingerprint") else {pem}
+            if value not in allowed: raise SystemExit("Unknown fixture root")
+        with open(os.environ["EVENT_LOG"], "a") as f: f.write("check-owned\n")
+        raise SystemExit(0)
     if os.environ.get("FAIL_CERT"): raise SystemExit(7)
     with sqlite3.connect(a.db) as c:
         if a.restore:
-            c.execute("delete from core_settings")
+            c.execute("delete from core_settings where key in (?, ?, ?, ?)",
+                ("LicenseRootCertHKFingerprint", "LicenseRootCertCNFingerprint", "LicenseRootCertHK", "LicenseRootCertCN"))
             for key, value in json.loads(pathlib.Path(a.bak).read_text()).items():
-                c.execute("insert into core_settings values (?,?)", (key, value))
+                if key in ("LicenseRootCertHKFingerprint", "LicenseRootCertCNFingerprint", "LicenseRootCertHK", "LicenseRootCertCN"):
+                    c.execute("insert into core_settings values (?,?)", (key, value))
         else:
             backup = pathlib.Path(a.bak)
             if not backup.exists():
-                backup.write_text(json.dumps(dict(c.execute("select key,value from core_settings").fetchall())))
+                backup.write_text(json.dumps(dict(c.execute("select key,value from core_settings where key in (?, ?, ?, ?)",
+                    ("LicenseRootCertHKFingerprint", "LicenseRootCertCNFingerprint", "LicenseRootCertHK", "LicenseRootCertCN")).fetchall())))
             pem = pathlib.Path(a.cert).read_text(); fp = fingerprint(pem)
             for key in ("LicenseRootCertHKFingerprint", "LicenseRootCertCNFingerprint", "LicenseRootCertHK", "LicenseRootCertCN"):
                 c.execute("delete from core_settings where key=?", (key,))
@@ -151,7 +173,7 @@ if __name__ == "__main__":
 '''
 
 MOCK_COMMAND = r'''#!/usr/bin/env python3
-import json, os, pathlib, shutil, subprocess, sys
+import hashlib, json, os, pathlib, shutil, subprocess, sys
 name = pathlib.Path(sys.argv[0]).name; args = sys.argv[1:]
 base = pathlib.Path(os.environ["FIXTURE_ROOT"]).resolve()
 def confined(value):
@@ -187,6 +209,17 @@ elif name == "install":
     raise SystemExit(subprocess.call([os.environ["REAL_INSTALL"]]+args))
 elif name == "curl":
     url = args[-1]; dst = args[args.index("-o")+1]; confined(dst)
+    if url == os.environ.get("API_URL_CHECK"):
+        assert pathlib.Path(dst).resolve().is_relative_to(pathlib.Path(os.environ["TMPDIR"]).resolve())
+        assert not pathlib.Path(os.environ["UNLOCK_WORK"]).exists(), "persistent runtime before first API"
+        assert not pathlib.Path(os.environ["BACKUP"]).exists(), "backup before first API"
+        watched = json.loads(pathlib.Path(os.environ["API_SNAPSHOT"]).read_text())
+        for filename, expected in watched.items():
+            path = pathlib.Path(filename)
+            actual = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+            assert actual == expected, "machine data changed before first API: " + filename
+        assert not list(pathlib.Path(os.environ["MOCK_STATE"]).glob("*.stopped"))
+        with open(os.environ["EVENT_LOG"], "a") as f: f.write("first-api-readonly\n")
     if os.environ.get("FAIL_CURL"): raise SystemExit(22)
     urls = json.loads(pathlib.Path(os.environ["CURL_MAP"]).read_text())
     if url not in urls or not pathlib.Path(urls[url]).is_file():
@@ -218,6 +251,7 @@ class Fixture:
         self.downloads = self.base / "downloads"
         self.assets = self.downloads / "assets"
         self.assets.mkdir(parents=True)
+        self.extra_urls = {}
         self.public = {"tools/patch_core.py": PATCH_CORE.encode(), "tools/patch_agent.py": PATCH_AGENT.encode(),
                        "tools/gen_license.py": GEN_LICENSE.encode(), "tools/cert_store.py": CERT_STORE.encode(),
                        "tools/aes128.py": b"", "tools/gosym.py": b"", "tools/official_rootcert.json": b"{}",
@@ -255,10 +289,12 @@ class Fixture:
         self.events = self.base / "events"
         self.bin = self.base / "mock-bin"
         self.bin.mkdir()
+        self.temporary = self.base / "tmp"
+        self.temporary.mkdir()
         for name in ("systemctl", "curl", "install", "id", "uname", "1pctl"):
             path = self.bin / name; path.write_text(MOCK_COMMAND); path.chmod(0o755)
         self.env = {"PATH": str(self.bin)+os.pathsep+os.defpath, "HOME": str(self.base),
-                    "LANG": "C.UTF-8", "PYTHONDONTWRITEBYTECODE": "1",
+                    "LANG": "C.UTF-8", "PYTHONDONTWRITEBYTECODE": "1", "TMPDIR": str(self.temporary),
                     "PANEL_ROOT": str(self.panel), "CORE_BIN": str(self.core), "AGENT_BIN": str(self.agent),
                     "CORE_SVC": "fixture-core", "AGENT_SVC": "fixture-agent", "XPACK_DB": str(self.db),
                     "BACKUP": str(self.backup), "UNLOCK_WORK": str(self.work),
@@ -329,16 +365,54 @@ class Fixture:
             releases = [{"tag_name": "core-v9.9.9", "draft": True, "assets": assets},
                         {"tag_name": "core-v9.9.8", "prerelease": True, "assets": assets},
                         {"tag_name": "core-v2.3.2-amd64", "assets": assets},
-                        {"tag_name": "core-v2.3.2", "draft": False, "prerelease": False, "assets": assets}]
+                        {"tag_name": "core-" + self.man["version"], "draft": False, "prerelease": False, "assets": assets}]
         (self.downloads / "releases.json").write_text(json.dumps(releases))
         urls = {API_URL: str(self.downloads / "releases.json")}
         urls.update({self.asset_url(name): str(self.assets / name) for name in names})
+        urls.update(self.extra_urls)
         (self.downloads / "urls.json").write_text(json.dumps(urls))
         return releases
 
-    @staticmethod
-    def asset_url(name):
-        return "https://github.com/fixture/xpack/releases/download/core-v2.3.2/"+name
+    def asset_url(self, name, version=None):
+        version = self.man["version"] if version is None else version
+        return "https://github.com/fixture/xpack/releases/download/core-"+version+"/"+name
+
+    def set_target_version(self, version):
+        self.man["version"] = version
+        self.write_manifest()
+        self.write_api()
+
+    def release_for(self, version, missing=(), **metadata):
+        directory = self.downloads / "versions" / version
+        directory.mkdir(parents=True, exist_ok=True)
+        assets = []
+        for source in self.assets.iterdir():
+            if not source.is_file(): continue
+            target = directory / source.name
+            if source.name == "manifest.json":
+                manifest = json.loads(source.read_text()); manifest["version"] = version
+                target.write_text(json.dumps(manifest))
+            else:
+                shutil.copyfile(source, target)
+            url = self.asset_url(source.name, version)
+            self.extra_urls[url] = str(target)
+            if source.name not in missing:
+                assets.append({"name": source.name, "browser_download_url": url})
+        return {"tag_name": "core-" + version, "draft": False, "prerelease": False,
+                "assets": assets, **metadata}
+
+    def machine_snapshot(self):
+        paths = [self.core, self.agent, self.ctl]
+        for directory in (self.panel, self.state, self.backup):
+            if directory.is_dir(): paths.extend(directory.rglob("*"))
+        return {str(path): sha(path.read_bytes()) for path in paths if path.is_file()}
+
+    def guard_first_api(self):
+        snapshot = self.base / "api-snapshot.json"
+        watched = self.machine_snapshot()
+        watched[str(self.agent)] = sha(self.agent.read_bytes()) if self.agent.is_file() else None
+        snapshot.write_text(json.dumps(watched))
+        self.env.update({"API_URL_CHECK": API_URL, "API_SNAPSHOT": str(snapshot)})
 
     def run(self, mode="install", piped=False, **env):
         args = ["bash", "-s", "--"] if piped else ["bash", str(self.script)]
@@ -381,6 +455,151 @@ class UnlockTests(unittest.TestCase):
         self.assertNotIn("license.key", "\n".join(self.f.urls()))
         self.assertNotIn("raw.githubusercontent", self.f.log())
 
+    def assert_version_preflight_exit(self, result, snapshot=None, network=True, original=INITIAL_CORE):
+        self.before_stop(result, before_code=True, original=original)
+        self.assertEqual(self.f.urls(), [API_URL] if network else [])
+        self.assertFalse(self.f.work.exists())
+        self.assertFalse(self.f.backup.exists())
+        self.assertEqual(list(self.f.temporary.iterdir()), [])
+        if snapshot is not None:
+            self.assertEqual(self.f.machine_snapshot(), snapshot)
+
+    def test_highest_semver_numeric_equal_newer_and_older_matrix(self):
+        cases = (("v2.3.2", "v2.3.2", True), ("v3.0.0", "v2.99.99", True),
+                 ("v2.10.0", "v2.9.99", True), ("v2.3.10", "v2.3.9", True),
+                 ("v2.9.99", "v2.10.0", False), ("v2.3.9", "v2.3.10", False),
+                 ("v2.99.99", "v3.0.0", False), ("v0.0.1", "v0.0.0", True))
+        for target, installed, allowed in cases:
+            with self.subTest(target=target, installed=installed), tempfile.TemporaryDirectory(prefix="public-version-") as base:
+                self.f = Fixture(base)
+                self.f.set_target_version(target); self.f.installed_version(installed)
+                before = self.f.machine_snapshot(); self.f.guard_first_api()
+                result = self.f.run(VERSION="v1.0.0")
+                if allowed:
+                    self.ok(result); self.assert_downloads("amd64")
+                    self.assertEqual(self.f.core.read_bytes(), self.f.outputs["amd64"])
+                else:
+                    self.assert_version_preflight_exit(result, before)
+                self.assertIn("first-api-readonly", self.f.log())
+
+    def test_highest_release_uses_numeric_tag_not_api_order_or_created_latest(self):
+        latest_created = self.f.release_for("v2.9.9", created_at="2099-01-01T00:00:00Z",
+                                             published_at="2099-01-01T00:00:00Z")
+        highest = self.f.release_for("v2.10.0", created_at="2020-01-01T00:00:00Z",
+                                    published_at="2020-01-01T00:00:00Z")
+        older = self.f.release_for("v2.3.2")
+        self.f.write_api([latest_created, older, highest])
+        self.f.installed_version("v2.9.9")
+        self.ok(self.f.run())
+        self.assertEqual(self.f.urls(), [API_URL] + [self.f.asset_url(name, "v2.10.0") for name in
+                         ("manifest.json", "runtime.tar.gz", "core-linux-amd64", "core-linux-amd64.orig")])
+        self.assertEqual(json.loads((self.f.last_license().parent / "manifest.json").read_text())["version"], "v2.10.0")
+
+    def test_malformed_draft_prerelease_and_rc_tags_are_ignored(self):
+        stable = self.f.release_for("v2.3.2")
+        ignored = []
+        for tag in ("core-v99.0.0-rc.1", "core-v99.0.0-amd64", "core-v99.0",
+                    "core-99.0.0", "v99.0.0", "core-v99.0.0+build", "core-v99.0.0\n"):
+            release = dict(stable, tag_name=tag, draft=False, prerelease=False)
+            ignored.append(release)
+        ignored.extend((dict(stable, tag_name="core-v99.0.0", draft=True),
+                        dict(stable, tag_name="core-v98.0.0", prerelease=True)))
+        self.f.write_api(ignored + [stable])
+        self.ok(self.f.run())
+        self.assert_downloads("amd64")
+
+    def test_highest_missing_architecture_never_falls_back_to_older_supported_tag(self):
+        for arch, machine in (("amd64", "x86_64"), ("arm64", "aarch64")):
+            with self.subTest(arch=arch), tempfile.TemporaryDirectory(prefix="public-version-arch-") as base:
+                self.f = Fixture(base)
+                older = self.f.release_for("v2.3.2")
+                highest = self.f.release_for("v2.4.0", missing=("core-linux-"+arch, "core-linux-"+arch+".orig"))
+                self.f.write_api([older, highest]); before = self.f.machine_snapshot()
+                self.assert_version_preflight_exit(self.f.run(TEST_ARCH=machine), before)
+
+    def test_highest_missing_official_agent_never_falls_back_to_older_tag(self):
+        self.f.agent.write_bytes(b"installed agent sentinel")
+        highest = self.f.release_for("v2.4.0", missing=("agent-linux-amd64.orig",))
+        older = self.f.release_for("v2.3.2")
+        self.f.write_api([older, highest]); before = self.f.machine_snapshot()
+        self.assert_version_preflight_exit(self.f.run(), before)
+
+    def test_valid_version_env_cannot_bypass_newer_installed_database(self):
+        self.f.installed_version("v2.10.0")
+        self.f.executable_core()
+        original = self.f.core.read_bytes()
+        before = self.f.machine_snapshot()
+        result = self.f.run(VERSION="v2.3.2", TEST_VERSION="v2.3.2")
+        self.assert_version_preflight_exit(result, before, original=original)
+        self.assertNotIn("core version", self.f.log())
+
+    def test_first_network_api_precedes_detection_and_all_persistent_mutations(self):
+        self.f.executable_core(); self.f.ctl.unlink()
+        app = self.f.panel / "apps/example/data"; app.mkdir(parents=True)
+        (app / "keep.txt").write_bytes(b"application sentinel")
+        with sqlite3.connect(self.f.db) as c:
+            c.execute("insert into core_settings values('UnrelatedSetting','keep')")
+        self.f.guard_first_api()
+        self.ok(self.f.run(VERSION="", TEST_VERSION="v2.3.2"))
+        self.assertLess(self.f.log().index("first-api-readonly"), self.f.log().index("core version"))
+        self.assert_downloads("amd64")
+        self.assertEqual((app / "keep.txt").read_bytes(), b"application sentinel")
+        self.assertEqual(list(self.f.temporary.iterdir()), [])
+
+    def test_local_manifest_higher_version_is_selected_without_network(self):
+        self.f.installed_version("v2.3.2")
+        self.f.set_target_version("v2.10.0")
+        self.ok(self.f.run(ARTIFACT_DIR=str(self.f.assets), VERSION="v2.3.2", FAIL_CURL="1"))
+        self.assertEqual(self.f.urls(), [])
+        self.assertEqual(json.loads((self.f.last_license().parent / "manifest.json").read_text())["version"], "v2.10.0")
+
+    def test_local_manifest_lower_version_exits_before_persistent_or_machine_edits(self):
+        self.f.installed_version("v2.10.0")
+        self.f.set_target_version("v2.9.99")
+        before = self.f.machine_snapshot()
+        self.assert_version_preflight_exit(self.f.run(ARTIFACT_DIR=str(self.f.assets), VERSION="v2.9.99"),
+                                           before, network=False)
+
+    def test_unknown_actual_version_never_uses_valid_version_env_fallback(self):
+        self.f.ctl.write_text("#!/bin/sh\nORIGINAL_VERSION='unknown'\n")
+        before = self.f.machine_snapshot(); self.f.guard_first_api()
+        self.assert_version_preflight_exit(self.f.run(VERSION="v2.3.2"), before)
+
+    def test_foreign_bound_license_db_is_preserved_before_service_stop(self):
+        with sqlite3.connect(self.f.db) as c:
+            c.execute("insert into licenses values(88,?)", (json.dumps({"signed": True}),))
+        before = self.f.machine_snapshot()
+        self.before_stop(self.f.run())
+        self.assertEqual(self.f.machine_snapshot(), before)
+        self.assertNotIn("apply 17", self.f.log())
+        self.assertNotIn("code patch_core", self.f.log())
+
+    def test_unknown_root_and_fingerprint_history_do_not_establish_ownership(self):
+        foreign = "c"*64
+        with sqlite3.connect(self.f.db) as c:
+            c.execute("insert into core_settings values('LicenseRootCertHKFingerprint',?)", (foreign,))
+        self.f.backup.mkdir()
+        (self.f.backup / "script_root_fingerprints").write_text(foreign+"\n")
+        before = self.f.machine_snapshot()
+        self.before_stop(self.f.run())
+        self.assertEqual(self.f.machine_snapshot(), before)
+        self.assertNotIn("apply 17", self.f.log())
+        self.assertNotIn("code patch_core", self.f.log())
+
+    def test_known_official_project_roots_preserve_unrelated_settings_and_restore(self):
+        with sqlite3.connect(self.f.db) as c:
+            c.executemany("insert into core_settings values(?,?)", (
+                ("LicenseRootCertHKFingerprint", "a"*64), ("LicenseRootCertCNFingerprint", "b"*64),
+                ("UnrelatedSetting", "application sentinel")))
+        self.ok(self.f.run())
+        self.ok(self.f.run())
+        self.ok(self.f.run("restore", FAIL_CURL="1"))
+        with sqlite3.connect(self.f.db) as c:
+            settings = dict(c.execute("select key,value from core_settings"))
+        self.assertEqual(settings, {"LicenseRootCertHKFingerprint": "a"*64,
+                                    "LicenseRootCertCNFingerprint": "b"*64,
+                                    "UnrelatedSetting": "application sentinel"})
+
     def test_shell_syntax_single_entry(self):
         self.ok(subprocess.run(["bash", "-n", str(ROOT / "unlock.sh")], capture_output=True, text=True))
 
@@ -393,7 +612,7 @@ class UnlockTests(unittest.TestCase):
         self.assertEqual(len(rows), 1); self.assertEqual(rows[0][0], 17)
         self.assertEqual(json.loads(rows[0][1])["products"][0]["maxNodeCount"], 43)
         self.assertEqual((self.f.backup / "1panel-core.orig").read_bytes(), self.f.originals["amd64"])
-        self.assertIn("apply 17 "+self.f.fp, self.f.log())
+        self.assertIn("apply 17 \n", self.f.log())
         self.assert_downloads("amd64", 2)
 
     def test_cached_verify_restore_no_network_or_private_material(self):
@@ -474,11 +693,12 @@ class UnlockTests(unittest.TestCase):
         self.before_stop(self.f.run(mode=None, piped=True, VERSION=""), before_code=True)
         self.assertEqual(self.f.urls(), [API_URL])
 
-    def test_unknown_version_fails_before_network_and_service(self):
+    def test_unknown_version_fails_after_api_before_persistent_state_and_service(self):
         self.f.ctl.write_text("#!/bin/sh\nORIGINAL_VERSION='unknown'\n")
         self.before_stop(self.f.run(VERSION=""), before_code=True)
-        self.assertEqual(self.f.urls(), [])
+        self.assertEqual(self.f.urls(), [API_URL])
         self.assertFalse(self.f.work.exists())
+        self.assertFalse(self.f.backup.exists())
 
     def test_version_control_file_injection_is_never_executed_or_sourced(self):
         marker = self.f.base / "injected"
@@ -486,15 +706,15 @@ class UnlockTests(unittest.TestCase):
         self.f.ctl.chmod(0o755)
         self.before_stop(self.f.run(VERSION=""), before_code=True)
         self.assertFalse(marker.exists())
-        self.assertEqual(self.f.urls(), [])
+        self.assertEqual(self.f.urls(), [API_URL])
         self.assertNotIn("1pctl version", self.f.log())
 
-    def test_explicit_version_strict_validation_precedes_network(self):
+    def test_explicit_version_strict_validation_follows_first_api(self):
         for version in ("latest", "v2.3", "vv2.3.2", "v2.3.2;echo injected", "2.3.2/../other"):
             with self.subTest(version=version):
                 self.f.events.unlink(missing_ok=True)
                 self.before_stop(self.f.run(VERSION=version), before_code=True)
-                self.assertEqual(self.f.urls(), [])
+                self.assertEqual(self.f.urls(), [API_URL])
 
     def test_install_retains_apps_database_and_unrelated_backup(self):
         app = self.f.panel / "apps/example/data"
@@ -514,6 +734,7 @@ class UnlockTests(unittest.TestCase):
             with self.subTest(**override): self.before_stop(self.f.run(**override), before_code=True)
 
     def test_unadapted_official_four_version_fails_early(self):
+        self.f.installed_version("v2.3.4")
         self.before_stop(self.f.run(VERSION="v2.3.4"), before_code=True)
         self.assertEqual(self.f.urls(), [API_URL])
 

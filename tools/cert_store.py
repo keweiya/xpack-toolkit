@@ -28,14 +28,17 @@ import argparse
 import base64
 import datetime
 import hashlib
+import json
 import os
+from pathlib import Path
 import secrets
 import sqlite3
 import ssl
+import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from aes128 import cbc_encrypt, cbc_decrypt, pkcs7_pad  # noqa: E402
+from aes128 import cbc_encrypt, cbc_decrypt, pkcs7_pad, pkcs7_unpad  # noqa: E402
 
 # encrypt_xpack.StringEncrypt / decryptRootCertStoreValue 用的固定盐（16 字节）
 STORE_KEY = b"nel1Pa2520pack@x"
@@ -48,6 +51,11 @@ OFFICIAL_FP = {
 }
 OFFICIAL_JSON = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                              "official_rootcert.json")
+
+# Only established project roots belong here, never fingerprints discovered in DBs.
+PROJECT_ROOT_FINGERPRINTS = frozenset({
+    "cb8cc410354dbbda7b542c952a8c8ffb47a0f3d886c7e7273c89cb7a44156030",
+})
 
 KEYS = {
     "cert_hk": "LicenseRootCertHK",
@@ -64,18 +72,80 @@ def encrypt(value: str, key: bytes = STORE_KEY) -> str:
 
 
 def decrypt(value: str, key: bytes = STORE_KEY) -> str:
-    raw = base64.b64decode(value)
-    pt = cbc_decrypt(raw[16:], key[:16], raw[:16])
-    n = pt[-1]
-    if 1 <= n <= 16 and pt[-n:] == bytes([n]) * n:
-        pt = pt[:-n]
-    return pt.decode("utf-8", "replace")
+    raw = base64.b64decode(value, validate=True)
+    if len(raw) < 32 or len(raw) % 16:
+        raise ValueError("invalid encrypted root store value")
+    return pkcs7_unpad(cbc_decrypt(raw[16:], key[:16], raw[:16])).decode()
 
 
 def fingerprint(cert_pem: str) -> str:
     """与 Go 侧 sha256.Sum256(cert.Raw) 等价的十六进制指纹。"""
     der = ssl.PEM_cert_to_DER_cert(cert_pem)
+    result = subprocess.run(["openssl", "x509", "-inform", "DER", "-noout"],
+                            input=der, capture_output=True)
+    if result.returncode:
+        raise ValueError("invalid root certificate")
     return hashlib.sha256(der).hexdigest()
+
+
+def project_fingerprints(current_fp=None, extra_fps=()):
+    known = set(PROJECT_ROOT_FINGERPRINTS)
+    if current_fp is not None:
+        known.add(current_fp)
+    requested = set(extra_fps)
+    if any(len(fp) != 64 or any(c not in "0123456789abcdef" for c in fp)
+           for fp in requested) or not requested.issubset(known):
+        raise ValueError("replacement root fingerprint lacks established project ownership")
+    return known
+
+
+def database_uri(db, mode="ro"):
+    return Path(db).resolve().as_uri() + "?mode=" + mode
+
+
+def _root_rows(con):
+    rows = {}
+    for key in KEYS.values():
+        found = con.execute("select value from core_settings where key=?", (key,)).fetchall()
+        if len(found) > 1:
+            raise ValueError("duplicate root store key: " + key)
+        if found:
+            rows[key] = found[0][0]
+    return rows
+
+
+def _check_root_rows(rows, known):
+    states = {}
+    for region in ("hk", "cn"):
+        cert_key, fp_key = KEYS["cert_" + region], KEYS["fp_" + region]
+        if cert_key not in rows and fp_key not in rows:
+            states[region] = "missing"
+            continue
+        if cert_key not in rows or fp_key not in rows:
+            raise ValueError("incomplete root store pair: " + region)
+        try:
+            actual = fingerprint(decrypt(rows[cert_key]))
+            recorded = decrypt(rows[fp_key])
+        except (ValueError, UnicodeError, TypeError, IndexError) as exc:
+            raise ValueError("malformed root store pair: " + region) from exc
+        if actual != recorded:
+            raise ValueError("root certificate and fingerprint differ: " + region)
+        if actual == OFFICIAL_FP[region]:
+            states[region] = "official"
+        elif actual in known:
+            states[region] = "project"
+        else:
+            raise ValueError("unknown foreign root store pair: " + region)
+    return states
+
+
+def check_owned_roots(db, pem=None, extra_fps=()):
+    """Read-only guard for the four license-root settings, not application certs."""
+    current_fp = fingerprint(pem) if pem is not None else None
+    known = project_fingerprints(current_fp, extra_fps)
+    with sqlite3.connect(database_uri(db), uri=True) as con:
+        states = _check_root_rows(_root_rows(con), known)
+    return {"ready": True, "roots": states}
 
 
 def _now() -> str:
@@ -99,38 +169,40 @@ def show(db: str):
         print("%-32s %s" % (k, head))
 
 
-def write(db: str, cert_pem: str, fp: str, dry_run=False):
-    con = sqlite3.connect(db)
-    now = _now()
-    written = []
-    for key, value in ((KEYS["cert_hk"], cert_pem), (KEYS["cert_cn"], cert_pem),
-                       (KEYS["fp_hk"], fp), (KEYS["fp_cn"], fp)):
-        enc = encrypt(value)
-        row = con.execute("select id from core_settings where key=?", (key,)).fetchone()
-        if row:
-            con.execute("update core_settings set value=?, updated_at=? where key=?",
-                        (enc, now, key))
-        else:
-            con.execute("insert into core_settings (created_at, updated_at, key, value,"
-                        " description) values (?,?,?,?,?)", (now, now, key, enc, ""))
-        written.append(key)
-    if not dry_run:
-        con.commit()
-    con.close()
-    return written
+def write(db: str, cert_pem: str, fp: str, dry_run=False, extra_fps=()):
+    if fingerprint(cert_pem) != fp:
+        raise ValueError("supplied certificate and fingerprint differ")
+    known = project_fingerprints(fp, extra_fps)
+    check_owned_roots(db, cert_pem, extra_fps)
+    with sqlite3.connect(database_uri(db, "rw"), uri=True, timeout=30) as con:
+        con.execute("begin immediate")
+        _check_root_rows(_root_rows(con), known)
+        written = list(KEYS.values())
+        if dry_run:
+            con.rollback()
+            return written
+        now = _now()
+        for key, value in ((KEYS["cert_hk"], cert_pem), (KEYS["cert_cn"], cert_pem),
+                           (KEYS["fp_hk"], fp), (KEYS["fp_cn"], fp)):
+            enc = encrypt(value)
+            row = con.execute("select id from core_settings where key=?", (key,)).fetchone()
+            if row:
+                con.execute("update core_settings set value=?, updated_at=? where key=?",
+                            (enc, now, key))
+            else:
+                con.execute("insert into core_settings (created_at, updated_at, key, value,"
+                            " description) values (?,?,?,?,?)", (now, now, key, enc, ""))
+        return written
 
 
 def is_official(rows: dict) -> bool:
     """这 4 行是不是官方原值（指纹等于内置常量）。"""
-    for key, want in ((KEYS["fp_hk"], OFFICIAL_FP["hk"]), (KEYS["fp_cn"], OFFICIAL_FP["cn"])):
-        if not rows.get(key):
-            return False
-        try:
-            if decrypt(rows[key]) != want:
-                return False
-        except Exception:  # noqa: BLE001
-            return False
-    return True
+    if set(rows) != set(KEYS.values()):
+        return False
+    try:
+        return all(state == "official" for state in _check_root_rows(rows, set()).values())
+    except (ValueError, OSError):
+        return False
 
 
 def backup(db: str, path: str):
@@ -156,25 +228,45 @@ def backup(db: str, path: str):
     return path, "官方原值已备份到 %s" % path
 
 
-def restore(db: str, path: str):
-    """还原官方原值：优先用备份，其次用仓库里自带的官方原值（tools/official_rootcert.json）。"""
-    import json
+def restore(db: str, path: str, cert_pem=None, extra_fps=()):
+    """Restore only coherent official pairs, guarded by current project ownership."""
+    current_fp = fingerprint(cert_pem) if cert_pem is not None else None
+    known = project_fingerprints(current_fp, extra_fps)
+    check_owned_roots(db, cert_pem, extra_fps)
     if not os.path.exists(path) and os.path.exists(OFFICIAL_JSON):
         path = OFFICIAL_JSON
-    con = sqlite3.connect(db)
+    data = None
     if os.path.exists(path):
         with open(path) as fh:
-            data = json.load(fh)
-        for key, value in data.items():
-            con.execute("update core_settings set value=? where key=?", (value, key))
-        con.commit()
-        con.close()
-        return "已还原官方根证书 %d 行" % len(data)
-    con.execute("delete from core_settings where key in (%s)"
-                % ",".join("?" * len(KEYS)), tuple(KEYS.values()))
-    con.commit()
-    con.close()
-    return "已删除本站根证书 %d 行" % len(KEYS)
+            loaded = json.load(fh)
+        if not isinstance(loaded, dict):
+            raise ValueError("invalid official root backup")
+        data = {key: loaded[key] for key in KEYS.values() if key in loaded}
+        if not is_official(data):
+            raise ValueError("backup lacks coherent official root certificate pairs")
+    with sqlite3.connect(database_uri(db, "rw"), uri=True, timeout=30) as con:
+        con.execute("begin immediate")
+        rows = _root_rows(con)
+        states = _check_root_rows(rows, known)
+        if not rows or is_official(rows):
+            return "官方根证书保持原值"
+        if data is not None:
+            restored = 0
+            for region, state in states.items():
+                if state != "project":
+                    continue
+                for key in (KEYS["cert_" + region], KEYS["fp_" + region]):
+                    con.execute("update core_settings set value=? where key=?", (data[key], key))
+                    restored += 1
+            return "已还原官方根证书 %d 行" % restored
+        owned_keys = []
+        for region in ("hk", "cn"):
+            cert_key, fp_key = KEYS["cert_" + region], KEYS["fp_" + region]
+            if cert_key in rows and fingerprint(decrypt(rows[cert_key])) in known:
+                owned_keys.extend((cert_key, fp_key))
+        for key in owned_keys:
+            con.execute("delete from core_settings where key=?", (key,))
+        return "已删除本站根证书 %d 行" % len(owned_keys)
 
 
 def main():
@@ -189,6 +281,9 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--backup", action="store_true", help="备份官方原值到 --bak")
     ap.add_argument("--restore", action="store_true", help="从 --bak 还原官方原值")
+    ap.add_argument("--check-owned", action="store_true", help="read-only license-root ownership preflight")
+    ap.add_argument("--replace-root-fingerprint", action="append", default=[],
+                    help="explicit established project root fingerprint")
     ap.add_argument("--bak", default="/opt/1panel/crack/backup/"
                                      "core_settings_license_rootcert.json")
     args = ap.parse_args()
@@ -196,25 +291,41 @@ def main():
     if args.show:
         show(args.db)
         return 0
+    if args.check_owned:
+        pem = None
+        if os.path.isfile(args.cert):
+            with open(args.cert) as fh:
+                pem = fh.read()
+        print(json.dumps(check_owned_roots(args.db, pem, args.replace_root_fingerprint)))
+        return 0
     if args.backup:
         os.makedirs(os.path.dirname(args.bak), exist_ok=True)
         _p, msg = backup(args.db, args.bak)
         print(msg)
         return 0
     if args.restore:
-        print(restore(args.db, args.bak))
+        pem = None
+        if os.path.isfile(args.cert):
+            with open(args.cert) as fh:
+                pem = fh.read()
+        print(restore(args.db, args.bak, pem, args.replace_root_fingerprint))
         return 0
 
-    with open(args.cert) as fh:
-        pem = fh.read()
+    pem = None
+    if os.path.isfile(args.cert):
+        with open(args.cert) as fh:
+            pem = fh.read()
+    if pem is None:
+        raise ValueError("missing signing certificate: " + args.cert)
     if "BEGIN CERTIFICATE" not in pem:
         raise SystemExit("不是 PEM 证书: %s" % args.cert)
     fp = fingerprint(pem)
+    check_owned_roots(args.db, pem, args.replace_root_fingerprint)
     if not args.dry_run:
         os.makedirs(os.path.dirname(args.bak), exist_ok=True)
         _p, msg = backup(args.db, args.bak)
         print("备份   : %s" % msg)
-    keys = write(args.db, pem, fp, args.dry_run)
+    keys = write(args.db, pem, fp, args.dry_run, args.replace_root_fingerprint)
     print("根证书 : %s" % args.cert)
     print("指纹   : %s" % fp)
     print("已写入 : %s%s" % (", ".join(keys), "（dry-run）" if args.dry_run else ""))

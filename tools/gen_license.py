@@ -77,6 +77,7 @@ import tempfile
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from aes128 import cbc_decrypt, cbc_encrypt, pkcs7_pad, pkcs7_unpad  # noqa: E402
+from cert_store import database_uri, fingerprint, project_fingerprints  # noqa: E402
 
 LICENSE_KEY = b"nel1Pa2520pack@x"
 XPACK_DB = "/opt/1panel/db/xpack.db"
@@ -231,8 +232,8 @@ def sign_response(message: bytes) -> str:
     return base64.b64encode(out).decode()
 
 
-def verify_license(text: str) -> dict:
-    """校验授权文件；通过返回内容 dict，失败抛 ValueError。"""
+def _verify_signed_license(text: str, fingerprints) -> dict:
+    """Verify a signed payload against established roots, including expired roots."""
     parts = text.strip().split("-")
     if len(parts) != 3:
         raise ValueError("expected 3 segments, got %d" % len(parts))
@@ -243,10 +244,8 @@ def verify_license(text: str) -> dict:
     except Exception as exc:  # noqa: BLE001
         raise ValueError("base64 decode failed: %s" % exc)
 
-    with open(SIGN_CRT) as fh:
-        root_der = ssl.PEM_cert_to_DER_cert(fh.read())
-    if hashlib.sha256(der).digest() != hashlib.sha256(root_der).digest():
-        raise ValueError("leaf certificate is not issued by this site")
+    if hashlib.sha256(der).hexdigest() not in fingerprints:
+        raise ValueError("certificate root lacks established project ownership")
 
     with tempfile.TemporaryDirectory() as td:
         sigf = os.path.join(td, "sig.bin")
@@ -257,15 +256,41 @@ def verify_license(text: str) -> dict:
         with open(rawf, "wb") as fh:
             fh.write(raw)
         with open(pubf, "w") as fh:
-            fh.write(public_pem())
+            cert = subprocess.run(["openssl", "x509", "-inform", "DER", "-pubkey", "-noout"],
+                                  input=der, capture_output=True)
+            if cert.returncode:
+                raise ValueError("invalid embedded signing certificate")
+            fh.write(cert.stdout.decode())
+        rsa = subprocess.run(["openssl", "rsa", "-pubin", "-in", pubf, "-noout"],
+                             capture_output=True)
+        if rsa.returncode:
+            raise ValueError("embedded signing certificate requires an RSA key")
         r = subprocess.run(["openssl", "dgst", "-sha256", "-verify", pubf,
                             "-signature", sigf, rawf], capture_output=True)
     if r.returncode != 0:
         raise ValueError("signature verification failed")
     try:
-        return json.loads(raw.decode())
+        content = json.loads(raw.decode())
+        if not isinstance(content, dict):
+            raise ValueError("license content must be an object")
+        return content
     except Exception as exc:  # noqa: BLE001
         raise ValueError("content is not valid json: %s" % exc)
+
+
+def verify_license(text: str) -> dict:
+    """Verify issuance against the current signing root, independently of expiry."""
+    with open(SIGN_CRT) as fh:
+        fp = fingerprint(fh.read())
+    return _verify_signed_license(text, {fp})
+
+
+def _known_roots(replace_root_fingerprints=()):
+    current = None
+    if os.path.isfile(SIGN_CRT):
+        with open(SIGN_CRT) as fh:
+            current = fingerprint(fh.read())
+    return project_fingerprints(current, replace_root_fingerprints)
 
 
 def machine_id(path=SERIAL):
@@ -391,27 +416,74 @@ def row_from_content(content, device_id=None, text=""):
 def _owned_license(stored, fingerprints):
     value = stored.get("license") or ""
     try:
-        value = decrypt_blob(value)
-    except (ValueError, UnicodeError):
+        value = decrypt_blob(value, LICENSE_KEY)
+    except (ValueError, UnicodeError, TypeError):
         pass
-    parts = value.strip().split("-")
-    if len(parts) == 3:
-        try:
-            der = base64.b64decode(parts[2], validate=True)
-            return hashlib.sha256(der).hexdigest() in fingerprints
-        except ValueError:
-            return False
-    # Migrate only the deterministic JSON-only rows produced by the old script.
-    try:
-        content = json.loads(value)
-        exp = content["products"][0]["expiresAt"]
-        nodes = content["products"][0]["maxNodeCount"]
-        serial = "1P-" + hashlib.sha256(("%s|%s|%s" % (
-            content["assigneeName"], exp, nodes)).encode()).hexdigest()[:24].upper()
-        return content.get("licenseName") in ("1Panel Professional", "1Panel Enterprise") \
-            and content.get("license") == serial
-    except (ValueError, KeyError, TypeError, IndexError):
+    if not isinstance(value, str):
         return False
+    try:
+        content = _verify_signed_license(value, fingerprints)
+        if any(not isinstance(content.get(field), str) or not content[field]
+               for field in ("licenseName", "deviceID", "license")):
+            return False
+        row_from_content(content, text=value)
+        return True
+    except (ValueError, UnicodeError, TypeError, AttributeError, KeyError,
+            OSError, subprocess.SubprocessError):
+        return False
+
+
+def _binding_fields(stored):
+    try:
+        return decrypt_row(stored)
+    except (ValueError, UnicodeError, TypeError):
+        plain = dict(stored)
+        try:
+            name = decrypt_blob(stored["license_name"])
+            key = repository_key(name)
+            for field in ("bind_node_id", "free_nodes"):
+                if stored.get(field):
+                    plain[field] = decrypt_blob(stored[field], key)
+        except (ValueError, UnicodeError, TypeError):
+            pass
+        return plain
+
+
+def _database_scope(con, fingerprints, bind_node_id=None):
+    if bind_node_id is None:
+        nodes = con.execute("select id from nodes where name='local'").fetchall()
+    else:
+        nodes = con.execute("select id from nodes where id=?", (bind_node_id,)).fetchall()
+    if len(nodes) != 1:
+        raise ValueError("expected exactly one master node")
+    master_id = str(nodes[0]["id"])
+    scoped = []
+    for raw in con.execute("select * from licenses").fetchall():
+        stored = dict(raw)
+        plain = _binding_fields(stored)
+        owned = _owned_license(stored, fingerprints)
+        bound = str(plain.get("bind_node_id") or "")
+        if bound == master_id and not owned:
+            raise ValueError("master already bound to a different issuer's license")
+        scoped.append((stored, plain, owned, bound))
+    return master_id, scoped
+
+
+def preflight_database(db=XPACK_DB, serial_path=None, bind_node_id=None,
+                       replace_root_fingerprints=()):
+    """Check master ownership without exporting, signing or changing any file."""
+    fingerprints = _known_roots(replace_root_fingerprints)
+    with sqlite3.connect(database_uri(db), uri=True) as con:
+        con.row_factory = sqlite3.Row
+        master_id, scoped = _database_scope(con, fingerprints, bind_node_id)
+    serial_path = serial_path or os.path.join(os.path.dirname(db), ".serial")
+    serial = None
+    if os.path.isfile(serial_path):
+        with open(serial_path) as fh:
+            serial = fh.read().strip()
+    return {"ready": True, "bindNodeID": master_id, "serial": serial,
+            "ownedLicenseCount": sum(owned for _, _, owned, _ in scoped),
+            "foreignLicenseCount": sum(not owned for _, _, owned, _ in scoped)}
 
 
 def apply_row(row, db=XPACK_DB, restart=True, bind_node_id=None,
@@ -427,45 +499,26 @@ def apply_row(row, db=XPACK_DB, restart=True, bind_node_id=None,
     if not os.path.isfile(db):
         raise ValueError("missing initialized database: %s" % db)
     serial_path = serial_path or os.path.join(os.path.dirname(db), ".serial")
-    with open(SIGN_CRT) as fh:
-        fp = hashlib.sha256(ssl.PEM_cert_to_DER_cert(fh.read())).hexdigest()
-    fingerprints = set(replace_root_fingerprints) | {fp}
+    fingerprints = _known_roots(replace_root_fingerprints)
+    preflight_database(db, serial_path, bind_node_id, replace_root_fingerprints)
     con = sqlite3.connect(db, timeout=30)
     con.row_factory = sqlite3.Row
     backup = db + ".pre-license"
     try:
-        if not os.path.exists(backup):
-            with sqlite3.connect(backup) as dest:
-                con.backup(dest)
-            os.chmod(backup, 0o600)
         con.execute("begin immediate")
-        if bind_node_id is None:
-            nodes = con.execute("select id from nodes where name='local'").fetchall()
-        else:
-            nodes = con.execute("select id from nodes where id=?", (bind_node_id,)).fetchall()
-        if len(nodes) != 1:
-            raise ValueError("expected exactly one master node")
-        master_id = str(nodes[0]["id"])
+        master_id, scoped = _database_scope(con, fingerprints, bind_node_id)
+        if os.path.exists(serial_path):
+            with open(serial_path) as fh:
+                if fh.read().strip() != row["device_id"]:
+                    raise ValueError("certificate device ID differs from panel serial")
+        if not os.path.exists(backup):
+            with sqlite3.connect(database_uri(db), uri=True) as source:
+                with sqlite3.connect(backup) as dest:
+                    source.backup(dest)
+            os.chmod(backup, 0o600)
         row = dict(row, bind_node_id=master_id)
         replace_ids, keep_id = [], None
-        for stored in con.execute("select * from licenses").fetchall():
-            stored = dict(stored)
-            try:
-                plain = decrypt_row(stored)
-            except (ValueError, UnicodeError):
-                plain = dict(stored)
-                try:
-                    name = decrypt_blob(stored["license_name"])
-                    key = repository_key(name)
-                    for field in ("bind_node_id", "free_nodes"):
-                        if stored.get(field):
-                            plain[field] = decrypt_blob(stored[field], key)
-                except (ValueError, UnicodeError):
-                    pass
-            owned = _owned_license(stored, fingerprints)
-            bound = str(plain.get("bind_node_id") or "")
-            if bound == master_id and not owned:
-                raise ValueError("master already bound to a different issuer's license")
+        for stored, plain, owned, bound in scoped:
             if owned and bound in ("", "0", master_id):
                 if bound == master_id and keep_id is None:
                     keep_id = stored["id"]
@@ -607,6 +660,7 @@ def main():
     ap.add_argument("--bind-node-id", type=int, default=None, help="master node ID (auto: local)")
     ap.add_argument("--no-restart", action="store_true", help="caller manages service lifecycle")
     ap.add_argument("--verify-db", action="store_true", help="verify master binding and encrypted display metadata")
+    ap.add_argument("--preflight-db", action="store_true", help="read-only master license ownership preflight")
     ap.add_argument("--export-existing", metavar="FILE", help="export one existing verified certificate without a signing key")
     ap.add_argument("--replace-root-fingerprint", action="append", default=[],
                     help="previous script CA fingerprint to replace during rotation")
@@ -618,6 +672,10 @@ def main():
     a = ap.parse_args()
     if a.serial and not a.apply:
         ap.error("--serial requires --apply")
+    if a.preflight_db:
+        print(json.dumps(preflight_database(a.db, a.serial_path, a.bind_node_id,
+                                           a.replace_root_fingerprint)))
+        return 0
     if a.export_existing:
         text = existing_license(a.db)
         fd = os.open(a.export_existing, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
