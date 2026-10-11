@@ -217,8 +217,20 @@ run_download() {
   fi
   return "$STATUS"
 }
+run_download_silent() {
+  # 工具脚本等小文件：完全静默，不打印进度条与完成信息。
+  local PART="$1" CANDIDATE="$2" STATUS=0
+  shift 2
+  curl --proto '=http,https' --proto-redir '=http,https' --tlsv1.2 -fSL \
+    --connect-timeout 10 --max-time "$DL_MAX_TIME" \
+    --speed-limit "$STALL_BYTES" --speed-time "$STALL_SECONDS" \
+    --retry 1 --retry-max-time 20 -s "$@" -o "$PART" "$CANDIDATE" 2> "$PART.log"
+  STATUS=$?
+  [ "$STATUS" = 0 ] || printf '!! transfer failed (curl exit %s): %s\n' "$STATUS" "${CANDIDATE##*/}" >&2
+  return "$STATUS"
+}
 fetch() {
-  local URL="$1" DEST="$2" PREFIX CANDIDATE PART ERROR HOST ATTEMPT=0
+  local URL="$1" DEST="$2" SILENT="${3:-}" PREFIX CANDIDATE PART ERROR HOST ATTEMPT=0
   local -a ROUTES=("$URL") CURL_PROXY=() ORDER=()
   case "$URL" in
     https://github.com/*|https://raw.githubusercontent.com/*|https://api.github.com/*)
@@ -233,8 +245,13 @@ fetch() {
     ATTEMPT=$((ATTEMPT + 1))
     PART="$(mktemp "$DEST.part.XXXXXX")"
     HOST="${CANDIDATE#*://}"; HOST="${HOST%%/*}"
-    log "Downloading ${DEST##*/} from $HOST (route $ATTEMPT/${#ROUTES[@]})"
-    if run_download "$PART" "$CANDIDATE" "${CURL_PROXY[@]}"; then
+    [ -n "$SILENT" ] || log "Downloading ${DEST##*/} from $HOST (route $ATTEMPT/${#ROUTES[@]})"
+    if [ -n "$SILENT" ]; then
+      run_download_silent "$PART" "$CANDIDATE" "${CURL_PROXY[@]}"
+    else
+      run_download "$PART" "$CANDIDATE" "${CURL_PROXY[@]}"
+    fi
+    if [ $? -eq 0 ]; then
       mv -f -- "$PART" "$DEST"
       if [ "$CANDIDATE" != "$URL" ]; then
         PREFIX="${CANDIDATE%"$URL"}"
@@ -244,7 +261,7 @@ fetch() {
       fi
       return 0
     fi
-    printf '!! Download route %s failed; trying next route\n' "$HOST" >&2
+    [ -n "$SILENT" ] || printf '!! Download route %s failed; trying next route\n' "$HOST" >&2
     rm -f -- "$PART" "$PART.log"
   done
   die "All download routes failed: ${DEST##*/}"
@@ -344,8 +361,21 @@ PY
 # ---------------------------------------------------------------------------
 TOOL_FILES="tools/gen_license.py tools/aes128.py tools/patch_core.py tools/gosym.py tools/patch_agent.py state/license.crt"
 
+fetch_tool_files() {
+  # 从 main 分支静默拉取工具脚本（不打印进度）。
+  mkdir -p "$WORK/tools" "$WORK/state"
+  local REL
+  for REL in $TOOL_FILES; do
+    fetch "https://raw.githubusercontent.com/$REPO/main/$REL" "$WORK/$REL" silent
+  done
+  # 语法自检，确保工具下载完整可用
+  python3 -m py_compile "$WORK/tools/gen_license.py" "$WORK/tools/aes128.py" \
+    "$WORK/tools/patch_core.py" "$WORK/tools/gosym.py" "$WORK/tools/patch_agent.py" \
+    || die "Runtime tools failed to compile"
+}
+
 fetch_tools() {
-  # 先校验内核 manifest 结构，再从 main 分支拉取工具脚本。
+  # 先校验内核 manifest 结构，再静默拉取工具脚本。
   python3 - "$RUN" "$PLATFORM" <<'PY'
 import json, pathlib, sys
 run, platform = pathlib.Path(sys.argv[1]), sys.argv[2]
@@ -360,15 +390,7 @@ p = m["platforms"][platform]
 if p.get("os") != "linux" or p.get("arch") != platform[6:] or p.get("core_asset") != "core-" + platform:
     raise SystemExit("Invalid platform declaration")
 PY
-  mkdir -p "$WORK/tools" "$WORK/state"
-  local REL
-  for REL in $TOOL_FILES; do
-    fetch "https://raw.githubusercontent.com/$REPO/main/$REL" "$WORK/$REL"
-  done
-  # 语法自检，确保工具下载完整可用
-  python3 -m py_compile "$WORK/tools/gen_license.py" "$WORK/tools/aes128.py" \
-    "$WORK/tools/patch_core.py" "$WORK/tools/gosym.py" "$WORK/tools/patch_agent.py" \
-    || die "Runtime tools failed to compile"
+  fetch_tool_files
   log "Fetched runtime tools from main branch"
 }
 
@@ -437,19 +459,17 @@ if [ "$MODE" = restore ]; then
 fi
 
 if [ "$MODE" = verify ]; then
-  WORK=""
-  [ -f "$PERSIST/runtime.path" ] && IFS= read -r WORK < "$PERSIST/runtime.path"
-  if [ -n "$WORK" ] && [ -f "$WORK/tools/patch_core.py" ]; then
-    python3 "$WORK/tools/patch_core.py" --verify --in "$CORE_BIN" || die "Cracked kernel not detected"
-  else
-    die "Runtime not found under $PERSIST; run install first"
-  fi
+  # 安装完成后下载内容已清理，这里重新静默拉取工具脚本用于校验。
+  WORK="$(mktemp -d "${TMPDIR:-/tmp}/xpack-verify.XXXXXX")"
+  fetch_tool_files
+  python3 "$WORK/tools/patch_core.py" --verify --in "$CORE_BIN" || die "Cracked kernel not detected"
   if [ -f "$PERSIST/license.status" ] && [[ "$(<"$PERSIST/license.status")" != applied ]]; then
     log "Components verified; license is pending import"
   else
     python3 "$WORK/tools/gen_license.py" --verify-db --db "$XPACK_DB" --serial-path "$SERIAL_PATH"
   fi
   systemctl is-active --quiet "$CORE_SVC"
+  rm -rf -- "$WORK"
   log "Cracked kernel verified on $CORE_BIN"
   exit 0
 fi
@@ -469,7 +489,6 @@ RELEASE_VERSION="$(<"$RUN/selected.version")"
 fetch "$(<"$RUN/manifest.url")" "$RUN/manifest.json"
 WORK="$(mktemp -d "$PERSIST/runtime.XXXXXX")"
 fetch_tools
-printf '%s\n' "$WORK" > "$PERSIST/runtime.path"
 
 PATCH_CORE="$WORK/tools/patch_core.py"
 PATCH_AGENT="$WORK/tools/patch_agent.py"
@@ -552,7 +571,10 @@ systemctl is-active --quiet "$CORE_SVC"
 python3 "$PATCH_CORE" --verify --in "$CORE_BIN"
 python3 "$GEN_LICENSE" --verify-db --db "$XPACK_DB" --serial-path "$SERIAL_PATH"
 
+# 静默清理下载的临时内容（release 资产与工具脚本），退出前不残留运行目录。
+rm -rf -- "$RUN" "$WORK" "$PREFLIGHT" 2>/dev/null || true
+
 log "Kernel replaced (all license checks removed); enterprise license applied with main-node binding"
-log "Existing certificates in the database are preserved; any prior master binding was released first"
-log "License and verified artifacts retained: $RUN"
+log "Third-party certificates preserved; any prior master binding was released first"
+log "Downloaded artifacts cleaned up"
 log "Rollback: bash unlock.sh restore (previous images: $BACKUP)"

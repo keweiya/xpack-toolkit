@@ -249,8 +249,8 @@ def build(edition, expires, nodes, assignee, device_id, issuer,
         "sms_total": int(sms_total),
         "sms_used": 0,
         "bind_node_id": "",
-        "free_count": str(nodes),         # 子节点数量
-        "free_nodes": "[]",
+        "free_count": str(nodes),         # 子节点总配额（面板显示「已绑定 / 此值」）
+        "free_nodes": "",                 # 已绑定子节点 ID，逗号分隔（如 "2,3,5"）
         "status": status,
         "message": "",
     }
@@ -286,7 +286,7 @@ def row_from_content(content, device_id=None, text=""):
         "sms_used": int(content.get("smsUsed") or 0),
         "bind_node_id": "",
         "free_count": str(nodes),
-        "free_nodes": "[]",
+        "free_nodes": "",                 # 已绑定子节点 ID，逗号分隔
         "status": "Bound",
         "message": "",
     }
@@ -331,21 +331,17 @@ def _is_toolkit_license(plain):
 
 
 def _collect_free_nodes(plain, out, seen):
-    """把一条已解密证书的子节点绑定列表并入 out（按 JSON 序列化去重）。"""
+    """把一条已解密证书的子节点绑定 ID 列表并入 out（逗号分隔，去重）。"""
     value = plain.get("free_nodes") or ""
     if not value:
         return
-    try:
-        nodes = json.loads(value)
-    except (ValueError, TypeError):
-        return
-    if not isinstance(nodes, list):
-        return
-    for node in nodes:
-        key = json.dumps(node, sort_keys=True, ensure_ascii=False)
-        if key not in seen:
-            seen.add(key)
-            out.append(node)
+    for node_id in value.split(","):
+        node_id = node_id.strip()
+        if not node_id:
+            continue
+        if node_id not in seen:
+            seen.add(node_id)
+            out.append(node_id)
 
 
 def _unbound_value(stored):
@@ -477,7 +473,7 @@ def apply_row(row, db=XPACK_DB, restart=True, bind_node_id=None,
         # 绑定新证书：继承旧脚本证书的子节点绑定（free_nodes），插入新行。
         row = dict(row, bind_node_id=master_id)
         if migrated_free_nodes:
-            row["free_nodes"] = json.dumps(migrated_free_nodes)
+            row["free_nodes"] = ",".join(migrated_free_nodes)
         stamp = dt.datetime.now().astimezone().isoformat(" ")
         stored = encrypt_row(dict(row, updated_at=stamp, created_at=stamp))
         con.execute("insert into licenses (%s) values (%s)" % (

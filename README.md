@@ -4,11 +4,15 @@
 
 ## 一键安装 / 更新
 
-```bash
-# 国外服务器
-curl -fsSL https://raw.githubusercontent.com/keweiya/xpack-toolkit/main/unlock.sh | sudo bash
+国外服务器：
 
-# 国内服务器（走 gh-proxy 镜像）
+```bash
+curl -fsSL https://raw.githubusercontent.com/keweiya/xpack-toolkit/main/unlock.sh | sudo bash
+```
+
+国内服务器（走 gh-proxy 镜像）：
+
+```bash
 curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/keweiya/xpack-toolkit/main/unlock.sh | sudo bash
 ```
 
@@ -16,7 +20,7 @@ curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/keweiya/xpack-
 
 1. **版本检测与升级**：读取宿主机 1Panel 版本与仓库最高稳定 Release；若 Release 版本较新，先通过官方安装包把宿主机 1Panel 升级到与 Release 一致（数据库迁移随官方内核启动自动完成）。
 2. **替换破解内核**：从 Release 下载已移除全部授权检查的破解内核，替换官方或第三方内核；amd64 的 Agent 从官方原件重建。安装/证书工具（`gen_license.py` 等）直接从 `main` 分支拉取，不打包进 Release。
-3. **本地生成授权证书**：生成企业版授权（999 节点、永久有效、离线），直接写入 `licenses` 表并绑定主节点。**机器中既有的证书/许可证一律保留不删除**；若主节点已绑定其它证书，会先解除旧绑定（交互终端提示确认，非交互默认自动解绑）。
+3. **本地生成授权证书**：生成企业版授权（999 节点、永久有效、离线），直接写入 `licenses` 表并绑定主节点。**本工具之前生成的证书会删除重做（子节点绑定自动迁移）**；第三方/官方证书一律保留，若主节点已绑定其它证书则先解除旧绑定。
 
 破解内核已**移除全部授权检查**：授权中间件放行、本地签名/根证书校验恒通过、节点额度校验恒通过、授权上报/解绑不回连服务器。因此**不需要宿主机额外签发/生成任何授权证书，也不需要签名私钥**。
 

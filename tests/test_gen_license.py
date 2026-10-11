@@ -149,10 +149,7 @@ class DatabaseTests(unittest.TestCase):
                                self.serial.read_text(), "lxware", 100000, False, True, "2.x")
         text = gen.encode_license(content)
         old = gen.row_from_content(content, text=text)
-        old["free_nodes"] = json.dumps([
-            {"id": 2, "addr": "192.168.1.2", "name": "node2", "isXpack": False},
-            {"id": 3, "addr": "192.168.1.3", "name": "node3", "isXpack": False},
-        ])
+        old["free_nodes"] = "2,3"  # 面板绑定子节点后为逗号分隔的节点 ID
         gen.apply_row(old, str(self.db), restart=False, serial_path=str(self.serial))
 
         result = self._apply()
@@ -166,9 +163,9 @@ class DatabaseTests(unittest.TestCase):
             for raw in con.execute("select * from licenses"):
                 plain = gen.decrypt_row(dict(raw))
                 if plain.get("bind_node_id") == master:
-                    migrated = json.loads(plain.get("free_nodes") or "[]")
+                    migrated = (plain.get("free_nodes") or "").split(",")
             self.assertIsNotNone(migrated)
-            self.assertEqual(sorted(n["name"] for n in migrated), ["node2", "node3"])
+            self.assertEqual(sorted(x for x in migrated if x), ["2", "3"])
 
     def test_serial_mismatch_rejected(self):
         content, _ = gen.build("enterprise", "2099-12-31", 999, "YG",
