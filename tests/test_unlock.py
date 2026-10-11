@@ -81,20 +81,35 @@ def verify_license(text):
     if d.get("signed") is not True: raise ValueError("Unsigned fixture license")
     if d.get("foreign"): raise ValueError("Wrong project signing key")
     return d
+def is_foreign(text):
+    try: return bool(json.loads(text).get("foreign"))
+    except (ValueError, TypeError, AttributeError): return True
+def archive_foreign_rows(rows, directory):
+    raw = json.dumps({"rows": [{"rowid": row[0], "bind_node_id": row[1], "license": row[2]} for row in rows]}, sort_keys=True).encode()
+    digest = hashlib.sha256(raw).hexdigest()
+    backup = pathlib.Path(directory)/("foreign-licenses."+digest+".json")
+    backup.parent.mkdir(parents=True, exist_ok=True)
+    if backup.exists(): assert backup.read_bytes() == raw
+    else: backup.write_bytes(raw)
+    pathlib.Path(str(backup)+".sha256").write_text(digest+"  "+str(backup)+"\n")
+    return backup
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     for x in ("edition", "expires", "nodes", "assignee", "out", "import-file", "db", "serial-path", "export-existing", "foreign-backup-dir"):
         p.add_argument("--"+x)
     p.add_argument("--replace-root-fingerprint", action="append", default=[])
-    for x in ("offline", "apply", "no-restart", "verify-db", "preflight-db", "preserve-foreign", "archive-foreign"): p.add_argument("--"+x, action="store_true")
+    for x in ("offline", "apply", "no-restart", "verify-db", "preflight-db", "preserve-foreign", "archive-foreign", "replace-foreign", "drop-foreign-licenses"): p.add_argument("--"+x, action="store_true")
     a = p.parse_args()
     if a.preflight_db:
         with sqlite3.connect("file:" + pathlib.Path(a.db).resolve().as_posix() + "?mode=ro", uri=True) as c:
             local = c.execute("select id from nodes where local=1").fetchone()
-            rows = c.execute("select bind_node_id from licenses").fetchall()
+            rows = c.execute("select bind_node_id,license from licenses").fetchall()
         if not local or (not a.preserve_foreign and any(str(row[0]) != str(local[0]) for row in rows)):
             raise SystemExit("Foreign-bound fixture license")
+        foreign = [row for row in rows if is_foreign(row[1])]
         with open(os.environ["EVENT_LOG"], "a") as f: f.write("preflight-db\n")
+        print(json.dumps({"ready": True, "bindNodeID": int(local[0]), "foreignLicenseCount": len(foreign),
+                          "ownedLicenseCount": len(rows) - len(foreign)}))
         raise SystemExit(0)
     if a.export_existing:
         with sqlite3.connect(a.db) as c: rows = c.execute("select license from licenses").fetchall()
@@ -125,15 +140,20 @@ if __name__ == "__main__":
         assert a.preserve_foreign and a.foreign_backup_dir
         verify_license(pathlib.Path(a.import_file).read_text())
         with sqlite3.connect(a.db) as c: rows = c.execute("select rowid,bind_node_id,license from licenses").fetchall()
-        foreign = [row for row in rows if json.loads(row[2]).get("foreign")]
+        foreign = [row for row in rows if is_foreign(row[2])]
+        if foreign: archive_foreign_rows(foreign, a.foreign_backup_dir)
+        raise SystemExit(0)
+    if a.drop_foreign_licenses:
+        # Archive first, then delete: replacement never loses a third-party row.
+        assert a.preserve_foreign and a.foreign_backup_dir
+        with sqlite3.connect(a.db) as c:
+            rows = c.execute("select rowid,bind_node_id,license from licenses").fetchall()
+        foreign = [row for row in rows if is_foreign(row[2])]
         if foreign:
-            raw = json.dumps({"rows": [{"rowid": row[0], "bind_node_id": row[1], "license": row[2]} for row in foreign]}, sort_keys=True).encode()
-            digest = hashlib.sha256(raw).hexdigest()
-            backup = pathlib.Path(a.foreign_backup_dir)/("foreign-licenses."+digest+".json")
-            backup.parent.mkdir(parents=True, exist_ok=True)
-            if backup.exists(): assert backup.read_bytes() == raw
-            else: backup.write_bytes(raw)
-            pathlib.Path(str(backup)+".sha256").write_text(digest+"  "+str(backup)+"\n")
+            archive_foreign_rows(foreign, a.foreign_backup_dir)
+            with sqlite3.connect(a.db) as c:
+                for row in foreign: c.execute("delete from licenses where rowid=?", (row[0],))
+        with open(os.environ["EVENT_LOG"], "a") as f: f.write("drop-foreign-licenses "+str(len(foreign))+"\n")
         raise SystemExit(0)
     if a.apply:
         if os.environ.get("FAIL_APPLY"): raise SystemExit(8)
@@ -142,24 +162,21 @@ if __name__ == "__main__":
         with sqlite3.connect(a.db) as c:
             node = c.execute("select id from nodes where local=1").fetchone()[0]
             rows = c.execute("select rowid,bind_node_id,license from licenses").fetchall()
-            foreign = [row for row in rows if json.loads(row[2]).get("foreign")]
+            foreign = [row for row in rows if is_foreign(row[2])]
             if foreign and a.preserve_foreign:
                 assert a.foreign_backup_dir
-                raw = json.dumps({"rows": [{"rowid": row[0], "bind_node_id": row[1], "license": row[2]} for row in foreign]}, sort_keys=True).encode()
-                digest = hashlib.sha256(raw).hexdigest()
-                backup = pathlib.Path(a.foreign_backup_dir)/("foreign-licenses."+digest+".json")
-                backup.parent.mkdir(parents=True, exist_ok=True)
-                if backup.exists(): assert backup.read_bytes() == raw
-                else: backup.write_bytes(raw)
-                pathlib.Path(str(backup)+".sha256").write_text(digest+"  "+str(backup)+"\n")
-                for row in foreign:
-                    if str(row[1]) == str(node): c.execute("update licenses set bind_node_id=0 where rowid=?", (row[0],))
+                archive_foreign_rows(foreign, a.foreign_backup_dir)
+                if a.replace_foreign:
+                    for row in foreign: c.execute("delete from licenses where rowid=?", (row[0],))
+                else:
+                    for row in foreign:
+                        if str(row[1]) == str(node): c.execute("update licenses set bind_node_id=0 where rowid=?", (row[0],))
             elif any(str(row[1]) == str(node) for row in foreign): raise SystemExit("Foreign-bound fixture license")
             for row in rows:
                 if row not in foreign: c.execute("delete from licenses where rowid=?", (row[0],))
             c.execute("insert into licenses values (?,?)", (node, text))
         with open(os.environ["EVENT_LOG"], "a") as f:
-            f.write("apply "+str(node)+" "+",".join(a.replace_root_fingerprint)+"\n")
+            f.write("apply "+str(node)+" "+",".join(a.replace_root_fingerprint)+(" replace-foreign" if a.replace_foreign else "")+"\n")
 '''
 
 CERT_STORE = r'''
@@ -185,7 +202,17 @@ if __name__ == "__main__":
         for key, value in roots:
             allowed = {fp, OFFICIAL_FP["hk"], OFFICIAL_FP["cn"]} if key.endswith("Fingerprint") else {pem}
             if value not in allowed and not a.preserve_foreign: raise SystemExit("Unknown fixture root")
+        stored = dict(roots)
+        states = {}
+        for region in ("hk", "cn"):
+            cert_key = "LicenseRootCert" + region.upper(); fp_key = cert_key + "Fingerprint"
+            if cert_key not in stored and fp_key not in stored: states[region] = "missing"
+            elif cert_key not in stored or fp_key not in stored: states[region] = "incomplete"
+            elif stored[fp_key] == OFFICIAL_FP[region]: states[region] = "official"
+            elif stored[fp_key] == fp: states[region] = "project"
+            else: states[region] = "foreign"
         with open(os.environ["EVENT_LOG"], "a") as f: f.write("check-owned\n")
+        print(json.dumps({"ready": True, "roots": states}))
         raise SystemExit(0)
     if a.archive_current:
         assert a.preserve_foreign
@@ -232,7 +259,7 @@ if __name__ == "__main__":
 '''
 
 MOCK_COMMAND = r'''#!/usr/bin/env python3
-import hashlib, json, os, pathlib, shutil, subprocess, sys
+import hashlib, json, os, pathlib, shutil, subprocess, sys, time
 name = pathlib.Path(sys.argv[0]).name; args = sys.argv[1:]
 base = pathlib.Path(os.environ["FIXTURE_ROOT"]).resolve()
 def confined(value):
@@ -291,6 +318,9 @@ elif name == "curl":
             f.write(json.dumps({"args": args, "probe": probe, "proxy_env": {key: os.environ[key] for key in
                 ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "all_proxy", "ALL_PROXY")
                 if key in os.environ}})+"\n")
+    delay = os.environ.get("MOCK_CURL_SLEEP")
+    if delay and not probe and not (os.environ.get("MOCK_CURL_SLEEP_MATCH") and os.environ["MOCK_CURL_SLEEP_MATCH"] not in url):
+        time.sleep(float(delay))
     api = os.environ.get("API_URL_CHECK", "")
     original_url = url[url.find(api):] if api and api in url else url
     if api and original_url == api:
@@ -501,6 +531,69 @@ class Fixture:
     def curl_trace(self):
         path = Path(self.env["CURL_TRACE"])
         return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def downloads_only(self):
+        return [call for call in self.curl_trace() if not call["probe"]]
+
+    def slow_curl(self, seconds=6, match=None):
+        """Make the mocked curl sleep before it writes, so a heartbeat is observable."""
+        self.env["MOCK_CURL_SLEEP"] = str(seconds)
+        if match is not None: self.env["MOCK_CURL_SLEEP_MATCH"] = match
+
+    def fetch_program(self, url, destination=None):
+        """Real parser plus one fetch call, delivered as a piped shell body."""
+        program = self.script.read_text().split('\nWORK=""', 1)[0]
+        program += '\nfetch "$TEST_FETCH_URL" "$TEST_FETCH_DEST"\nprintf "PIPE_BODY_INTACT\\n"\n'
+        return program, {"TEST_FETCH_URL": url,
+                         "TEST_FETCH_DEST": str(destination or self.temporary / "fetched.bin")}
+
+    def fetch_only(self, url, destination=None, options=(), **env):
+        program, extra = self.fetch_program(url, destination)
+        return subprocess.run(["bash", "-s", "--", *options], input=program, cwd=self.base,
+                              env={**self.env, **extra, **env}, capture_output=True,
+                              text=True, start_new_session=True, timeout=90)
+
+    def event_lines(self):
+        """Event log as individual lines; ``self.events`` stays the log file path."""
+        return self.log().splitlines()
+
+    def gen_license_calls(self):
+        return [line.split("code gen_license ", 1)[1] for line in self.event_lines()
+                if line.startswith("code gen_license ")]
+
+    def part_files(self):
+        """Every temporary transfer artifact, wherever the installer put it."""
+        return sorted(str(path) for path in self.base.rglob("*.part.*"))
+
+    def license_status(self):
+        path = self.work / "license.status"
+        return path.read_text().strip() if path.is_file() else None
+
+    def third_party_roots(self, regions=("hk", "cn")):
+        """Install a third-party root pair: neither the project nor the official certificate."""
+        directory = self.base / "third-party-state"
+        directory.mkdir(exist_ok=True)
+        subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                        "-keyout", str(directory / "license.key"),
+                        "-out", str(directory / "license.crt"), "-days", "1",
+                        "-subj", "/CN=temporary-third-party-root"],
+                       capture_output=True, check=True, timeout=30)
+        pem = (directory / "license.crt").read_text()
+        fp = sha(ssl.PEM_cert_to_DER_cert(pem))
+        with sqlite3.connect(self.db) as c:
+            for region in regions:
+                c.execute("insert into core_settings values(?,?)",
+                          ("LicenseRootCert" + region.upper(), pem))
+                c.execute("insert into core_settings values(?,?)",
+                          ("LicenseRootCert" + region.upper() + "Fingerprint", fp))
+        return pem, fp
+
+    def third_party_licenses(self, count=1, bind_node_id=17):
+        """Rows signed by another issuer, exactly what the preflight reports as foreign."""
+        with sqlite3.connect(self.db) as c:
+            for index in range(count):
+                c.execute("insert into licenses values(?,?)",
+                          (bind_node_id, json.dumps({"signed": True, "foreign": True, "index": index})))
 
     def probe_responses(self, responses):
         path = self.downloads / "probe-map.json"

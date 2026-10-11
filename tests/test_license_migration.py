@@ -98,6 +98,266 @@ class LicenseMigrationTests(unittest.TestCase):
         self.assertEqual(self.archives(), [])
         self.assertEqual(list(self.base.glob(".*.tmp")), [])
 
+    def licenses_digest(self):
+        """Full licenses table content plus the raw database bytes."""
+        with sqlite3.connect(self.db) as con:
+            con.row_factory = sqlite3.Row
+            table = [dict(row) for row in con.execute("select * from licenses order by id")]
+        return table, self.db.read_bytes()
+
+    def test_replace_foreign_archives_then_deletes_every_foreign_row_and_binds_project_row(self):
+        master_foreign = self.insert(self.issue(foreign=True), 17)
+        other_foreign = self.insert(self.issue(foreign=True), 23)
+        unbound_foreign = self.insert(self.issue(foreign=True))
+        other_owned = self.insert(self.issue(), 23)
+        before = self.rows()
+        project = self.issue()
+        result = self.apply(project, replace_foreign=True)
+        after = self.rows()
+        self.assertEqual(result["dropped"], 3)
+        self.assertEqual(result["backup"], str(self.db) + ".pre-license")
+        self.assertTrue(os.path.isfile(result))
+        with sqlite3.connect(result) as con:
+            con.row_factory = sqlite3.Row
+            saved = {row["id"]: dict(row) for row in con.execute("select * from licenses")}
+        self.assertEqual(saved, before)
+        for row_id in (master_foreign, other_foreign, unbound_foreign):
+            self.assertNotIn(row_id, after)
+        self.assertEqual(after[other_owned], before[other_owned])
+        new_id, = set(after) - set(before)
+        imported = gl.decrypt_row(after[new_id])
+        self.assertEqual(imported["bind_node_id"], "17")
+        self.assertEqual(imported["license"], project["license"])
+        self.assertEqual(self.serial.read_text(), "temporary-device")
+        self.assertTrue(gl.verify_database(str(self.db), str(self.serial))["signatureVerified"])
+        archive = Path(result["archive"])
+        payload = archive.read_bytes()
+        self.assertEqual(archive.name,
+                         "foreign-licenses.%s.json" % hashlib.sha256(payload).hexdigest())
+        self.assertEqual(stat.S_IMODE(archive.stat().st_mode), 0o600)
+        data = json.loads(payload)
+        self.assertEqual(data["master"], "17")
+        self.assertEqual(data["columns"], list(before[master_foreign]))
+        self.assertEqual(data["rows"],
+                         [before[i] for i in (master_foreign, other_foreign, unbound_foreign)])
+        self.assertEqual(self.archives(), [archive])
+        stable_rows = self.rows()
+        baseline = Path(str(self.db) + ".pre-license").read_bytes()
+        again = self.apply(project, replace_foreign=True)
+        self.assertEqual(again["dropped"], 0)
+        self.assertNotIn("archive", again)
+        self.assertEqual(set(self.rows()), set(stable_rows))
+        self.assertEqual(self.rows()[other_owned], before[other_owned])
+        rebound = gl.decrypt_row(self.rows()[new_id])
+        self.assertEqual(rebound["bind_node_id"], "17")
+        self.assertEqual(rebound["license"], project["license"])
+        self.assertEqual(self.archives(), [archive])
+        self.assertEqual(archive.read_bytes(), payload)
+        self.assertEqual(Path(str(self.db) + ".pre-license").read_bytes(), baseline)
+
+    def test_replace_foreign_rolls_back_every_delete_when_a_later_write_fails(self):
+        self.insert(self.issue(foreign=True), 17)
+        self.insert(self.issue(foreign=True), 23)
+        self.insert(self.issue(foreign=True))
+        before = self.rows()
+        project = self.issue()
+        rollback_serial = self.base / ".serial-rollback"
+        failures = (
+            ("later insert", mock.patch.object(gl, "encrypt_row",
+                                               side_effect=ValueError("insert failed"))),
+            ("serial check", mock.patch.object(gl.os, "chmod",
+                                               side_effect=OSError("serial write failed"))),
+        )
+        for label, patcher in failures:
+            with self.subTest(failure=label):
+                with patcher:
+                    with self.assertRaises((ValueError, OSError)):
+                        gl.apply_row(project, str(self.db), restart=False,
+                                     serial_path=str(rollback_serial),
+                                     preserve_foreign=True, replace_foreign=True)
+                self.assertEqual(self.rows(), before)
+                self.assertEqual(self.serial.read_text(), "temporary-device")
+                self.assertEqual(gl.preflight_database(str(self.db), str(rollback_serial),
+                                                       None, (), True, True)
+                                 ["foreignLicenseCount"], 3)
+
+    def test_replace_and_archive_reject_preserve_foreign_free_replacement(self):
+        self.insert(self.issue(foreign=True), 17)
+        before = self.licenses_digest()
+        project = self.issue()
+        operations = (
+            lambda: gl.apply_row(project, str(self.db), False, None, str(self.serial),
+                                 (), False, None, True),
+            lambda: gl.preflight_database(str(self.db), str(self.serial), None, (), False, True),
+            lambda: gl.archive_foreign_database(project, str(self.db),
+                                                serial_path=str(self.serial),
+                                                preserve_foreign=False, replace_foreign=True),
+        )
+        for operation in operations:
+            with self.assertRaisesRegex(ValueError, "preserve-foreign"):
+                operation()
+            self.assertEqual(self.licenses_digest(), before)
+            self.assert_no_backups()
+
+    def test_cli_replace_and_drop_require_preserve_foreign_with_zero_writes(self):
+        self.insert(self.issue(foreign=True), 17)
+        before = self.licenses_digest()
+        env = dict(os.environ, SIGN_CRT=str(self.keydir / "project.crt"),
+                   SIGN_KEY=str(self.keydir / "project.key"), PYTHONDONTWRITEBYTECODE="1")
+        command = [sys.executable, str(ROOT / "tools/gen_license.py"), "--db", str(self.db),
+                   "--serial-path", str(self.serial)]
+        for flag in ("--replace-foreign", "--drop-foreign-licenses"):
+            with self.subTest(flag=flag):
+                result = subprocess.run(command + [flag], env=env, capture_output=True,
+                                        text=True, timeout=60)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("--preserve-foreign", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertEqual(self.licenses_digest(), before)
+                self.assert_no_backups()
+
+    def test_archive_foreign_database_with_replace_foreign_archives_all_rows_read_only(self):
+        self.insert(self.issue(foreign=True), 17)
+        self.insert(self.issue(foreign=True), 23)
+        self.insert(self.issue(foreign=True))
+        before = self.licenses_digest()
+        result = gl.archive_foreign_database(self.issue(), str(self.db),
+                                            serial_path=str(self.serial),
+                                            preserve_foreign=True, replace_foreign=True)
+        self.assertEqual(result["foreignLicenseCount"], 3)
+        self.assertEqual(self.licenses_digest(), before)
+        self.assertFalse(Path(str(self.db) + ".pre-license").exists())
+        self.assertEqual(len(json.loads(Path(result["archive"]).read_text())["rows"]), 3)
+
+    def test_drop_foreign_database_archives_and_deletes_without_license_material(self):
+        master_foreign = self.insert(self.issue(foreign=True), 17)
+        other_foreign = self.insert(self.issue(foreign=True), 23)
+        unbound_foreign = self.insert(self.issue(foreign=True))
+        before = self.rows()
+        with mock.patch.object(gl, "sign_payload",
+                               side_effect=AssertionError("unexpected signing")):
+            result = gl.drop_foreign_database(str(self.db), serial_path=str(self.serial))
+        self.assertTrue(result["ready"])
+        self.assertEqual(result["bindNodeID"], "17")
+        self.assertEqual(result["foreignLicenseCount"], 3)
+        self.assertEqual(result["dropped"], 3)
+        self.assertEqual(self.rows(), {})
+        self.assertEqual(self.licenses_digest()[0], [])
+        self.assertEqual(self.serial.read_text(), "temporary-device")
+        self.assertFalse(Path(str(self.db) + ".pre-license").exists())
+        archive = Path(result["archive"])
+        payload = archive.read_bytes()
+        self.assertEqual(archive.name,
+                         "foreign-licenses.%s.json" % hashlib.sha256(payload).hexdigest())
+        self.assertEqual(stat.S_IMODE(archive.stat().st_mode), 0o600)
+        data = json.loads(payload)
+        self.assertEqual(data["master"], "17")
+        self.assertEqual(data["columns"], list(before[master_foreign]))
+        self.assertEqual(data["rows"],
+                         [before[i] for i in (master_foreign, other_foreign, unbound_foreign)])
+        self.assertEqual(self.archives(), [archive])
+
+    def test_drop_foreign_database_is_a_zero_write_noop_without_foreign_rows(self):
+        owned_master = self.insert(self.issue(), 17)
+        owned_other = self.insert(self.issue(), 23)
+        before = self.licenses_digest()
+        result = gl.drop_foreign_database(str(self.db), serial_path=str(self.serial))
+        self.assertEqual(result["foreignLicenseCount"], 0)
+        self.assertEqual(result["dropped"], 0)
+        self.assertIsNone(result["archive"])
+        self.assertEqual(self.licenses_digest(), before)
+        self.assertEqual(set(self.rows()), {owned_master, owned_other})
+        self.assert_no_backups()
+        with sqlite3.connect(self.db) as con:
+            con.execute("delete from licenses")
+        empty = self.licenses_digest()
+        result = gl.drop_foreign_database(str(self.db), serial_path=str(self.serial))
+        self.assertEqual(result["dropped"], 0)
+        self.assertIsNone(result["archive"])
+        self.assertEqual(self.licenses_digest(), empty)
+        self.assert_no_backups()
+
+    def test_cli_drop_foreign_licenses_needs_no_signing_key_or_license_file(self):
+        self.insert(self.issue(foreign=True), 17)
+        self.insert(self.issue(foreign=True), 23)
+        env = dict(os.environ, SIGN_CRT=str(self.keydir / "project.crt"),
+                   SIGN_KEY=str(self.base / "missing-key"), PYTHONDONTWRITEBYTECODE="1")
+        command = [sys.executable, str(ROOT / "tools/gen_license.py"), "--db", str(self.db),
+                   "--serial-path", str(self.serial), "--preserve-foreign",
+                   "--drop-foreign-licenses"]
+        result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["dropped"], 2)
+        self.assertEqual(payload["foreignLicenseCount"], 2)
+        self.assertTrue(Path(payload["archive"]).is_file())
+        self.assertEqual(self.rows(), {})
+        again = subprocess.run(command, env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertEqual(json.loads(again.stdout)["dropped"], 0)
+        self.assertIsNone(json.loads(again.stdout)["archive"])
+        self.assertEqual(self.archives(), [Path(payload["archive"])])
+
+    def test_cli_apply_replace_foreign_replaces_the_third_party_authorization(self):
+        self.insert(self.issue(foreign=True), 17)
+        self.insert(self.issue(foreign=True), 23)
+        project = self.issue()
+        license_file = self.base / "license.txt"
+        license_file.write_text(project["license"])
+        backup_dir = self.base / "installation-backup"
+        backup_dir.mkdir()
+        env = dict(os.environ, SIGN_CRT=str(self.keydir / "project.crt"),
+                   SIGN_KEY=str(self.keydir / "project.key"), PYTHONDONTWRITEBYTECODE="1")
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "tools/gen_license.py"), "--db", str(self.db),
+             "--serial-path", str(self.serial), "--preserve-foreign", "--replace-foreign",
+             "--foreign-backup-dir", str(backup_dir), "--import-file", str(license_file),
+             "--apply", "--no-restart"], env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("主节点已绑定", result.stdout)
+        remaining = self.rows()
+        project_id, = remaining
+        self.assertEqual(gl.decrypt_row(remaining[project_id])["license"], project["license"])
+        archive, = self.archives(backup_dir)
+        self.assertEqual(len(json.loads(archive.read_text())["rows"]), 2)
+        self.assertTrue(gl.verify_database(str(self.db), str(self.serial))["signatureVerified"])
+
+    def test_malformed_duplicate_and_unknown_root_rows_keep_strict_default_path(self):
+        unknown = self.base / "unknown"
+        subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                        "-keyout", str(unknown.with_suffix(".key")),
+                        "-out", str(unknown.with_suffix(".crt")), "-days", "1",
+                        "-subj", "/CN=temporary-unknown"], capture_output=True, check=True)
+        content, _ = gl.build("enterprise", "2099-12-31", 10, "Fixture", "temporary-device",
+                              "fixture", 0, False, True, "2.x")
+        with mock.patch.multiple(gl, SIGN_KEY=str(unknown.with_suffix(".key")),
+                                 SIGN_CRT=str(unknown.with_suffix(".crt"))):
+            unknown_root = self.insert(
+                gl.row_from_content(content, text=gl.encode_license(content)), 17)
+        shared = self.issue(foreign=True)
+        duplicate_a = self.insert(shared, 17)
+        duplicate_b = self.insert(shared, 17)
+        malformed = self.insert({"license_name": "!!not-base64!!",
+                                 "license": "!!not-base64!!"}, 17, encrypted=False)
+        rows_before = self.rows()
+        digest_before = self.licenses_digest()
+        for operation in (lambda: gl.preflight_database(str(self.db), str(self.serial)),
+                          lambda: gl.apply_row(self.issue(), str(self.db), False, None,
+                                               str(self.serial))):
+            with self.assertRaisesRegex(ValueError, "different issuer"):
+                operation()
+            self.assertEqual(self.licenses_digest(), digest_before)
+            self.assert_no_backups()
+        result = self.apply(replace_foreign=True)
+        self.assertEqual(result["dropped"], 4)
+        remaining = self.rows()
+        project_id, = remaining
+        self.assertEqual(gl.decrypt_row(remaining[project_id])["bind_node_id"], "17")
+        data = json.loads(Path(result["archive"]).read_text())
+        self.assertEqual(data["rows"],
+                         [rows_before[i] for i in (unknown_root, duplicate_a, duplicate_b,
+                                                   malformed)])
+
     def test_signed_foreign_master_changes_only_binding_and_archives_all_raw_rows(self):
         foreign_row = self.issue(foreign=True)
         master = self.insert(foreign_row, 17)
