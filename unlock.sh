@@ -18,12 +18,22 @@ MODE=install
 log() { printf '== %s\n' "$*"; }
 die() { printf '!! %s\n' "$*" >&2; exit 1; }
 trap 'printf "!! Failed; artifacts/backups retained: %s / %s\n" "$PERSIST" "$BACKUP" >&2' ERR
+# Download visibility: every transfer prints size, speed and elapsed time, so a
+# stalled route is obvious instead of looking like a hang.
+PROGRESS="${PROGRESS:-auto}"                 # auto (tty bar / log heartbeat) | on | off
+HEARTBEAT_SECONDS="${HEARTBEAT_SECONDS:-5}"  # heartbeat interval for log output
+STALL_SECONDS="${STALL_SECONDS:-30}"         # no growth for this long aborts the route
+STALL_BYTES="${STALL_BYTES:-1024}"           # average speed floor enforced by curl
+DL_MAX_TIME="${DL_MAX_TIME:-1800}"           # per-route ceiling in seconds
+REPLACE_FOREIGN="${REPLACE_FOREIGN:-0}"      # 1: drop third-party licenses after archiving
 usage() {
   printf '%s\n' 'Usage: unlock.sh [install|restore|verify|cert] [options]' \
     '  --use-mirror, --mirror auto  Measure built-in mirrors and use the fastest valid one' \
     '  --mirror URL                Use only the specified HTTP(S) GitHub gateway' \
     '  --no-mirror, --direct        Use GitHub directly, without mirror fallback' \
     '  --http-proxy URL            Set a local HTTP(S) network proxy for curl' \
+    '  --progress / --no-progress  Force download progress on/off (default: auto)' \
+    '  --replace-foreign           Replace third-party licenses with the project license' \
     '  --help                      Show this help'
 }
 CLI_ROUTE=""
@@ -39,6 +49,9 @@ while [ "$#" -gt 0 ]; do
       CLI_ROUTE="$2"; shift ;;
     --mirror=*) CLI_ROUTE="${1#*=}"; [ -n "$CLI_ROUTE" ] || die "--mirror requires auto or an HTTP(S) URL" ;;
     --no-mirror|--direct) CLI_ROUTE=direct ;;
+    --progress) PROGRESS=on ;;
+    --no-progress) PROGRESS=off ;;
+    --replace-foreign) REPLACE_FOREIGN=1 ;;
     --http-proxy)
       [ "$#" -ge 2 ] && [ -n "$2" ] || die "--http-proxy requires a proxy URL"
       export XPACK_HTTP_PROXY="$2"; shift ;;
@@ -143,7 +156,7 @@ configure_mirrors() {
     direct) MIRRORS=(); log "GitHub download mode: direct (mirrors disabled)" ;;
     auto)
       [ -n "$MIRROR_CONFIG" ] || die "No mirror candidates configured"
-      log "Measuring GitHub mirror response latency"
+      log "Measuring GitHub mirror response latency (concurrent probes, up to 12s each)"
       RANKED="$(rank_mirrors)" || die "All mirror probes failed; no installation changes were made"
       while IFS= read -r PREFIX; do MIRRORS+=("$PREFIX"); done <<< "$RANKED"
       log "Selected lowest-latency GitHub mirror: ${MIRRORS[0]}" ;;
@@ -221,9 +234,119 @@ if name in ("runtime.tar.gz", "core", "core.orig", "agent.orig"):
         raise SystemExit("Download size mismatch: " + name)
 PY
 }
+# ---- progress-aware download helpers (contiguous block, reused by tests) ----
+human_bytes() {
+  local VALUE="${1:-0}"
+  case "$VALUE" in ''|*[!0-9]*) VALUE=0 ;; esac
+  if [ "$VALUE" -ge 1073741824 ]; then printf '%d.%d GB' $(( VALUE / 1073741824 )) $(( (VALUE % 1073741824) * 10 / 1073741824 ))
+  elif [ "$VALUE" -ge 1048576 ]; then printf '%d.%d MB' $(( VALUE / 1048576 )) $(( (VALUE % 1048576) * 10 / 1048576 ))
+  elif [ "$VALUE" -ge 1024 ]; then printf '%d.%d KB' $(( VALUE / 1024 )) $(( (VALUE % 1024) * 10 / 1024 ))
+  else printf '%d B' "$VALUE"; fi
+}
+progress_enabled() {
+  case "$PROGRESS" in
+    on|ON|Yes|YES|yes|1|true) return 0 ;;
+    off|OFF|no|NO|0|false) return 1 ;;
+    *) [ -t 2 ] ;;
+  esac
+}
+route_host() {
+  local HOST="${1#*://}"
+  printf '%s\n' "${HOST%%/*}"
+}
+# Declared size of an asset, so progress can show "x / y" instead of bytes only.
+expected_size() {
+  local MAN
+  MAN="$(dirname -- "$1")/manifest.json"
+  [ -s "$MAN" ] || { printf '0\n'; return 0; }
+  python3 - "$MAN" "$(basename -- "$1")" "$PLATFORM" <<'PY' || printf '0\n'
+import json, pathlib, sys
+try:
+    manifest = json.loads(pathlib.Path(sys.argv[1]).read_text())
+except (OSError, ValueError):
+    raise SystemExit(0)
+name, platform = sys.argv[2], sys.argv[3]
+platforms = manifest.get("platforms")
+entry = (platforms or {}).get(platform) if isinstance(platforms, dict) else None
+entry = entry if isinstance(entry, dict) else {}
+runtime = manifest.get("runtime")
+runtime = runtime if isinstance(runtime, dict) else {}
+sizes = {"runtime.tar.gz": runtime.get("size"),
+         "core-" + platform: entry.get("size"),
+         "core-" + platform + ".orig": entry.get("orig_size") or entry.get("size"),
+         "agent-" + platform + ".orig": entry.get("agent_orig_size")}
+size = sizes.get(name)
+print(size if type(size) is int and size > 0 else 0)
+PY
+}
+# One route: live progress, a stall watchdog, and a completion summary line.
+download_route() {
+  local ROUTE="$1" PART="$2" ERROR="$3" LABEL="$4" TOTAL="${5:-0}"
+  local HOST PID START NOW SIZE ELAPSED RATE REPORT LAST_SIZE LAST_GROWTH STATUS=0 POLL=0.05
+  local -a ARGS=(--proto '=http,https' --proto-redir '=http,https' --tlsv1.2 -fL -S
+                 --connect-timeout 10 --max-time "$DL_MAX_TIME"
+                 --speed-limit "$STALL_BYTES" --speed-time "$STALL_SECONDS"
+                 --retry 1 --retry-max-time 20)
+  [ -z "${XPACK_HTTP_PROXY:-}" ] || ARGS+=(--proxy "$XPACK_HTTP_PROXY")
+  HOST="$(route_host "$ROUTE")"
+  START="$(date +%s)"
+  if [ "$TOTAL" -gt 0 ]; then
+    printf '   %s: %s via %s\n' "$LABEL" "$(human_bytes "$TOTAL")" "$HOST" >&2
+  else
+    printf '   %s: unknown size via %s\n' "$LABEL" "$HOST" >&2
+  fi
+  if progress_enabled; then
+    # curl owns the single-line bar: percentage, transferred, speed and ETA.
+    curl --progress-bar "${ARGS[@]}" -o "$PART" "$ROUTE" || STATUS=$?
+  else
+    # No terminal: curl stays quiet and the wrapper prints heartbeat lines.
+    curl -s "${ARGS[@]}" -o "$PART" "$ROUTE" 2> "$ERROR" &
+    PID=$!
+    REPORT=$(( START + HEARTBEAT_SECONDS )); LAST_SIZE=0; LAST_GROWTH="$START"
+    while kill -0 "$PID" 2>/dev/null; do
+      sleep "$POLL"
+      kill -0 "$PID" 2>/dev/null || break
+      NOW="$(date +%s)"; ELAPSED=$(( NOW - START )); [ "$ELAPSED" -gt 0 ] || ELAPSED=1
+      [ "$ELAPSED" -lt 2 ] || POLL=0.5
+      SIZE="$(stat -c %s -- "$PART" 2>/dev/null || printf 0)"
+      case "$SIZE" in ''|*[!0-9]*) SIZE=0 ;; esac
+      if [ "$SIZE" -gt "$LAST_SIZE" ]; then LAST_SIZE="$SIZE"; LAST_GROWTH="$NOW"; fi
+      if [ "$NOW" -ge "$REPORT" ]; then
+        RATE=$(( SIZE / ELAPSED ))
+        if [ "$TOTAL" -gt 0 ]; then
+          printf '   %s: %s / %s (%s%%) %s/s, %ss\n' "$LABEL" "$(human_bytes "$SIZE")" \
+            "$(human_bytes "$TOTAL")" "$(( SIZE * 100 / TOTAL ))" "$(human_bytes "$RATE")" "$ELAPSED" >&2
+        else
+          printf '   %s: %s, %s/s, %ss\n' "$LABEL" "$(human_bytes "$SIZE")" \
+            "$(human_bytes "$RATE")" "$ELAPSED" >&2
+        fi
+        REPORT=$(( NOW + HEARTBEAT_SECONDS ))
+      fi
+      if [ $(( NOW - LAST_GROWTH )) -ge "$STALL_SECONDS" ]; then
+        printf '!! %s: no data for %ss (floor %s/s); aborting this route\n' \
+          "$LABEL" "$(( NOW - LAST_GROWTH ))" "$(human_bytes "$STALL_BYTES")" >&2
+        kill "$PID" 2>/dev/null || true
+        break
+      fi
+    done
+    wait "$PID" || STATUS=$?
+  fi
+  NOW="$(date +%s)"; ELAPSED=$(( NOW - START )); [ "$ELAPSED" -gt 0 ] || ELAPSED=1
+  SIZE="$(stat -c %s -- "$PART" 2>/dev/null || printf 0)"
+  case "$SIZE" in ''|*[!0-9]*) SIZE=0 ;; esac
+  if [ "$STATUS" -eq 0 ]; then
+    printf '   %s: %s in %ss (%s/s)\n' "$LABEL" "$(human_bytes "$SIZE")" \
+      "$ELAPSED" "$(human_bytes $(( SIZE / ELAPSED )))" >&2
+  else
+    printf '!! %s: transfer failed (curl exit %s) after %ss, %s received\n' \
+      "$LABEL" "$STATUS" "$ELAPSED" "$(human_bytes "$SIZE")" >&2
+  fi
+  return "$STATUS"
+}
+# ---- end progress-aware download helpers ----
 fetch() {
-  local URL="$1" DEST="$2" PREFIX CANDIDATE PART ERROR HOST
-  local -a ROUTES=("$URL") CURL_PROXY=() ORDER=()
+  local URL="$1" DEST="$2" PREFIX CANDIDATE PART ERROR HOST TOTAL
+  local -a ROUTES=("$URL") ORDER=()
   case "$URL" in
     https://github.com/*|https://raw.githubusercontent.com/*|https://api.github.com/*)
       configure_mirrors
@@ -232,13 +355,11 @@ fetch() {
         for PREFIX in "${MIRRORS[@]}"; do ROUTES+=("$PREFIX$URL"); done
       fi ;;
   esac
-  [ -z "${XPACK_HTTP_PROXY:-}" ] || CURL_PROXY=(--proxy "$XPACK_HTTP_PROXY")
+  TOTAL="$(expected_size "$DEST")"
   for CANDIDATE in "${ROUTES[@]}"; do
     PART="$(mktemp "$DEST.part.XXXXXX")"
     ERROR="$PART.log"
-    if curl --proto '=http,https' --proto-redir '=http,https' --tlsv1.2 -fsSL \
-      --connect-timeout 10 --max-time 180 --retry 1 --retry-max-time 20 \
-      "${CURL_PROXY[@]}" -o "$PART" "$CANDIDATE" 2> "$ERROR" \
+    if download_route "$CANDIDATE" "$PART" "$ERROR" "${DEST##*/}" "$TOTAL" \
       && validate_download "$PART" "$DEST" 2>> "$ERROR"; then
       mv -f -- "$PART" "$DEST"
       rm -f -- "$ERROR"
@@ -250,8 +371,9 @@ fetch() {
       fi
       return 0
     fi
-    HOST="${CANDIDATE#*://}"; HOST="${HOST%%/*}"
+    HOST="$(route_host "$CANDIDATE")"
     printf '== Download route %s failed or returned invalid data; trying next route\n' "$HOST" >&2
+    if [ -s "$ERROR" ]; then tail -n 3 "$ERROR" | sed 's/^/   /' >&2; fi
     rm -f -- "$PART" "$ERROR"
   done
   die "All download routes failed: ${DEST##*/}"
@@ -580,7 +702,12 @@ fi
 if [[ "$MODE" = install || "$MODE" = deploy || "$MODE" = cert ]]; then
   python3 "$CERT_STORE" --preserve-foreign --check-owned --cert "$SIGN_CRT" --db "$XPACK_DB"
   python3 "$GEN_LICENSE" --preserve-foreign --preflight-db --db "$XPACK_DB" --serial-path "$PANEL_ROOT/db/.serial"
+  if [ "$REPLACE_FOREIGN" = 1 ]; then
+    log "Third-party licenses will be archived in $BACKUP and replaced by the project-signed license"
+  fi
 fi
+REPLACE_ARGS=()
+[ "$REPLACE_FOREIGN" != 1 ] || REPLACE_ARGS+=(--replace-foreign)
 LICENSE_OUT="$RUN/license.txt"
 LICENSE_READY=1
 if [ -n "${LICENSE_FILE:-}" ]; then
@@ -596,6 +723,9 @@ else
     LICENSE_READY=0
     log "No reusable project-signed license; preserving all old licenses and installing components pending import"
   fi
+fi
+if [ "$REPLACE_FOREIGN" = 1 ] && [ "$LICENSE_READY" != 1 ]; then
+  die "REPLACE_FOREIGN=1 needs LICENSE_FILE or local signing material; third-party licenses were left untouched"
 fi
 # Shared generator owns encrypted three-segment decoding/signature verification.
 if [ "$LICENSE_READY" = 1 ]; then
@@ -632,7 +762,8 @@ fi
 [ -f "$XPACK_DB" ] || die "Missing initialized database: $XPACK_DB"
 if [ "${NO_APPLY:-0}" != 1 ] && [ "$LICENSE_READY" = 1 ]; then
   HELP="$(python3 "$GEN_LICENSE" --help)"
-  for FLAG in --db --serial-path --no-restart --preflight-db --verify-db --preserve-foreign --foreign-backup-dir; do
+  for FLAG in --db --serial-path --no-restart --preflight-db --verify-db --preserve-foreign --foreign-backup-dir \
+              ${REPLACE_ARGS[@]+"${REPLACE_ARGS[@]}"}; do
     [[ "$HELP" == *"$FLAG"* ]] || die "Update gen_license.py: missing $FLAG (legacy expiry patching is not used)"
   done
 fi
@@ -715,6 +846,7 @@ python3 "$CERT_STORE" --preserve-foreign --archive-current --cert "$SIGN_CRT" --
   --bak "$BACKUP/core_settings_license_rootcert.json"
 if [ "${NO_APPLY:-0}" != 1 ] && [ "$LICENSE_READY" = 1 ]; then
   python3 "$GEN_LICENSE" --preserve-foreign --archive-foreign --foreign-backup-dir "$BACKUP" \
+    ${REPLACE_ARGS[@]+"${REPLACE_ARGS[@]}"} \
     --import-file "$LICENSE_OUT" --db "$XPACK_DB" --serial-path "$PANEL_ROOT/db/.serial"
 fi
 backup_orig "$RUN/core.orig" core
@@ -746,7 +878,8 @@ PY
 install -m 0600 "$RUN/project-root-fingerprint" "$BACKUP/script_root_fingerprints"
 python3 "$CERT_STORE" --preserve-foreign --cert "$SIGN_CRT" --db "$XPACK_DB" --bak "$BACKUP/core_settings_license_rootcert.json"
 if [ "${NO_APPLY:-0}" != 1 ] && [ "$LICENSE_READY" = 1 ]; then
-  python3 "$GEN_LICENSE" --preserve-foreign --foreign-backup-dir "$BACKUP" --import-file "$LICENSE_OUT" --apply --db "$XPACK_DB" \
+  python3 "$GEN_LICENSE" --preserve-foreign --foreign-backup-dir "$BACKUP" \
+    ${REPLACE_ARGS[@]+"${REPLACE_ARGS[@]}"} --import-file "$LICENSE_OUT" --apply --db "$XPACK_DB" \
     --serial-path "$PANEL_ROOT/db/.serial" --no-restart
   printf 'applied\n' > "$PERSIST/license.status"
 elif [ "${NO_APPLY:-0}" = 1 ]; then
@@ -769,6 +902,7 @@ if [ "${NO_APPLY:-0}" != 1 ] && [ "$LICENSE_READY" = 1 ]; then
 fi
 if [ "$LICENSE_READY" != 1 ]; then log "Repository components installed; third-party certificates/licenses retained; import a project-signed license to activate"
 elif [ "${NO_APPLY:-0}" = 1 ]; then log "Core/certificate replaced; license NOT applied (NO_APPLY=1)"
+elif [ "$REPLACE_FOREIGN" = 1 ]; then log "Core/certificate replaced; third-party licenses archived and replaced by the project-signed license"
 else log "Core/certificate replaced; offline license applied with automatic main-node binding"; fi
 log "License and verified artifacts retained: $RUN"
 log "Rollback: bash unlock.sh restore (official images: $BACKUP)"

@@ -122,8 +122,9 @@ class DownloadMirrorTests(unittest.TestCase):
         self.assertIn("first-api-readonly", self.f.log())
         for call in self.f.curl_trace():
             args = call["args"]
-            for option, value in (("--connect-timeout", "10"), ("--max-time", "180"),
-                                  ("--retry", "1"), ("--retry-max-time", "20")):
+            for option, value in (("--connect-timeout", "10"), ("--max-time", "1800"),
+                                  ("--retry", "1"), ("--retry-max-time", "20"),
+                                  ("--speed-limit", "1024"), ("--speed-time", "30")):
                 self.assertEqual(args[args.index(option) + 1], value)
             destination = Path(args[args.index("-o") + 1])
             self.assertIn(".part.", destination.name)

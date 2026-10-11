@@ -521,15 +521,23 @@ def _publish_snapshot(directory, name, payload):
     return os.path.join(directory, name)
 
 
-def _archive_foreign_licenses(con, db, master_id, scoped, foreign_backup_dir=None):
-    """Capture all foreign raw rows under the same writer lock as the migration."""
-    if not any(not owned and bound == master_id for _, _, owned, bound in scoped):
+def _archive_foreign_licenses(con, db, master_id, scoped, foreign_backup_dir=None, scope="bound"):
+    """Capture foreign raw rows under the same writer lock as the migration.
+
+    scope="bound" is the preserve default: every foreign row is captured once one
+    of them holds the master binding. scope="all" captures foreign rows even when
+    none is bound, which replace mode needs before it drops them.
+    """
+    foreign = [stored for stored, _, owned, _ in scoped if not owned]
+    if scope == "bound" and not any(bound == master_id for _, _, owned, bound in scoped if not owned):
+        return None
+    if not foreign:
         return None
     archive = {
         "schema": 1, "name": "xpack-toolkit-foreign-licenses",
         "database": os.path.abspath(db), "master": master_id,
         "columns": [r[1] for r in con.execute("pragma table_info(licenses)")],
-        "rows": [stored for stored, _, owned, _ in scoped if not owned],
+        "rows": foreign,
     }
     archive["rows"].sort(key=lambda row: row["id"])
     payload = (json.dumps(archive, sort_keys=True, ensure_ascii=True, separators=(",", ":"),
@@ -599,7 +607,7 @@ def _check_serial(serial_path, device_id):
 
 def archive_foreign_database(row, db=XPACK_DB, bind_node_id=None, serial_path=None,
                             replace_root_fingerprints=(), preserve_foreign=False,
-                            foreign_backup_dir=None):
+                            foreign_backup_dir=None, replace_foreign=False):
     """Archive before component replacement, without changing any database row."""
     if not preserve_foreign:
         raise ValueError("foreign archival requires --preserve-foreign")
@@ -611,15 +619,18 @@ def archive_foreign_database(row, db=XPACK_DB, bind_node_id=None, serial_path=No
         con.execute("begin")
         master_id, scoped = _database_scope(con, fingerprints, bind_node_id, True)
         _check_serial(serial_path, row["device_id"])
-        archive = _archive_foreign_licenses(con, db, master_id, scoped, foreign_backup_dir)
+        archive = _archive_foreign_licenses(con, db, master_id, scoped, foreign_backup_dir,
+                                            "all" if replace_foreign else "bound")
     return {"ready": True, "bindNodeID": master_id, "archive": archive,
             "foreignLicenseCount": sum(not owned for _, _, owned, _ in scoped)}
 
 
 def apply_row(row, db=XPACK_DB, restart=True, bind_node_id=None,
               serial_path=None, replace_root_fingerprints=(), preserve_foreign=False,
-              foreign_backup_dir=None):
+              foreign_backup_dir=None, replace_foreign=False):
     row = _validated_project_row(row)
+    if replace_foreign and not preserve_foreign:
+        raise ValueError("foreign replacement requires --preserve-foreign")
     if not os.path.isfile(db):
         raise ValueError("missing initialized database: %s" % db)
     serial_path = serial_path or os.path.join(os.path.dirname(db), ".serial")
@@ -633,7 +644,8 @@ def apply_row(row, db=XPACK_DB, restart=True, bind_node_id=None,
         master_id, scoped = _database_scope(con, fingerprints, bind_node_id, preserve_foreign)
         _check_serial(serial_path, row["device_id"])
         if preserve_foreign:
-            _archive_foreign_licenses(con, db, master_id, scoped, foreign_backup_dir)
+            _archive_foreign_licenses(con, db, master_id, scoped, foreign_backup_dir,
+                                      "all" if replace_foreign else "bound")
         _backup_database(db, backup)
         for foreign, _, owned, bound in scoped:
             if not owned and bound == master_id:
@@ -650,6 +662,12 @@ def apply_row(row, db=XPACK_DB, restart=True, bind_node_id=None,
                     replace_ids.append(stored["id"])
         for old_id in replace_ids:
             con.execute("delete from licenses where id=?", (old_id,))
+        if replace_foreign:
+            # Direct replacement: the archived third-party rows leave the table,
+            # so the panel only shows the project-signed license.
+            for stored, _, owned, _ in scoped:
+                if not owned:
+                    con.execute("delete from licenses where id=?", (stored["id"],))
         stamp = dt.datetime.now().astimezone().isoformat(" ")
         stored = encrypt_row(dict(row, updated_at=stamp))
         if keep_id is not None:
@@ -789,6 +807,9 @@ def main():
                     help="previous script CA fingerprint to replace during rotation")
     ap.add_argument("--preserve-foreign", action="store_true",
                     help="archive foreign licenses and release only their master binding")
+    ap.add_argument("--replace-foreign", action="store_true",
+                    help="with --preserve-foreign: archive foreign licenses and drop their rows "
+                         "(direct replacement by the project license)")
     ap.add_argument("--foreign-backup-dir", default=None,
                     help="foreign raw-license archive directory (apply only; default: database parent)")
     ap.add_argument("--archive-foreign", action="store_true",
@@ -801,6 +822,8 @@ def main():
     a = ap.parse_args()
     if a.serial and not a.apply:
         ap.error("--serial requires --apply")
+    if a.replace_foreign and not a.preserve_foreign:
+        ap.error("--replace-foreign requires --preserve-foreign")
     if a.archive_foreign:
         if not a.preserve_foreign or not a.import_file:
             ap.error("--archive-foreign requires --preserve-foreign --import-file")
@@ -808,7 +831,7 @@ def main():
             row = {"license": fh.read().strip()}
         print(json.dumps(archive_foreign_database(row, a.db, a.bind_node_id,
                                                  a.serial_path, a.replace_root_fingerprint,
-                                                 True, a.foreign_backup_dir)))
+                                                 True, a.foreign_backup_dir, a.replace_foreign)))
         return 0
     if a.preflight_db:
         print(json.dumps(preflight_database(a.db, a.serial_path, a.bind_node_id,
@@ -852,7 +875,7 @@ def main():
         if a.apply:
             backup = apply_row(row, a.db, not a.no_restart, a.bind_node_id,
                                a.serial_path, a.replace_root_fingerprint,
-                               a.preserve_foreign, a.foreign_backup_dir)
+                               a.preserve_foreign, a.foreign_backup_dir, a.replace_foreign)
             print("已写入 %s（备份 %s）；主节点已绑定" % (a.db, backup))
         return 0
 
@@ -884,7 +907,7 @@ def main():
     if a.apply:
         backup = apply_row(row, a.db, not a.no_restart, a.bind_node_id,
                            a.serial_path, a.replace_root_fingerprint,
-                           a.preserve_foreign, a.foreign_backup_dir)
+                           a.preserve_foreign, a.foreign_backup_dir, a.replace_foreign)
         print("已写入 %s（备份 %s）；主节点已绑定" % (a.db, backup))
     return 0
 
