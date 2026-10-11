@@ -643,12 +643,11 @@ def main():
     print("== 子节点数 : %s  -> free_count=%s / maxNodeCount=%s"
           % (a.nodes, row["free_count"], content["products"][0]["maxNodeCount"]))
     print("== 设备号   : %s" % row["device_id"])
-    print("== 授权文件 :\n%s\n" % text)
 
     if a.out:
         with open(a.out, "w") as fh:
             fh.write(text + "\n")
-        print("已写出 %s" % a.out)
+        print("== 授权文件 : %s" % a.out)
     if a.sql:
         print("== SQL ==\n%s" % sql_for(encrypt_row(row)))
     if a.apply:
