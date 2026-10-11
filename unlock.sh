@@ -31,7 +31,6 @@ die() { printf '!! %s\n' "$*" >&2; exit 1; }
 trap 'printf "!! Failed; artifacts/backups retained: %s / %s\n" "$PERSIST" "$BACKUP" >&2' ERR
 
 PROGRESS="${PROGRESS:-auto}"
-HEARTBEAT_SECONDS="${HEARTBEAT_SECONDS:-5}"
 STALL_SECONDS="${STALL_SECONDS:-30}"
 STALL_BYTES="${STALL_BYTES:-1024}"
 DL_MAX_TIME="${DL_MAX_TIME:-1800}"
@@ -193,30 +192,20 @@ configure_mirrors() {
   MIRROR_READY=1
 }
 run_download() {
-  local PART="$1" CANDIDATE="$2" PID STATUS=0 ELAPSED=0 SIZE=0 START NOW RATE
+  local PART="$1" CANDIDATE="$2" PID STATUS=0 ELAPSED=0 SIZE=0 START NOW
   shift 2
   local -a BASE=(--proto '=http,https' --proto-redir '=http,https' --tlsv1.2 -fSL
                  --connect-timeout 10 --max-time "$DL_MAX_TIME"
                  --speed-limit "$STALL_BYTES" --speed-time "$STALL_SECONDS"
                  --retry 1 --retry-max-time 20)
   START="$(date +%s)"
+  # 进度条保持在单行刷新（curl --progress-bar 自带 \r 回写），不额外打印心跳。
   if progress_bar_enabled; then
     curl "${BASE[@]}" --progress-bar "$@" -o "$PART" "$CANDIDATE" &
   else
     curl "${BASE[@]}" -s "$@" -o "$PART" "$CANDIDATE" 2> "$PART.log" &
   fi
   PID=$!
-  while kill -0 "$PID" 2>/dev/null; do
-    for _ in $(seq 1 $((HEARTBEAT_SECONDS * 4))); do
-      kill -0 "$PID" 2>/dev/null || break 2
-      sleep 0.25 || true
-    done
-    ELAPSED=$((ELAPSED + HEARTBEAT_SECONDS))
-    SIZE="$(wc -c < "$PART" 2>/dev/null)" || SIZE=0
-    RATE=$(( ${SIZE// /} / ELAPSED ))
-    printf '   ... still downloading: %ss elapsed, %s bytes received (%s B/s)\n' \
-      "$ELAPSED" "${SIZE// /}" "$RATE" >&2
-  done
   wait "$PID" || STATUS=$?
   NOW="$(date +%s)"; ELAPSED=$((NOW - START)); [ "$ELAPSED" -gt 0 ] || ELAPSED=1
   SIZE="$(wc -c < "$PART" 2>/dev/null)" || SIZE=0

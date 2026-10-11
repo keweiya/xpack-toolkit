@@ -410,7 +410,7 @@ def publish_release(version, repo, assets):
         command(["gh", "release", "delete", tag, "--repo", repo, "--yes"])
     command(["gh", "release", "create", tag, "--repo", repo, "--title", "xpack-toolkit " + version,
              "--notes", "Offline release; verified platforms: {} (see manifest.json). ".format(platforms)
-             + "Fixed asset names; public runtime only. Installation requires a valid signed license input.",
+             + "Remove-all-checks kernel; license is auto-generated and imported locally (no signing key).",
              "--latest"] + [str(path) for path in assets])
     print("Published https://github.com/{}/releases/tag/{}".format(repo, tag), flush=True)
 
