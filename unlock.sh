@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Verified offline reinstall. Only use local signing keys; never download keys.
-# STATE/SIGN_KEY: local material. LICENSE_FILE: pre-issued signed license.
+# STATE/SIGN_KEY: local material. LICENSE_FILE/--license-file: pre-issued signed license.
+# A project-signed license is required for activation: without one the run stops before
+# any binary is replaced unless --no-license (ALLOW_PENDING=1) is given explicitly.
 # ARTIFACT_DIR: local Release. NO_APPLY: persist license for manual import.
 set -euo pipefail
 umask 077
@@ -41,6 +43,8 @@ usage() {
     '  --progress / --no-progress  Force download progress on/off (default: auto)' \
     '  --replace-foreign           Replace a third-party authorization with ours (archive first)' \
     '  --keep-foreign              Keep third-party certificates and license rows untouched' \
+    '  --license-file PATH         Project-signed license to activate (same as LICENSE_FILE)' \
+    '  --no-license                Install components only, leave the panel inactive (no activation)' \
     '  --help                      Show this help'
 }
 CLI_ROUTE=""
@@ -68,6 +72,11 @@ while [ "$#" -gt 0 ]; do
     --keep-foreign) FOREIGN_CHOICE=keep ;;
     --progress) PROGRESS=on ;;
     --no-progress) PROGRESS=off ;;
+    --license-file)
+      [ "$#" -ge 2 ] && [ -n "$2" ] || die "--license-file requires a path"
+      LICENSE_FILE="$2"; shift ;;
+    --license-file=*) LICENSE_FILE="${1#*=}"; [ -n "$LICENSE_FILE" ] || die "--license-file requires a path" ;;
+    --no-license) ALLOW_PENDING=1 ;;
     --help|-h) usage; exit 0 ;;
     *) usage >&2; die "Unknown installation argument" ;;
   esac
@@ -81,6 +90,11 @@ case "$FOREIGN_CHOICE" in
   *) die "Invalid FOREIGN_LICENSE; expected replace or keep" ;;
 esac
 FOREIGN_MODE="${FOREIGN_CHOICE:-keep}"
+# Activation needs a project-signed license; --no-license/ALLOW_PENDING=1 opts out.
+ALLOW_PENDING="${ALLOW_PENDING:-0}"
+case "$ALLOW_PENDING" in 0|1) ;; *) die "Invalid ALLOW_PENDING; expected 0 or 1" ;; esac
+# Where an already-issued .lic may be found when LICENSE_FILE is not given.
+LICENSE_SEARCH_DIRS="${LICENSE_SEARCH_DIRS:-$PWD:$HOME:$PANEL_ROOT/crack:$PANEL_ROOT/unlock:/opt/1panel/crack:/root:/tmp}"
 [ "$(id -u)" -eq 0 ] || die "Run as root"
 [ "$(uname -s)" = Linux ] || die "This release provides Linux cores"
 case "$(uname -m)" in
@@ -699,20 +713,90 @@ PY
     log "Third-party authorization detected: $FOREIGN_SUMMARY -> keeping third-party certificates and licenses"
   fi
 fi
+# A discovered .lic only counts when it is ours: valid signature chain against the
+# toolkit root, offline, unexpired, sane node allowance and this machine's serial.
+license_candidate_ok() {
+  local FILE="$1"
+  [ -s "$FILE" ] || return 1
+  python3 - "$GEN_LICENSE" "$FILE" "$PANEL_ROOT/db/.serial" <<'PY' > /dev/null 2>&1
+import datetime as dt, importlib.util, pathlib, sys
+sys.path.insert(0, str(pathlib.Path(sys.argv[1]).parent))
+spec = importlib.util.spec_from_file_location("license_check", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+try:
+    spec.loader.exec_module(module)
+    content = module.verify_license(pathlib.Path(sys.argv[2]).read_text())
+except Exception:
+    raise SystemExit(1)
+if content.get("offline") is not True:
+    raise SystemExit(1)
+products = content.get("products") or []
+if not products or not content.get("deviceID") or int(products[0].get("maxNodeCount", 0)) < 1:
+    raise SystemExit(1)
+now = dt.datetime.now(dt.timezone.utc)
+for product in products:
+    try:
+        expiry = dt.datetime.fromisoformat(str(product["expiresAt"]).replace("Z", "+00:00"))
+    except (KeyError, ValueError):
+        raise SystemExit(1)
+    if expiry.tzinfo is None or expiry <= now:
+        raise SystemExit(1)
+serial = pathlib.Path(sys.argv[3])
+if serial.is_file() and serial.read_text().strip() != content["deviceID"]:
+    raise SystemExit(1)
+PY
+}
 LICENSE_OUT="$RUN/license.txt"
 LICENSE_READY=1
+LICENSE_SOURCE=""
 if [ -n "${LICENSE_FILE:-}" ]; then
+  [ -s "$LICENSE_FILE" ] || die "License file missing or empty: $LICENSE_FILE"
   install -m 0600 "$LICENSE_FILE" "$LICENSE_OUT"
+  LICENSE_SOURCE="$LICENSE_FILE"
 elif [ -s "$SIGN_KEY" ]; then
   python3 "$GEN_LICENSE" --edition enterprise --expires "${EXPIRES:-2099-12-31}" \
     --nodes "${NODES:-999}" --assignee "${ASSIGNEE:-YG}" --offline --out "$LICENSE_OUT" \
     --db "$XPACK_DB" --serial-path "$PANEL_ROOT/db/.serial"
+  LICENSE_SOURCE="local signing material"
 else
-  if python3 "$GEN_LICENSE" --export-existing "$LICENSE_OUT" --db "$XPACK_DB" 2> "$RUN/license-export.log"; then
-    log "Reusing verified project certificate; expiry and node allowance remain signed values"
-  else
+  # No signing material: an already-issued project license still activates the panel.
+  while IFS= read -r DIRECTORY; do
+    [ -n "$DIRECTORY" ] || continue
+    for CANDIDATE in "$DIRECTORY"/*.lic; do
+      [ -s "$CANDIDATE" ] || continue
+      license_candidate_ok "$CANDIDATE" || continue
+      install -m 0600 "$CANDIDATE" "$LICENSE_OUT"
+      LICENSE_SOURCE="$CANDIDATE"
+      break
+    done
+    [ -z "$LICENSE_SOURCE" ] || break
+  done <<< "$(printf '%s' "$LICENSE_SEARCH_DIRS" | tr ':' '\n')"
+  if [ -z "$LICENSE_SOURCE" ] && python3 "$GEN_LICENSE" --export-existing "$LICENSE_OUT" --db "$XPACK_DB" 2> "$RUN/license-export.log"; then
+    LICENSE_SOURCE="project license already stored in the panel database"
+  fi
+  if [ -z "$LICENSE_SOURCE" ] && [ "$ALLOW_PENDING" != 1 ]; then
+    if { exec 5<>/dev/tty; } 2>/dev/null; then
+      for ATTEMPT in 1 2 3; do
+        printf '本站授权文件是激活必需的，请给出 .lic 路径（留空中止）：' >&5
+        IFS= read -r LICENSE_ANSWER <&5 || break
+        [ -n "$LICENSE_ANSWER" ] || break
+        if license_candidate_ok "$LICENSE_ANSWER"; then
+          install -m 0600 "$LICENSE_ANSWER" "$LICENSE_OUT"
+          LICENSE_SOURCE="$LICENSE_ANSWER"
+          break
+        fi
+        printf '!! %s 不是本站签发、已过期或与本机 serial 不匹配\n' "$LICENSE_ANSWER" >&5
+      done
+      exec 5>&-
+    fi
+  fi
+  if [ -n "$LICENSE_SOURCE" ]; then
+    log "Project-signed license: $LICENSE_SOURCE"
+  elif [ "$ALLOW_PENDING" = 1 ]; then
     LICENSE_READY=0
-    log "No reusable project-signed license; preserving all old licenses and installing components pending import"
+    log "No project-signed license and --no-license given; installing components only, the panel stays inactive"
+  else
+    die "本站授权文件是激活必需的：请用 LICENSE_FILE=/path/1Panel-Enterprise-XXXX.lic（或 --license-file PATH），也可把签好的 .lic 放进 $PANEL_ROOT/crack/、\$HOME 或当前目录后重跑；只装组件不激活请显式加 --no-license"
   fi
 fi
 # Shared generator owns encrypted three-segment decoding/signature verification.
@@ -871,8 +955,7 @@ elif [ "${NO_APPLY:-0}" = 1 ]; then
   printf 'not-applied\n' > "$PERSIST/license.status"
 else
   if [ "$FOREIGN_MODE" = replace ] && [ "$FOREIGN_PRESENT" = 1 ]; then
-    python3 "$GEN_LICENSE" --preserve-foreign --drop-foreign-licenses --foreign-backup-dir "$BACKUP" \
-      --db "$XPACK_DB" --serial-path "$PANEL_ROOT/db/.serial"
+    log "No project-signed license supplied: third-party license rows were kept (not dropped) so the panel is not left without any authorization"
   fi
   printf 'pending\n' > "$PERSIST/license.status"
 fi
@@ -889,11 +972,13 @@ check_root
 if [ "${NO_APPLY:-0}" != 1 ] && [ "$LICENSE_READY" = 1 ]; then
   python3 "$GEN_LICENSE" --verify-db --db "$XPACK_DB" --serial-path "$PANEL_ROOT/db/.serial"
 fi
-if [ "$LICENSE_READY" != 1 ] && [ "$FOREIGN_MODE" = replace ] && [ "$FOREIGN_PRESENT" = 1 ]; then
-  log "Third-party authorization replaced by our kernel; originals archived under $BACKUP"
-  log "No project-signed license was available: import one to display our authorization"
-elif [ "$LICENSE_READY" != 1 ]; then log "Repository components installed; third-party certificates/licenses retained; import a project-signed license to activate"
-elif [ "${NO_APPLY:-0}" = 1 ]; then log "Core/certificate replaced; license NOT applied (NO_APPLY=1)"
+if [ "${NO_APPLY:-0}" = 1 ]; then
+  log "Core/certificate replaced; license NOT applied (NO_APPLY=1)"
+  [ "$FOREIGN_PRESENT" != 1 ] || [ "$FOREIGN_MODE" != replace ] \
+    || log "Third-party authorization archived under $BACKUP; import the project license to replace it"
+elif [ "$LICENSE_READY" != 1 ]; then
+  log "Components installed WITHOUT a project-signed license (--no-license): the panel stays inactive"
+  log "Activate later with: sudo env LICENSE_FILE=/path/1Panel-Enterprise-XXXX.lic bash unlock.sh install"
 else
   log "Core/certificate replaced; offline license applied with automatic main-node binding"
   [ "$FOREIGN_PRESENT" != 1 ] || [ "$FOREIGN_MODE" != replace ] \

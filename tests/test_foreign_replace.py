@@ -314,37 +314,43 @@ class ForeignReplaceTests(unittest.TestCase):
             self.assertNotIn("--progress-bar", call["args"])
             self.assertIn("-s", call["args"])
 
-    def test_replace_without_a_project_license_drops_rows_and_stays_pending(self):
+    def test_replace_without_a_project_license_keeps_the_rows_and_stays_pending(self):
+        self.f.third_party_roots()
+        self.f.third_party_licenses(2)
+        (self.f.state / "license.key").unlink()
+        result = self.f.run(FOREIGN_LICENSE="replace", ALLOW_PENDING="1", **self.local_artifacts())
+        self.ok(result)
+        self.assertEqual(self.apply_calls(), [])
+        self.assertEqual(self.drop_calls(), [])
+        self.assertEqual(self.f.license_status(), "pending")
+        self.assertIn("were kept (not dropped)", result.stdout)
+        self.assertEqual(len(self.rows()), 2)
+        self.assertEqual(list(self.f.backup.glob("foreign-licenses.*.json")), [])
+
+    def test_replace_without_a_project_license_stops_before_any_replacement(self):
         self.f.third_party_roots()
         self.f.third_party_licenses(2)
         (self.f.state / "license.key").unlink()
         result = self.f.run(FOREIGN_LICENSE="replace", **self.local_artifacts())
-        self.ok(result)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("本站授权文件是激活必需的", result.stdout + result.stderr)
         self.assertEqual(self.apply_calls(), [])
-        self.assertEqual(len(self.drop_calls()), 1)
-        self.assertIn("--preserve-foreign", self.drop_calls()[0])
-        self.assertIn("--foreign-backup-dir " + str(self.f.backup), self.drop_calls()[0])
-        self.assertEqual(self.f.license_status(), "pending")
-        self.assertIn("Third-party authorization replaced by our kernel; originals archived under",
-                      result.stdout)
-        self.assertIn("drop-foreign-licenses 2", self.f.log())
-        self.assertEqual(self.rows(), [])
-        archives = list(self.f.backup.glob("foreign-licenses.*.json"))
-        self.assertEqual(len(archives), 1)
-        self.assertEqual(len(json.loads(archives[0].read_text())["rows"]), 2)
+        self.assertEqual(self.drop_calls(), [])
+        self.assertEqual(len(self.rows()), 2)
+        self.assertEqual(list(self.f.backup.glob("foreign-licenses.*.json")), [])
 
     def test_keep_without_a_project_license_never_drops_and_keeps_the_wording(self):
         self.f.third_party_roots()
         self.f.third_party_licenses(1)
         (self.f.state / "license.key").unlink()
-        result = self.f.run(FOREIGN_LICENSE="keep", **self.local_artifacts())
+        result = self.f.run(FOREIGN_LICENSE="keep", ALLOW_PENDING="1", **self.local_artifacts())
         self.ok(result)
         self.assertEqual(self.drop_calls(), [])
         self.assertEqual(self.new_flags(), [])
         self.assertEqual(self.f.license_status(), "pending")
         self.assertIn(KEEP_LOG, result.stdout)
-        self.assertIn("Repository components installed; third-party certificates/licenses retained;"
-                      " import a project-signed license to activate", result.stdout)
+        self.assertIn("Components installed WITHOUT a project-signed license (--no-license):"
+                      " the panel stays inactive", result.stdout)
         self.assertEqual(len(self.rows()), 1)
 
     # ------------------------------------------------------- download progress

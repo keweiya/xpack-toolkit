@@ -940,10 +940,10 @@ class UnlockTests(unittest.TestCase):
         self.assertIn("export-existing", self.f.log())
         self.assert_downloads("amd64", 2)
 
-    def test_no_key_no_existing_license_installs_pending(self):
+    def test_no_key_no_existing_license_installs_pending_with_no_license_flag(self):
         (self.f.state / "license.key").unlink()
         self.f.agent.write_bytes(b"foreign agent without signing material")
-        self.ok(self.f.run())
+        self.ok(self.f.run_cli("--no-license"))
         self.assertEqual(self.f.core.read_bytes(), self.f.outputs["amd64"])
         self.assertEqual(self.f.agent.read_bytes(), self.f.agent_originals["amd64"].replace(b"ORIG", b"KEEP"))
         self.assertEqual((self.f.work / "license.status").read_text().strip(), "pending")
@@ -1362,7 +1362,7 @@ class UnlockTests(unittest.TestCase):
         old_rows = self.f.rows("licenses"); old_roots = self.f.root_values()
         (self.f.state / "license.key").unlink(); (self.f.state / "license.crt").unlink()
         self.f.agent.write_bytes(b"foreign installed agent")
-        result = self.f.run(); self.ok(result)
+        result = self.f.run_cli("--no-license"); self.ok(result)
         self.assertEqual(self.f.rows("licenses"), old_rows)
         self.assertEqual((self.f.work / "license.status").read_text().strip(), "pending")
         self.assertEqual(self.f.core.read_bytes(), self.f.outputs["amd64"])
@@ -1371,7 +1371,8 @@ class UnlockTests(unittest.TestCase):
         self.assertEqual(list(self.f.work.glob("run.*/license.txt")), [])
         self.assertEqual(list(self.f.backup.glob("foreign-licenses.*.json")), [])
         self.assertNotIn("offline license applied", result.stdout)
-        self.assertIn("import a project-signed license", result.stdout.lower())
+        self.assertIn("WITHOUT a project-signed license (--no-license)", result.stdout)
+        self.assertIn("the panel stays inactive", result.stdout)
         self.assertFalse((tools / "license.key").exists())
         self.assertTrue((foreign / "license.key").is_file())
 
@@ -1474,7 +1475,7 @@ assert g.verify_license(rows[1]["license"])["products"][0]["maxNodeCount"] == 42
     def test_pending_verify_checks_binaries_roots_services_without_network_or_bound_claim(self):
         self.f.real_foreign_fixture()
         (self.f.state / "license.key").unlink()
-        self.ok(self.f.run())
+        self.ok(self.f.run_cli("--no-license"))
         before_urls = self.f.urls(); rows = self.f.rows("licenses")
         self.f.events.unlink(missing_ok=True)
         result = self.f.run("verify", FAIL_CURL="1"); self.ok(result)
