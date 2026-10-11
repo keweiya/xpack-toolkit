@@ -36,6 +36,7 @@ import datetime as dt
 import hashlib
 import json
 import os
+import re
 import secrets
 import sqlite3
 import ssl
@@ -311,7 +312,14 @@ def _binding_fields(stored):
 
 
 def _is_toolkit_license(plain):
-    """判断已解密的一行是否由本工具生成（license 内容带专属标记）。"""
+    """判断已解密的一行是否由本工具生成。
+
+    优先看 license 内容里的专属标记；同时兼容旧版脚本证书（无标记）——
+    其 licenseName 固定为 1Panel-Enterprise/Professional-<12 位大写 HEX>。
+    """
+    name = plain.get("license_name") or ""
+    if re.fullmatch(r"1Panel-(Enterprise|Professional)-[0-9A-F]{12}", name):
+        return True
     text = plain.get("license") or ""
     if not text:
         return False

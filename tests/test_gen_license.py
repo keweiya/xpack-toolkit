@@ -111,9 +111,10 @@ class DatabaseTests(unittest.TestCase):
             str(self.db), serial_path=str(self.serial))["licenseName"]])
 
     def test_thirdparty_license_preserved_and_unbound(self):
-        # 第三方证书：不带 xpack-toolkit 标记，先绑定主节点。
+        # 第三方证书：licenseName 用面板导入格式，不带 xpack-toolkit 标记。
         content, _ = gen.build("enterprise", "2099-12-31", 999, "waaaater",
                                self.serial.read_text(), "lxware", 100000, False, True, "2.x")
+        content["licenseName"] = "license-Panel-VSExQ"  # 模拟面板导入的第三方证书
         content["annotations"].pop("lxware.cn/xpack-toolkit", None)
         text = gen.encode_license(content)
         third = gen.row_from_content(content, text=text)
@@ -127,6 +128,20 @@ class DatabaseTests(unittest.TestCase):
         after = gen.preflight_database(str(self.db), serial_path=str(self.serial))
         self.assertEqual(after["licenseCount"], 2)  # 第三方 + 脚本证书
         self.assertEqual(len(after["boundLicenses"]), 1)
+
+    def test_legacy_toolkit_license_name_recognized(self):
+        # 旧版脚本证书无标记，但 licenseName 前缀可识别为脚本证书，仍会删除。
+        content, _ = gen.build("enterprise", "2099-12-31", 999, "YG",
+                               self.serial.read_text(), "lxware", 100000, False, True, "2.x")
+        content["annotations"].pop("lxware.cn/xpack-toolkit", None)  # 模拟旧版无标记
+        text = gen.encode_license(content)
+        legacy = gen.row_from_content(content, text=text)
+        gen.apply_row(legacy, str(self.db), restart=False, serial_path=str(self.serial))
+
+        result = self._apply()
+        self.assertEqual(result["deleted"], 1)  # 旧脚本证书（无标记）仍被删除
+        after = gen.preflight_database(str(self.db), serial_path=str(self.serial))
+        self.assertEqual(after["licenseCount"], 1)
 
     def test_serial_mismatch_rejected(self):
         content, _ = gen.build("enterprise", "2099-12-31", 999, "YG",
