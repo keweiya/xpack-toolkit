@@ -38,8 +38,14 @@ RUNTIME_FILES = (
     "state/license.crt",
 )
 PATCH_NAMES = {
-    "P1.rootcert.hk_fingerprint", "P2.rootcert.cn_fingerprint",
-    "C7.initLicense.keep_rows",
+    "C1.middleware.checkLicense.passthrough",
+    "C2.checkLicenseSyncFresh.return_true",
+    "C3.CheckInLocal.return_ok",
+    "C4.checkRootCertFingerprint.return_ok",
+    "C5.EnsureFreeNodeBindAllowed.return_ok",
+    "C6.BindFree.return_ok",
+    "C7.Report.skip",
+    "C8.Unbind.skip",
 }
 PRIVATE_PEM = re.compile(br"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")
 
@@ -277,7 +283,7 @@ def build_platform(version, arch, package, work, assets):
              "--verify"], env=environment)
     details = json.loads(patch_manifest.read_text(encoding="utf-8"))
     patches = details.get("patches")
-    if (not isinstance(patches, list) or len(patches) != 3
+    if (not isinstance(patches, list) or len(patches) != len(PATCH_NAMES)
             or {item.get("name") for item in patches} != PATCH_NAMES
             or set(details.get("applied", [])) != PATCH_NAMES
             or details.get("already_patched") != []

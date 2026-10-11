@@ -365,7 +365,7 @@ class ReleaseTests(unittest.TestCase):
                 self.assertEqual(metadata["agent_orig_sha256"], release.sha256(assets / metadata["agent_orig_asset"]))
                 self.assertEqual(metadata["agent_orig_size"], (assets / metadata["agent_orig_asset"]).stat().st_size)
                 self.assertEqual((assets / metadata["agent_orig_asset"]).read_bytes(), self.original_agent(arch))
-                self.assertEqual(metadata["patches"], 3)
+                self.assertEqual(metadata["patches"], 8)
 
 
 if __name__ == "__main__":

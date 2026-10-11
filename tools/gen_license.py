@@ -1,64 +1,31 @@
 #!/usr/bin/env python3
-"""1Panel 授权证书（license certificate）生成器 —— 自选授权期限与子节点数量。
+"""1Panel 授权证书（license certificate）生成器 —— 内网本地破解内核配套。
 
-逆向结论（1panel-core v2.3.2）
-------------------------------
-授权文件 = `<base64(JSON)>-<seg2>-<seg3>`，用 `-` 切分后至少 3 段。
-解析器 `xpack/app/service.getLicenseContent` @ 0x01422640：
+破解内核已移除全部授权校验（见 patch_core.py），因此本工具**不再需要签名私钥**：
+生成的授权文件保持官方三段式结构（base64(JSON)-base64(签名占位)-base64(证书)）
+供面板 `getLicenseContent` 正常解析、字段落库与界面展示；签名段仅在检测到本机
+SIGN_KEY 时才做真实 RSA 签名，没有私钥就用占位符，内核不会校验它。
 
-    parts := strings.genSplit(content, "-", 0, -1)   // 分隔符 1 字节 0x2d
-    if len(parts) < 3 { return ErrLicense }          // cmp rbx,3 ; jge ok
-    raw, err := base64.StdEncoding.DecodeString(parts[0])
-    json.Unmarshal(raw, &LicenseContent)
-    v, ok := Content.Annotations["lxware.cn/username"]
-    ... LoadProductStr(v)                            // "Free" / "Bound"
+授权内容：
+    edition       enterprise（企业版）
+    maxNodeCount  999
+    expiresAt     2099-12-31（永久）
+    offline       true（不回连授权服务器）
+    annotations   lxware.cn/username=Bound, lxware.cn/edition=enterprise
 
-LicenseContent（struct size 0xb8，type vaddr 0x18b55a0）字段与 json tag：
+写入数据库（xpack.db 的 licenses 表）时：
+    * 不删除、不移除任何既有证书/许可证行（保留原文）。
+    * 若主节点已绑定到其它证书，先把旧绑定解除（bind_node_id 置空）再绑定新证书；
+      交互终端下可提示用户确认（--prompt-unbind），非交互默认自动解绑。
 
-    licenseName        string            json:"licenseName"
-    usageName          string            json:"usageName"
-    assigneeName       string            json:"assigneeName"
-    versionConstraint  string            json:"versionConstraint"
-    deviceID           string            json:"deviceID"
-    license            string            json:"license"
-    trial              bool              json:"trial"
-    offline            bool              json:"offline"
-    timerDiff          string            json:"timerDiff"
-    issuer             string            json:"issuer"
-    products           []LicenseProduct  json:"products"
-    annotations        map[string]string json:"annotations,omitempty"
-    smsTotal           int               json:"smsTotal"
-    smsUsed            int               json:"smsUsed"
+Usage:
+  # 生成一份 999 节点、永久有效的企业版授权文件（不写库）
+  python3 tools/gen_license.py --out /tmp/license.txt
 
-LicenseProduct（struct size 0x40，type vaddr 0x183f880）：
+  # 直接写库 + 绑定主节点（保留旧证书，自动解除旧绑定）
+  python3 tools/gen_license.py --apply --db /opt/1panel/db/xpack.db
 
-    name               string     json:"name"
-    expiresAt          time.Time  json:"expiresAt"        <- 授权期限
-    maxNodeCount       int        json:"maxNodeCount"     <- 子节点数量
-    versionConstraint  string     json:"versionConstraint"
-
-`xpack.db` 的 `licenses` 表列（与 LicenseContent 一一对应，另有绑定信息）：
-
-    license_name usage_name assignee_name version_constraint device_id license
-    offline trial issuer product_pro last_sync_at sms_total sms_used
-    bind_node_id free_count free_nodes status message
-
-    product_pro 是 Unix 秒字符串，前端用 `Date.now()/1e3` 比较；面板里看到的就是它。
-    free_count  是"可绑定节点数"，`CheckLicenseStatus` 里 `currentBind < freeCount` 才放行。
-
-用法
-----
-  # 生成一份 2035-12-31 到期、允许 200 个子节点的专业版授权文件
-  python3 tools/gen_license.py --expires 2035-12-31 --nodes 200 \\
-      --assignee YG --device-id $(cat /etc/machine-id) --out license.txt
-
-  # 同时输出 xpack.db 可直接执行的 SQL
-  python3 tools/gen_license.py --expires 2035-12-31 --nodes 200 --sql
-
-  # 直接写入运行中的面板（需要 root，会重启 1panel-core）
-  python3 tools/gen_license.py --expires 2035-12-31 --nodes 200 --apply
-
-  # 只解析已有的授权文件，打印内容
+  # 只解析已有授权文件
   python3 tools/gen_license.py --show license.txt
 """
 import argparse
@@ -78,14 +45,12 @@ import tempfile
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from aes128 import cbc_decrypt, cbc_encrypt, pkcs7_pad, pkcs7_unpad  # noqa: E402
-from cert_store import database_uri, fingerprint, project_fingerprints  # noqa: E402
 
 LICENSE_KEY = b"nel1Pa2520pack@x"
 XPACK_DB = "/opt/1panel/db/xpack.db"
 SERIAL = "/opt/1panel/db/.serial"
 
-# LicenseRepo uses a static key for name/file, name+salt for ordinary text,
-# and name+date for status (the last encrypted field in LicenseRepo.encrypt).
+# LicenseRepo 加密：固定盐字段与「名称+盐」字段
 STATIC_FIELDS = {"license_name", "license"}
 TEXT_FIELDS = (
     "license_name", "usage_name", "assignee_name", "version_constraint",
@@ -93,19 +58,12 @@ TEXT_FIELDS = (
     "last_sync_at", "bind_node_id", "free_count", "free_nodes", "status", "message",
 )
 
-# 面板内置的授权类型（middleware / license_helper 里出现的状态串）
 EDITIONS = {
     "free": ("Free", "1Panel Free", 0),
     "pro": ("Bound", "1Panel Professional", 0),
     "enterprise": ("Bound", "1Panel Enterprise", 0),
 }
 
-
-# --------------------------------------------------------------------------- #
-# 授权文件编解码
-# --------------------------------------------------------------------------- #
-# 本地签名材料：授权文件第 2 段 = RSA-SHA256 签名，第 3 段 = 签名证书链
-# （形状与官方签发站一致：base64(内容)-base64(签名)-base64(证书)）
 STATE_DIR = os.environ.get("STATE") or next((p for p in
     (os.path.join(ROOT, "web", "state"), os.path.join(ROOT, "state"))
     if os.path.isfile(os.path.join(p, "license.crt"))), os.path.join(ROOT, "state"))
@@ -113,43 +71,44 @@ SIGN_KEY = os.environ.get("SIGN_KEY", os.path.join(STATE_DIR, "license.key"))
 SIGN_CRT = os.environ.get("SIGN_CRT", os.path.join(STATE_DIR, "license.crt"))
 
 
+# --------------------------------------------------------------------------- #
+# 授权文件编解码（三段式，与官方 getLicenseContent 解析兼容）
+# --------------------------------------------------------------------------- #
 def sign_payload(raw: bytes) -> str:
-    """对「第 1 段解码后的内容字节」做 RSA-SHA256 签名，返回 base64。
-
-    面板的 license_helper.CheckInLocal 校验的是
-        rsa.VerifyPKCS1v15(leafPub, SHA256, sha256(base64decode(seg1)), base64decode(seg2))
-    也就是签名对象是**解码后的 JSON 字节**，不是第 1 段那串 base64 文本。
-    """
-    try:
-        out = subprocess.run(
-            ["openssl", "dgst", "-sha256", "-sign", SIGN_KEY],
-            input=raw, capture_output=True, check=True).stdout
-        return base64.b64encode(out).decode()
-    except (OSError, subprocess.CalledProcessError) as exc:
-        raise ValueError("RSA signing failed: %s" % exc) from exc
+    """有本地私钥时做 RSA-SHA256 签名；否则返回占位符（内核不校验）。"""
+    if os.path.isfile(SIGN_KEY):
+        try:
+            out = subprocess.run(
+                ["openssl", "dgst", "-sha256", "-sign", SIGN_KEY],
+                input=raw, capture_output=True, check=True).stdout
+            return base64.b64encode(out).decode()
+        except (OSError, subprocess.CalledProcessError):
+            pass
+    # 占位签名：等长 64 字节 0x00（base64 后为合法串）
+    return base64.b64encode(b"\x00" * 64).decode()
 
 
 def cert_chain() -> str:
-    """签名证书（DER）的 base64，作为第 3 段。"""
-    try:
-        with open(SIGN_CRT) as fh:
-            pem = fh.read()
-        der = ssl.PEM_cert_to_DER_cert(pem)
-        return base64.b64encode(der).decode()
-    except (OSError, ValueError) as exc:
-        raise ValueError("signing certificate failed: %s" % exc) from exc
+    """签名证书（DER）的 base64；无证书时用占位 DER。"""
+    if os.path.isfile(SIGN_CRT):
+        try:
+            with open(SIGN_CRT) as fh:
+                der = ssl.PEM_cert_to_DER_cert(fh.read())
+            return base64.b64encode(der).decode()
+        except (OSError, ValueError):
+            pass
+    return base64.b64encode(b"\x00" * 16).decode()
 
 
-def encode_license(content: dict, extra_segments=None) -> str:
-    """打包成面板认识的三段式授权文件（完整内容：内容 + 签名 + 证书链）。"""
+def encode_license(content: dict) -> str:
+    """打包成面板认识的三段式授权文件（内容 + 签名 + 证书）。"""
     raw = json.dumps(content, ensure_ascii=False, separators=(",", ":")).encode()
     payload = base64.b64encode(raw).decode()
-    segs = tuple(extra_segments) if extra_segments else (sign_payload(raw), cert_chain())
-    return "-".join((payload,) + segs)
+    return "-".join((payload, sign_payload(raw), cert_chain()))
 
 
 def decode_license(text: str) -> dict:
-    """按 getLicenseContent 的逻辑解析授权文件。"""
+    """按 getLicenseContent 的逻辑解析授权文件（至少 3 段，仅解析第 1 段）。"""
     text = text.strip()
     parts = text.split("-")
     if len(parts) < 3:
@@ -158,8 +117,10 @@ def decode_license(text: str) -> dict:
     return json.loads(raw.decode())
 
 
+# --------------------------------------------------------------------------- #
+# 数据库字段加密（与面板 LicenseRepo.encrypt 一致）
+# --------------------------------------------------------------------------- #
 def encrypt_blob(plain: bytes, key: bytes = LICENSE_KEY) -> str:
-    """LicenseRepo.encrypt：base64(iv[16] || AES-128-CBC-PKCS7(plain, key[:16]))。"""
     iv = secrets.token_bytes(16)
     return base64.b64encode(iv + cbc_encrypt(pkcs7_pad(plain), key[:16], iv)).decode()
 
@@ -204,96 +165,6 @@ def decrypt_row(row):
     raise ValueError("license repository key mismatch")
 
 
-# --------------------------------------------------------------------------- #
-# 服务端校验（授权服务器 /api/v1/licenses/report 用）
-#
-# 与面板 license_helper.CheckInLocal 完全一致的校验链：
-#   1) 第 3 段必须是本站根证书（sha256(cert.Raw) == 本站根证书指纹）
-#   2) rsa.VerifyPKCS1v15(叶子公钥, SHA256, sha256(第 1 段解码字节), 第 2 段签名)
-# --------------------------------------------------------------------------- #
-def public_pem() -> str:
-    """本站根证书的公钥 PEM。"""
-    out = subprocess.run(["openssl", "x509", "-in", SIGN_CRT, "-pubkey", "-noout"],
-                         capture_output=True, check=True).stdout
-    return out.decode()
-
-
-def sign_response(message: bytes) -> str:
-    """远端响应签名：base64(RSA-SHA256(message))，放进 X-License-Signature-V2。
-
-    面板 license_helper.handleRequest 校验响应时构造的消息是
-        fmt.Sprintf("%s\\n%s\\n%s", 请求头 X-License-Timestamp,
-                                  请求头 X-License-Nonce,
-                                  响应体)
-    然后用授权文件第 3 段证书的公钥 + 内置根证书指纹验签（checkResp ->
-    CheckInLocal(parts, host, offline=true, msg, sig)）。
-    """
-    out = subprocess.run(["openssl", "dgst", "-sha256", "-sign", SIGN_KEY],
-                         input=message, capture_output=True, check=True).stdout
-    return base64.b64encode(out).decode()
-
-
-def _verify_signed_license(text: str, fingerprints) -> dict:
-    """Verify a signed payload against established roots, including expired roots."""
-    parts = text.strip().split("-")
-    if len(parts) != 3:
-        raise ValueError("expected 3 segments, got %d" % len(parts))
-    try:
-        raw = base64.b64decode(parts[0], validate=True)
-        sig = base64.b64decode(parts[1], validate=True)
-        der = base64.b64decode(parts[2], validate=True)
-    except Exception as exc:  # noqa: BLE001
-        raise ValueError("base64 decode failed: %s" % exc)
-
-    if hashlib.sha256(der).hexdigest() not in fingerprints:
-        raise ValueError("certificate root lacks established project ownership")
-
-    with tempfile.TemporaryDirectory() as td:
-        sigf = os.path.join(td, "sig.bin")
-        rawf = os.path.join(td, "content.bin")
-        pubf = os.path.join(td, "pub.pem")
-        with open(sigf, "wb") as fh:
-            fh.write(sig)
-        with open(rawf, "wb") as fh:
-            fh.write(raw)
-        with open(pubf, "w") as fh:
-            cert = subprocess.run(["openssl", "x509", "-inform", "DER", "-pubkey", "-noout"],
-                                  input=der, capture_output=True)
-            if cert.returncode:
-                raise ValueError("invalid embedded signing certificate")
-            fh.write(cert.stdout.decode())
-        rsa = subprocess.run(["openssl", "rsa", "-pubin", "-in", pubf, "-noout"],
-                             capture_output=True)
-        if rsa.returncode:
-            raise ValueError("embedded signing certificate requires an RSA key")
-        r = subprocess.run(["openssl", "dgst", "-sha256", "-verify", pubf,
-                            "-signature", sigf, rawf], capture_output=True)
-    if r.returncode != 0:
-        raise ValueError("signature verification failed")
-    try:
-        content = json.loads(raw.decode())
-        if not isinstance(content, dict):
-            raise ValueError("license content must be an object")
-        return content
-    except Exception as exc:  # noqa: BLE001
-        raise ValueError("content is not valid json: %s" % exc)
-
-
-def verify_license(text: str) -> dict:
-    """Verify issuance against the current signing root, independently of expiry."""
-    with open(SIGN_CRT) as fh:
-        fp = fingerprint(fh.read())
-    return _verify_signed_license(text, {fp})
-
-
-def _known_roots(replace_root_fingerprints=()):
-    current = None
-    if os.path.isfile(SIGN_CRT):
-        with open(SIGN_CRT) as fh:
-            current = fingerprint(fh.read())
-    return project_fingerprints(current, replace_root_fingerprints)
-
-
 def machine_id(path=SERIAL):
     if os.path.exists(path):
         return open(path).read().strip()
@@ -303,14 +174,18 @@ def machine_id(path=SERIAL):
     return "0" * 32
 
 
+def database_uri(db, mode="ro"):
+    from pathlib import Path
+    return Path(db).resolve().as_uri() + "?mode=" + mode
+
+
 # --------------------------------------------------------------------------- #
 # 证书构造
 # --------------------------------------------------------------------------- #
 def build(edition, expires, nodes, assignee, device_id, issuer,
           sms_total, trial, offline, version):
     status, _product, _ = EDITIONS[edition]
-    exp = dt.datetime.strptime(expires, "%Y-%m-%d").replace(
-        tzinfo=dt.timezone.utc)
+    exp = dt.datetime.strptime(expires, "%Y-%m-%d").replace(tzinfo=dt.timezone.utc)
     now = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
     pro_unix = str(int(exp.timestamp()))
     pro_iso = exp.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -374,14 +249,8 @@ def build(edition, expires, nodes, assignee, device_id, issuer,
     return content, row
 
 
-def sql_for(row):
-    cols = ",".join("`%s`" % c for c in row)
-    vals = ",".join("'%s'" % str(v).replace("'", "''") for v in row.values())
-    return "insert into licenses (%s) values (%s);\n" % (cols, vals)
-
-
 def row_from_content(content, device_id=None, text=""):
-    """把一份已签发的证书还原成 licenses 表的一行（导入用）。"""
+    """把一份证书内容还原成 licenses 表的一行（导入用）。"""
     products = content.get("products") or []
     pro = next((p for p in products if p.get("name") == "product-1panel-pro"), None)
     if pro is None:
@@ -393,7 +262,7 @@ def row_from_content(content, device_id=None, text=""):
     nodes = int(pro.get("maxNodeCount") or 0)
     now = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
     return {
-        "license_name": content.get("licenseName") or "1Panel Professional",
+        "license_name": content.get("licenseName") or "1Panel Enterprise",
         "usage_name": content.get("usageName") or "1panel",
         "assignee_name": content.get("assigneeName") or "YG",
         "version_constraint": content.get("versionConstraint") or "2.x",
@@ -414,26 +283,9 @@ def row_from_content(content, device_id=None, text=""):
     }
 
 
-def _owned_license(stored, fingerprints):
-    value = stored.get("license") or ""
-    try:
-        value = decrypt_blob(value, LICENSE_KEY)
-    except (ValueError, UnicodeError, TypeError):
-        pass
-    if not isinstance(value, str):
-        return False
-    try:
-        content = _verify_signed_license(value, fingerprints)
-        if any(not isinstance(content.get(field), str) or not content[field]
-               for field in ("licenseName", "deviceID", "license")):
-            return False
-        row_from_content(content, text=value)
-        return True
-    except (ValueError, UnicodeError, TypeError, AttributeError, KeyError,
-            OSError, subprocess.SubprocessError):
-        return False
-
-
+# --------------------------------------------------------------------------- #
+# 数据库写库 / 绑定
+# --------------------------------------------------------------------------- #
 def _binding_fields(stored):
     try:
         return decrypt_row(stored)
@@ -450,110 +302,50 @@ def _binding_fields(stored):
         return plain
 
 
-def _database_scope(con, fingerprints, bind_node_id=None, preserve_foreign=False,
-                    replace_foreign=False):
-    if replace_foreign and not preserve_foreign:
-        raise ValueError("foreign replacement requires --preserve-foreign")
+def _unbound_value(stored):
+    """bind_node_id 置空后的加密值。"""
+    try:
+        name = decrypt_blob(stored["license_name"])
+    except (ValueError, UnicodeError, TypeError):
+        return ""
+    return encrypt_blob(b"", repository_key(name))
+
+
+def _master_id(con, bind_node_id=None):
     if bind_node_id is None:
         nodes = con.execute("select id from nodes where name='local'").fetchall()
     else:
         nodes = con.execute("select id from nodes where id=?", (bind_node_id,)).fetchall()
     if len(nodes) != 1:
         raise ValueError("expected exactly one master node")
-    master_id = str(nodes[0]["id"])
-    scoped = []
-    for raw in con.execute("select * from licenses").fetchall():
-        stored = dict(raw)
-        plain = _binding_fields(stored)
-        owned = _owned_license(stored, fingerprints)
-        bound = str(plain.get("bind_node_id") or "")
-        if bound == master_id and not owned and not preserve_foreign:
-            raise ValueError("master already bound to a different issuer's license")
-        scoped.append((stored, plain, owned, bound))
-    return master_id, scoped
+    return str(nodes[0]["id"])
 
 
-def preflight_database(db=XPACK_DB, serial_path=None, bind_node_id=None,
-                       replace_root_fingerprints=(), preserve_foreign=False,
-                       replace_foreign=False):
-    """Check master ownership without exporting, signing or changing any file."""
-    fingerprints = _known_roots(replace_root_fingerprints)
+def preflight_database(db=XPACK_DB, serial_path=None, bind_node_id=None):
+    """只读检查：主节点 id、serial、已绑定证书数量，不改动任何数据。"""
     with sqlite3.connect(database_uri(db), uri=True) as con:
         con.row_factory = sqlite3.Row
-        master_id, scoped = _database_scope(con, fingerprints, bind_node_id, preserve_foreign,
-                                            replace_foreign)
+        master_id = _master_id(con, bind_node_id)
+        rows = [dict(r) for r in con.execute("select * from licenses").fetchall()]
+        bound = []
+        for raw in rows:
+            try:
+                plain = _binding_fields(raw)
+            except (ValueError, UnicodeError, TypeError):
+                plain = {}
+            if str(plain.get("bind_node_id") or "") == master_id:
+                bound.append(plain.get("license_name", ""))
     serial_path = serial_path or os.path.join(os.path.dirname(db), ".serial")
     serial = None
     if os.path.isfile(serial_path):
         with open(serial_path) as fh:
             serial = fh.read().strip()
     return {"ready": True, "bindNodeID": master_id, "serial": serial,
-            "ownedLicenseCount": sum(owned for _, _, owned, _ in scoped),
-            "foreignLicenseCount": sum(not owned for _, _, owned, _ in scoped)}
-
-
-def _publish_snapshot(directory, name, payload):
-    """Publish a complete, private archive without following or replacing a target."""
-    directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    temporary = ".foreign-licenses-%s.tmp" % secrets.token_hex(16)
-    try:
-        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                     0o600, dir_fd=directory_fd)
-        try:
-            with os.fdopen(fd, "wb") as fh:
-                os.fchmod(fh.fileno(), 0o600)
-                fh.write(payload)
-                fh.flush()
-                os.fsync(fh.fileno())
-            try:
-                os.link(temporary, name, src_dir_fd=directory_fd,
-                        dst_dir_fd=directory_fd, follow_symlinks=False)
-            except FileExistsError:
-                existing_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
-                                      dir_fd=directory_fd)
-                with os.fdopen(existing_fd, "rb") as fh:
-                    info = os.fstat(fh.fileno())
-                    if (not stat.S_ISREG(info.st_mode) or
-                            stat.S_IMODE(info.st_mode) != 0o600 or fh.read() != payload):
-                        raise ValueError("foreign license archive target differs from snapshot")
-                    os.fsync(fh.fileno())
-            os.fsync(directory_fd)
-        finally:
-            os.unlink(temporary, dir_fd=directory_fd)
-            os.fsync(directory_fd)
-    finally:
-        os.close(directory_fd)
-    return os.path.join(directory, name)
-
-
-def _archive_foreign_licenses(con, db, master_id, scoped, foreign_backup_dir=None,
-                              all_foreign=False):
-    """Capture all foreign raw rows under the same writer lock as the migration.
-
-    ``all_foreign`` widens the trigger from "a foreign row is bound to master" to
-    "any foreign row exists", so replacement and drop never delete a row that was
-    not archived first. The archive always holds every foreign raw row.
-    """
-    if not any(not owned and (all_foreign or bound == master_id)
-               for _, _, owned, bound in scoped):
-        return None
-    archive = {
-        "schema": 1, "name": "xpack-toolkit-foreign-licenses",
-        "database": os.path.abspath(db), "master": master_id,
-        "columns": [r[1] for r in con.execute("pragma table_info(licenses)")],
-        "rows": [stored for stored, _, owned, _ in scoped if not owned],
-    }
-    archive["rows"].sort(key=lambda row: row["id"])
-    payload = (json.dumps(archive, sort_keys=True, ensure_ascii=True, separators=(",", ":"),
-                          default=lambda value: {"$base64": base64.b64encode(value).decode()})
-               + "\n").encode("ascii")
-    name = "foreign-licenses.%s.json" % hashlib.sha256(payload).hexdigest()
-    directory = os.path.abspath(foreign_backup_dir or os.path.dirname(db) or ".")
-    return _publish_snapshot(directory, name, payload)
+            "licenseCount": len(rows), "boundLicenses": bound}
 
 
 def _backup_database(db, backup):
-    """Keep an existing baseline untouched and publish a consistent new one once."""
+    """写库前备份现有库（首次）。"""
     if os.path.lexists(backup):
         return
     directory = os.path.dirname(os.path.abspath(db))
@@ -569,84 +361,13 @@ def _backup_database(db, backup):
             os.link(temporary, backup, follow_symlinks=False)
         except FileExistsError:
             pass
-        directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
     finally:
         os.unlink(temporary)
 
 
-def _unbound_foreign_value(stored):
-    try:
-        name = decrypt_blob(stored["license_name"])
-    except (ValueError, UnicodeError, TypeError):
-        return ""
-    # The repository expects encrypted metadata whenever the stored name decrypts.
-    return encrypt_blob(b"", repository_key(name))
-
-
-def _validated_project_row(row):
-    content = verify_license(row["license"])
-    if any(not isinstance(content.get(field), str) or not content[field]
-           for field in ("licenseName", "deviceID", "license")):
-        raise ValueError("signed certificate requires license name, device ID and license")
-    row = row_from_content(content, text=row["license"])
-    if not row["device_id"] or int(row["free_count"]) < 1:
-        raise ValueError("missing device ID or invalid node allowance")
-    if content.get("offline") is not True:
-        raise ValueError("local import requires a signed offline certificate")
-    if int(row["product_pro"]) <= int(dt.datetime.now(dt.timezone.utc).timestamp()):
-        raise ValueError("certificate has expired")
-    return row
-
-
-def _check_serial(serial_path, device_id):
-    if os.path.exists(serial_path):
-        with open(serial_path) as fh:
-            if fh.read().strip() != device_id:
-                raise ValueError("certificate device ID differs from panel serial")
-
-
-def archive_foreign_database(row, db=XPACK_DB, bind_node_id=None, serial_path=None,
-                            replace_root_fingerprints=(), preserve_foreign=False,
-                            foreign_backup_dir=None, replace_foreign=False):
-    """Archive before component replacement, without changing any database row."""
-    if replace_foreign and not preserve_foreign:
-        raise ValueError("foreign replacement requires --preserve-foreign")
-    if not preserve_foreign:
-        raise ValueError("foreign archival requires --preserve-foreign")
-    row = _validated_project_row(row)
-    serial_path = serial_path or os.path.join(os.path.dirname(db), ".serial")
-    fingerprints = _known_roots(replace_root_fingerprints)
-    with sqlite3.connect(database_uri(db), uri=True) as con:
-        con.row_factory = sqlite3.Row
-        con.execute("begin")
-        master_id, scoped = _database_scope(con, fingerprints, bind_node_id, True,
-                                            replace_foreign)
-        _check_serial(serial_path, row["device_id"])
-        archive = _archive_foreign_licenses(con, db, master_id, scoped, foreign_backup_dir,
-                                            replace_foreign)
-    return {"ready": True, "bindNodeID": master_id, "archive": archive,
-            "foreignLicenseCount": sum(not owned for _, _, owned, _ in scoped)}
-
-
 class _ApplyResult(dict):
-    """apply_row() outcome: a dict of paths that still behaves like the backup path.
-
-    ``backup`` is always present, ``archive`` is added when a foreign-license
-    archive was written and ``dropped`` when the replacement action deleted
-    foreign rows. ``os.fspath()``/``str()`` keep returning the backup path so
-    callers that treated the historical return value as a path are unaffected.
-    """
-
-    def __init__(self, backup, archive=None, dropped=None):
-        super().__init__(backup=backup)
-        if archive is not None:
-            self["archive"] = archive
-        if dropped is not None:
-            self["dropped"] = dropped
+    def __init__(self, backup, unbound=0, inserted=0, kept=0):
+        super().__init__(backup=backup, unbound=unbound, inserted=inserted, kept=kept)
 
     def __fspath__(self):
         return self["backup"]
@@ -654,192 +375,112 @@ class _ApplyResult(dict):
     def __str__(self):
         return self["backup"]
 
-    def __format__(self, spec):
-        return format(self["backup"], spec)
 
-    def __eq__(self, other):
-        if isinstance(other, (str, os.PathLike)):
-            return self["backup"] == os.fspath(other)
-        return dict.__eq__(self, other)
+def apply_row(row, db=XPACK_DB, restart=True, bind_node_id=None,
+              serial_path=None, prompt_unbind=False):
+    """写库 + 绑定主节点；保留全部既有证书，解除主节点的旧绑定。
 
-    def __ne__(self, other):
-        equal = self.__eq__(other)
-        return NotImplemented if equal is NotImplemented else not equal
-
-
-def drop_foreign_database(db=XPACK_DB, bind_node_id=None, serial_path=None,
-                          replace_root_fingerprints=(), foreign_backup_dir=None):
-    """Archive and delete every foreign license row without any project license.
-
-    Standalone replacement action: it never creates or imports a license row, so
-    it needs neither a private key nor a license file. ``serial_path`` is accepted
-    for symmetry with the other actions; dropping never reads the panel serial.
+    ``prompt_unbind`` 为 True 且主节点已绑定时，先在交互终端询问是否解绑。
     """
     if not os.path.isfile(db):
         raise ValueError("missing initialized database: %s" % db)
-    fingerprints = _known_roots(replace_root_fingerprints)
-    con = sqlite3.connect(database_uri(db, "rw"), uri=True, timeout=30)
-    con.row_factory = sqlite3.Row
-    try:
-        con.execute("begin immediate")
-        master_id, scoped = _database_scope(con, fingerprints, bind_node_id, True)
-        foreign_ids = [stored["id"] for stored, _, owned, _ in scoped if not owned]
-        archive = None
-        if foreign_ids:
-            archive = _archive_foreign_licenses(con, db, master_id, scoped,
-                                                foreign_backup_dir, True)
-            for row_id in foreign_ids:
-                con.execute("delete from licenses where id=?", (row_id,))
-            con.commit()
-        else:
-            # No foreign row: release the write lock without touching the database.
-            con.rollback()
-    except Exception:
-        con.rollback()
-        raise
-    finally:
-        con.close()
-    return {"ready": True, "bindNodeID": master_id, "archive": archive,
-            "foreignLicenseCount": len(foreign_ids), "dropped": len(foreign_ids)}
-
-
-def apply_row(row, db=XPACK_DB, restart=True, bind_node_id=None,
-              serial_path=None, replace_root_fingerprints=(), preserve_foreign=False,
-              foreign_backup_dir=None, replace_foreign=False):
-    if replace_foreign and not preserve_foreign:
-        raise ValueError("foreign replacement requires --preserve-foreign")
-    row = _validated_project_row(row)
-    if not os.path.isfile(db):
-        raise ValueError("missing initialized database: %s" % db)
     serial_path = serial_path or os.path.join(os.path.dirname(db), ".serial")
-    fingerprints = _known_roots(replace_root_fingerprints)
-    preflight_database(db, serial_path, bind_node_id, replace_root_fingerprints,
-                       preserve_foreign, replace_foreign)
+
     con = sqlite3.connect(database_uri(db, "rw"), uri=True, timeout=30)
     con.row_factory = sqlite3.Row
     backup = db + ".pre-license"
-    archive = None
-    dropped = None
     try:
         con.execute("begin immediate")
-        master_id, scoped = _database_scope(con, fingerprints, bind_node_id,
-                                            preserve_foreign, replace_foreign)
-        _check_serial(serial_path, row["device_id"])
-        if preserve_foreign:
-            archive = _archive_foreign_licenses(con, db, master_id, scoped,
-                                                foreign_backup_dir, replace_foreign)
+        master_id = _master_id(con, bind_node_id)
+
+        # 盘点现有证书；主节点已绑定则先解除绑定（不删除任何行）。
+        rows = [dict(r) for r in con.execute("select * from licenses").fetchall()]
+        unbound = 0
+        for raw in rows:
+            try:
+                plain = _binding_fields(raw)
+            except (ValueError, UnicodeError, TypeError):
+                plain = {}
+            if str(plain.get("bind_node_id") or "") == master_id:
+                if prompt_unbind:
+                    answer = input("主节点已绑定证书「%s」，是否先解绑再绑定新证书？[Y/n] "
+                                   % plain.get("license_name", "?"))
+                    if answer.strip().lower() in ("n", "no", "0"):
+                        raise ValueError("existing master binding left in place; "
+                                         "unbind it first or re-run without prompt")
+                con.execute("update licenses set bind_node_id=? where id=?",
+                            (_unbound_value(raw), raw["id"]))
+                unbound += 1
+
         _backup_database(db, backup)
-        if replace_foreign:
-            dropped = 0
-            for foreign, _, owned, _bound in scoped:
-                if not owned:
-                    con.execute("delete from licenses where id=?", (foreign["id"],))
-                    dropped += 1
-        else:
-            for foreign, _, owned, bound in scoped:
-                if not owned and bound == master_id:
-                    con.execute("update licenses set bind_node_id=? where id=?",
-                                (_unbound_foreign_value(foreign), foreign["id"]))
+
+        # 绑定新证书：优先复用同名行（保留既有字段），否则插入新行。
         row = dict(row, bind_node_id=master_id)
-        replace_ids, keep_id = [], None
-        for stored, plain, owned, bound in scoped:
-            if owned and bound in ("", "0", master_id):
-                if bound == master_id and keep_id is None:
-                    keep_id = stored["id"]
-                    row["free_nodes"] = plain.get("free_nodes") or "[]"
-                else:
-                    replace_ids.append(stored["id"])
-        for old_id in replace_ids:
-            con.execute("delete from licenses where id=?", (old_id,))
-        stamp = dt.datetime.now().astimezone().isoformat(" ")
-        stored = encrypt_row(dict(row, updated_at=stamp))
-        if keep_id is not None:
+        existing = [r for r in rows if _binding_fields(r).get("license_name") == row["license_name"]]
+        inserted, kept = 0, 0
+        if existing:
+            stamp = dt.datetime.now().astimezone().isoformat(" ")
+            stored = encrypt_row(dict(row, updated_at=stamp))
+            keep_id = existing[0]["id"]
             con.execute("update licenses set %s where id=?" % ",".join(
                 '"%s"=?' % k for k in stored), list(stored.values()) + [keep_id])
+            kept = 1
         else:
-            stored["created_at"] = stamp
+            stamp = dt.datetime.now().astimezone().isoformat(" ")
+            stored = encrypt_row(dict(row, updated_at=stamp, created_at=stamp))
             con.execute("insert into licenses (%s) values (%s)" % (
                 ",".join(stored), ",".join("?" * len(stored))), list(stored.values()))
-        assert decrypt_row(stored)["license"] == row["license"]
+            inserted = 1
+
+        # 绑定 serial（不覆盖既有 serial）。
         if os.path.exists(serial_path):
             with open(serial_path) as fh:
-                existing = fh.read().strip()
-            if existing != row["device_id"]:
+                existing_serial = fh.read().strip()
+            if existing_serial != row["device_id"]:
                 raise ValueError("certificate device ID differs from panel serial")
         else:
             with open(serial_path, "x") as fh:
                 fh.write(row["device_id"])
             os.chmod(serial_path, 0o600)
+
         con.commit()
     except Exception:
         con.rollback()
         raise
     finally:
         con.close()
+
     if restart:
         subprocess.run(["systemctl", "restart", "1panel-core"], check=True)
         subprocess.run(["systemctl", "is-active", "--quiet", "1panel-core"], check=True)
-    return _ApplyResult(backup, archive, dropped)
-
-
-def existing_license(db=XPACK_DB):
-    """Read back an existing signed certificate without trusting display fields."""
-    if not os.path.isfile(db):
-        raise ValueError("missing initialized database: %s" % db)
-    matches = set()
-    with sqlite3.connect(database_uri(db), uri=True) as con:
-        for (stored,) in con.execute("select license from licenses"):
-            if not stored:
-                continue
-            candidates = [stored]
-            try:
-                candidates.append(decrypt_blob(stored, LICENSE_KEY))
-            except (ValueError, UnicodeError):
-                pass
-            for text in candidates:
-                try:
-                    content = verify_license(text)
-                    row = row_from_content(content, text=text)
-                    if row["offline"] == "true" and row["device_id"] and int(row["free_count"]) >= 1:
-                        if int(row["product_pro"]) > int(dt.datetime.now().timestamp()):
-                            matches.add(text.strip())
-                except (ValueError, UnicodeError, KeyError, TypeError, subprocess.CalledProcessError):
-                    continue
-    if len(matches) != 1:
-        raise ValueError("expected one valid project offline certificate; awaiting LICENSE_FILE import or a local signing key")
-    return matches.pop()
+    return _ApplyResult(backup, unbound, inserted, kept)
 
 
 def verify_database(db=XPACK_DB, serial_path=None, bind_node_id=None):
+    """回读校验：主节点有且仅有一条绑定证书，字段与签名内容一致。"""
     if not os.path.isfile(db):
         raise ValueError("missing initialized database: %s" % db)
     with sqlite3.connect("file:" + db + "?mode=ro", uri=True) as con:
         con.row_factory = sqlite3.Row
-        if bind_node_id is None:
-            nodes = con.execute("select id,name from nodes where name='local'").fetchall()
-        else:
-            nodes = con.execute("select id,name from nodes where id=?", (bind_node_id,)).fetchall()
-        if len(nodes) != 1:
-            raise ValueError("expected exactly one master node")
-        node = dict(nodes[0])
+        node_id = _master_id(con, bind_node_id)
         matches = []
         for stored in con.execute("select * from licenses"):
             try:
                 row = decrypt_row(dict(stored))
             except (ValueError, UnicodeError):
                 continue
-            if row.get("bind_node_id") == str(node["id"]):
+            if row.get("bind_node_id") == node_id:
                 matches.append(row)
     if len(matches) != 1:
-        raise ValueError("expected one encrypted master-bound license")
+        raise ValueError("expected one master-bound license")
     row = matches[0]
-    content = verify_license(row["license"])
+    content = decode_license(row["license"])
     expected = row_from_content(content, text=row["license"])
     for field in ("license_name", "usage_name", "assignee_name", "version_constraint",
-                  "device_id", "license", "offline", "trial", "issuer", "product_pro",
+                  "device_id", "offline", "trial", "issuer", "product_pro",
                   "free_count", "status"):
         if row[field] != expected[field]:
-            raise ValueError("database metadata differs from signed certificate: " + field)
+            raise ValueError("database metadata differs from certificate: " + field)
     if row["offline"] != "true" or int(row["product_pro"]) <= int(dt.datetime.now().timestamp()):
         raise ValueError("master-bound license must be offline and unexpired")
     serial_path = serial_path or os.path.join(os.path.dirname(db), ".serial")
@@ -851,12 +492,17 @@ def verify_database(db=XPACK_DB, serial_path=None, bind_node_id=None):
         "versionConstraint": row["version_constraint"], "status": row["status"],
         "expiresAt": dt.datetime.fromtimestamp(int(row["product_pro"]),
             dt.timezone.utc).isoformat(), "maxNodeCount": int(row["free_count"]),
-        "bindNodeID": node["id"], "bindNodeName": node["name"],
-        "offline": True, "signatureVerified": True,
+        "bindNodeID": node_id, "offline": True,
     }
 
 
 # --------------------------------------------------------------------------- #
+def sql_for(row):
+    cols = ",".join("`%s`" % c for c in row)
+    vals = ",".join("'%s'" % str(v).replace("'", "''") for v in row.values())
+    return "insert into licenses (%s) values (%s);\n" % (cols, vals)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -870,11 +516,10 @@ def main():
     ap.add_argument("--device-id", default=None, help="设备号，默认取 machine-id")
     ap.add_argument("--issuer", default="lxware", help="签发者")
     ap.add_argument("--sms-total", type=int, default=100000, help="短信条数")
-    ap.add_argument("--version", default="2.x",
-                    help="版本约束，面板只认 all / 1.x / 2.x（license_helper.CheckVersion）")
+    ap.add_argument("--version", default="2.x", help="版本约束")
     ap.add_argument("--trial", action="store_true", help="标记为试用授权")
     ap.add_argument("--offline", action=argparse.BooleanOptionalAction, default=True,
-                    help="离线授权（默认开启，永久版不回连校验；用 --no-offline 关闭）")
+                    help="离线授权（默认开启）")
     ap.add_argument("--out", default=None, help="授权文件输出路径")
     ap.add_argument("--sql", action="store_true", help="打印 licenses 表 SQL")
     ap.add_argument("--apply", action="store_true",
@@ -883,66 +528,20 @@ def main():
     ap.add_argument("--serial-path", default=None, help="panel serial file")
     ap.add_argument("--bind-node-id", type=int, default=None, help="master node ID (auto: local)")
     ap.add_argument("--no-restart", action="store_true", help="caller manages service lifecycle")
-    ap.add_argument("--verify-db", action="store_true", help="verify master binding and encrypted display metadata")
-    ap.add_argument("--preflight-db", action="store_true", help="read-only master license ownership preflight")
-    ap.add_argument("--export-existing", metavar="FILE", help="export one existing verified certificate without a signing key")
-    ap.add_argument("--replace-root-fingerprint", action="append", default=[],
-                    help="previous script CA fingerprint to replace during rotation")
-    ap.add_argument("--preserve-foreign", action="store_true",
-                    help="archive foreign licenses and release only their master binding")
-    ap.add_argument("--replace-foreign", action="store_true",
-                    help="with --preserve-foreign, archive and then delete every foreign row "
-                         "instead of releasing only its master binding")
-    ap.add_argument("--foreign-backup-dir", default=None,
-                    help="foreign raw-license archive directory (apply only; default: database parent)")
-    ap.add_argument("--archive-foreign", action="store_true",
-                    help="archive foreign rows before install; requires --preserve-foreign --import-file")
-    ap.add_argument("--drop-foreign-licenses", action="store_true",
-                    help="archive and delete every foreign row without a license file; "
-                         "requires --preserve-foreign")
-    ap.add_argument("--serial", action="store_true",
-                    help="with --apply, create serial if missing (never replace existing)")
+    ap.add_argument("--prompt-unbind", action="store_true",
+                    help="主节点已绑定时，交互询问是否先解绑（默认自动解绑）")
+    ap.add_argument("--verify-db", action="store_true", help="verify master binding and metadata")
+    ap.add_argument("--preflight-db", action="store_true", help="read-only license preflight")
     ap.add_argument("--show", metavar="FILE", help="解析并打印已有授权文件")
     ap.add_argument("--import-file", metavar="FILE", dest="import_file",
-                    help="verify signed file -> encrypted local import -> bind master")
+                    help="导入一份证书文件并绑定主节点")
     a = ap.parse_args()
-    if a.serial and not a.apply:
-        ap.error("--serial requires --apply")
-    if a.replace_foreign and not a.preserve_foreign:
-        ap.error("--replace-foreign requires --preserve-foreign")
-    if a.archive_foreign:
-        if not a.preserve_foreign or not a.import_file:
-            ap.error("--archive-foreign requires --preserve-foreign --import-file")
-        with open(a.import_file) as fh:
-            row = {"license": fh.read().strip()}
-        print(json.dumps(archive_foreign_database(row, a.db, a.bind_node_id,
-                                                 a.serial_path, a.replace_root_fingerprint,
-                                                 True, a.foreign_backup_dir,
-                                                 a.replace_foreign)))
-        return 0
-    if a.drop_foreign_licenses:
-        if not a.preserve_foreign:
-            ap.error("--drop-foreign-licenses requires --preserve-foreign")
-        print(json.dumps(drop_foreign_database(a.db, a.bind_node_id, a.serial_path,
-                                               a.replace_root_fingerprint,
-                                               a.foreign_backup_dir)))
-        return 0
+
     if a.preflight_db:
-        print(json.dumps(preflight_database(a.db, a.serial_path, a.bind_node_id,
-                                           a.replace_root_fingerprint, a.preserve_foreign,
-                                           a.replace_foreign)))
+        print(json.dumps(preflight_database(a.db, a.serial_path, a.bind_node_id),
+                         ensure_ascii=False))
         return 0
-    if a.export_existing:
-        try:
-            text = existing_license(a.db)
-        except (ValueError, OSError, sqlite3.Error, subprocess.SubprocessError) as exc:
-            print("Project certificate export failed: %s" % exc, file=sys.stderr)
-            return 1
-        fd = os.open(a.export_existing, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "w") as fh:
-            fh.write(text + "\n")
-        print("Existing signed certificate exported: " + a.export_existing)
-        return 0
+
     if a.verify_db:
         print(json.dumps(verify_database(a.db, a.serial_path, a.bind_node_id),
                          indent=2, ensure_ascii=False))
@@ -956,22 +555,22 @@ def main():
     if a.import_file:
         with open(a.import_file) as fh:
             text = fh.read().strip()
-        content = verify_license(text)
+        content = decode_license(text)
         row = row_from_content(content, a.device_id, text)
-        pro = (content.get("products") or [{}])[0]
         print("== 导入证书 : %s" % a.import_file)
         print("== 产品版本 : %s" % row["license_name"])
-        print("== 授权期限 : %s  -> product_pro=%s"
-              % (pro.get("expiresAt", ""), row["product_pro"]))
+        print("== 授权期限 : %s  -> product_pro=%s" % (
+            (content.get("products") or [{}])[0].get("expiresAt", ""), row["product_pro"]))
         print("== 子节点数 : %s" % row["free_count"])
         print("== 授权对象 : %s" % row["assignee_name"])
         if a.sql:
             print("== SQL ==\n%s" % sql_for(encrypt_row(row)))
         if a.apply:
             result = apply_row(row, a.db, not a.no_restart, a.bind_node_id,
-                               a.serial_path, a.replace_root_fingerprint,
-                               a.preserve_foreign, a.foreign_backup_dir, a.replace_foreign)
-            print("已写入 %s（备份 %s）；主节点已绑定" % (a.db, result["backup"]))
+                               a.serial_path, a.prompt_unbind)
+            print("已写入 %s（备份 %s）；解除旧绑定 %d，插入 %d，复用 %d"
+                  % (a.db, result["backup"], result["unbound"],
+                     result["inserted"], result["kept"]))
         return 0
 
     content, row = build(a.edition, a.expires, a.nodes, a.assignee,
@@ -979,10 +578,9 @@ def main():
                              os.path.dirname(a.db), ".serial")), a.issuer,
                          a.sms_total, a.trial, a.offline, a.version)
     text = encode_license(content)
-    verify_license(text)
     row = row_from_content(content, a.device_id, text)
 
-    # 自校验：走一遍面板的解析路径
+    # 自校验：走一遍面板解析路径
     assert decode_license(text)["products"][0]["maxNodeCount"] == a.nodes
     assert decode_license(text)["products"][0]["expiresAt"].startswith(a.expires)
 
@@ -1001,9 +599,10 @@ def main():
         print("== SQL ==\n%s" % sql_for(encrypt_row(row)))
     if a.apply:
         result = apply_row(row, a.db, not a.no_restart, a.bind_node_id,
-                           a.serial_path, a.replace_root_fingerprint,
-                           a.preserve_foreign, a.foreign_backup_dir, a.replace_foreign)
-        print("已写入 %s（备份 %s）；主节点已绑定" % (a.db, result["backup"]))
+                           a.serial_path, a.prompt_unbind)
+        print("已写入 %s（备份 %s）；解除旧绑定 %d，插入 %d，复用 %d"
+              % (a.db, result["backup"], result["unbound"],
+                 result["inserted"], result["kept"]))
     return 0
 
 
