@@ -62,13 +62,25 @@ class UnlockFlowTests(unittest.TestCase):
         ]), "core-v2.3.2")
 
 
-class RuntimeWhitelistTests(unittest.TestCase):
-    def test_whitelist_matches_repo_files(self):
-        whitelist = {"tools/gen_license.py", "tools/patch_core.py", "tools/patch_agent.py",
-                     "tools/cert_store.py", "tools/aes128.py", "tools/gosym.py",
-                     "tools/official_rootcert.json", "state/license.crt"}
-        for name in whitelist:
+def extract_tool_files(script):
+    match = re.search(r'TOOL_FILES="([^"]+)"', script)
+    if not match:
+        raise AssertionError("TOOL_FILES declaration not found in unlock.sh")
+    return match.group(1).split()
+
+
+class RuntimeToolFilesTests(unittest.TestCase):
+    """工具脚本现在从 main 分支下载，不再打进 runtime.tar.gz。"""
+
+    def test_tool_files_exist_in_repo(self):
+        for name in extract_tool_files(UNLOCK.read_text()):
             self.assertTrue((ROOT / name).is_file(), name)
+
+    def test_tool_files_drop_legacy_cert_store(self):
+        # 遗留的 cert_store.py / official_rootcert.json 已不再随安装流程下载。
+        files = set(extract_tool_files(UNLOCK.read_text()))
+        self.assertNotIn("tools/cert_store.py", files)
+        self.assertNotIn("tools/official_rootcert.json", files)
 
 
 def extract_heredoc(script, marker):

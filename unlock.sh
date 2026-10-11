@@ -322,13 +322,12 @@ if not releases:
 target, release = max(releases, key=lambda item: item[0])
 tag = release["tag_name"]
 assets = {a["name"]: a["browser_download_url"] for a in release.get("assets", [])}
-needed = ("manifest.json", "runtime.tar.gz", "core-" + platform, "core-" + platform + ".orig")
+needed = ("manifest.json", "core-" + platform, "core-" + platform + ".orig")
 if platform == "linux-amd64":
     needed += ("agent-" + platform + ".orig",)
 if not all(name in assets for name in needed):
     raise SystemExit("Unsupported: latest Release " + tag + " has no verified assets for " + platform)
 (run / "manifest.url").write_text(assets["manifest.json"])
-(run / "runtime.url").write_text(assets["runtime.tar.gz"])
 (run / "core.url").write_text(assets["core-" + platform])
 (run / "orig.url").write_text(assets["core-" + platform + ".orig"])
 if platform == "linux-amd64":
@@ -340,14 +339,16 @@ PY
 }
 
 # ---------------------------------------------------------------------------
-# 运行时解包（manifest + runtime.tar.gz 里是工具脚本）
+# 运行时工具：内核资产（core/agent/manifest）走 Release，脚本工具走 main 分支。
+# 这样只改证书显示或安装脚本时无需重新发版，push 到 main 即生效。
 # ---------------------------------------------------------------------------
-RUNTIME_FILES_OK="tools/gen_license.py tools/patch_core.py tools/patch_agent.py tools/cert_store.py tools/aes128.py tools/gosym.py tools/official_rootcert.json state/license.crt"
+TOOL_FILES="tools/gen_license.py tools/aes128.py tools/patch_core.py tools/gosym.py tools/patch_agent.py state/license.crt"
 
-extract_runtime() {
-  python3 - "$RUN" "$WORK" "$PLATFORM" "$RUNTIME_FILES_OK" <<'PY'
-import hashlib, json, pathlib, tarfile, sys
-run, work, platform, whitelist = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), sys.argv[3], set(sys.argv[4].split())
+fetch_tools() {
+  # 先校验内核 manifest 结构，再从 main 分支拉取工具脚本。
+  python3 - "$RUN" "$PLATFORM" <<'PY'
+import json, pathlib, sys
+run, platform = pathlib.Path(sys.argv[1]), sys.argv[2]
 m = json.loads((run / "manifest.json").read_text())
 if m.get("schema_version") != 2 or m.get("name") != "xpack-toolkit" or m.get("mode") != "offline":
     raise SystemExit("Expected an offline schema-2 release manifest")
@@ -358,22 +359,17 @@ if (run / "release.tag").exists() and (run / "release.tag").read_text() != "core
 p = m["platforms"][platform]
 if p.get("os") != "linux" or p.get("arch") != platform[6:] or p.get("core_asset") != "core-" + platform:
     raise SystemExit("Invalid platform declaration")
-meta = m["runtime"]
-archive = run / "runtime.tar.gz"
-data = archive.read_bytes()
-if meta.get("asset") != archive.name or meta.get("size") != len(data) or meta.get("sha256") != hashlib.sha256(data).hexdigest():
-    raise SystemExit("Runtime archive checksum mismatch")
-with tarfile.open(archive, "r:gz") as tf:
-    members = tf.getmembers()
-    if any(a.name not in whitelist or not a.isfile() for a in members):
-        raise SystemExit("Runtime archive must contain only the public file whitelist")
-    for item in members:
-        target = work / item.name
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(tf.extractfile(item).read())
-        target.chmod(0o600)
-print("Verified bundled runtime / " + m["version"] + " / " + platform)
 PY
+  mkdir -p "$WORK/tools" "$WORK/state"
+  local REL
+  for REL in $TOOL_FILES; do
+    fetch "https://raw.githubusercontent.com/$REPO/main/$REL" "$WORK/$REL"
+  done
+  # 语法自检，确保工具下载完整可用
+  python3 -m py_compile "$WORK/tools/gen_license.py" "$WORK/tools/aes128.py" \
+    "$WORK/tools/patch_core.py" "$WORK/tools/gosym.py" "$WORK/tools/patch_agent.py" \
+    || die "Runtime tools failed to compile"
+  log "Fetched runtime tools from main branch"
 }
 
 # ---------------------------------------------------------------------------
@@ -469,11 +465,10 @@ RELEASE_LINE="$(select_release)"
 log "$RELEASE_LINE"
 RELEASE_VERSION="$(<"$RUN/selected.version")"
 
-# 下载 manifest 与 runtime
+# 下载 manifest（内核资产）与工具脚本（main 分支）
 fetch "$(<"$RUN/manifest.url")" "$RUN/manifest.json"
-fetch "$(<"$RUN/runtime.url")" "$RUN/runtime.tar.gz"
 WORK="$(mktemp -d "$PERSIST/runtime.XXXXXX")"
-extract_runtime
+fetch_tools
 printf '%s\n' "$WORK" > "$PERSIST/runtime.path"
 
 PATCH_CORE="$WORK/tools/patch_core.py"

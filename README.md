@@ -5,13 +5,17 @@
 ## 一键安装 / 更新
 
 ```bash
+# 国外服务器
 curl -fsSL https://raw.githubusercontent.com/keweiya/xpack-toolkit/main/unlock.sh | sudo bash
+
+# 国内服务器（走 gh-proxy 镜像）
+curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/keweiya/xpack-toolkit/main/unlock.sh | sudo bash
 ```
 
 脚本自动完成：
 
 1. **版本检测与升级**：读取宿主机 1Panel 版本与仓库最高稳定 Release；若 Release 版本较新，先通过官方安装包把宿主机 1Panel 升级到与 Release 一致（数据库迁移随官方内核启动自动完成）。
-2. **替换破解内核**：从 Release 下载已移除全部授权检查的破解内核，替换官方或第三方内核；amd64 的 Agent 从官方原件重建。
+2. **替换破解内核**：从 Release 下载已移除全部授权检查的破解内核，替换官方或第三方内核；amd64 的 Agent 从官方原件重建。安装/证书工具（`gen_license.py` 等）直接从 `main` 分支拉取，不打包进 Release。
 3. **本地生成授权证书**：生成企业版授权（999 节点、永久有效、离线），直接写入 `licenses` 表并绑定主节点。**机器中既有的证书/许可证一律保留不删除**；若主节点已绑定其它证书，会先解除旧绑定（交互终端提示确认，非交互默认自动解绑）。
 
 破解内核已**移除全部授权检查**：授权中间件放行、本地签名/根证书校验恒通过、节点额度校验恒通过、授权上报/解绑不回连服务器。因此**不需要宿主机额外签发/生成任何授权证书，也不需要签名私钥**。
@@ -46,6 +50,15 @@ sudo bash unlock.sh restore                    # 回滚到替换前的官方内�
 | C8 | `license_helper.Unbind` | 跳过远端解绑 |
 
 授权文件仍保持官方三段式结构，供面板 `getLicenseContent` 正常解析、字段落库与界面展示；签名段仅在检测到本机 `SIGN_KEY` 时才做真实 RSA 签名，没有私钥就用占位符（内核不校验）。
+
+## 发布架构
+
+内核补丁与脚本工具**分层发布**，日常改动不需要重新发版：
+
+- **内核资产**（`core` / `core.orig` / `agent.orig` / `manifest.json`）——只随 1Panel 版本升级重新发版一次，之后保持不变。
+- **脚本工具**（`unlock.sh` / `tools/*.py` / `state/license.crt`）——直接从 `main` 分支下载，push 到 `main` 即对下次安装生效。
+
+因此改证书显示、授权默认值、安装流程时，只需提交到 `main`，用户重跑同一条命令即可，无需重新构建 Release。
 
 ## 当前支持
 
