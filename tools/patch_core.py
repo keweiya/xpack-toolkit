@@ -175,7 +175,67 @@ PATCHES = [
      0x010866EF, bytes.fromhex("7514"), bytes.fromhex("eb14"),
      "xpack.initLicense: 启动时不再清掉 sync 字段为 0 的根证书行（保住本站根证书）",
      "initLicense"),
+
+    # ------------------------------------------------------------------
+    # 离线化补丁：删除在线验证 + 定时验证
+    #
+    # 面板的授权链路原本依赖 1p-cert.0rz.li（Cloudflare 后面，当前 530）。
+    # 只要有一次出网失败，updateStatus 就会拿不到授权内容，紧接着
+    # license_snapshot.RefreshWithLog 用空快照覆盖启动时建好的快照，
+    # /licenses/status 于是永远返回空 —— 面板显示「社区版」。
+    #
+    # 这里把「出网」和「定时校验」两件事从内核里摘掉，授权完全本地生效。
+    # 注意：不短路 CheckInLocal / 解密逻辑，否则字段会被二次加密写成乱码。
+    # ------------------------------------------------------------------
+    ("P5a.license_snapshot.refresh.ignore_err",
+     0x00F149F5, bytes.fromhex("0f8526010000"), bytes.fromhex("909090909090"),
+     "license_snapshot.Refresh: 忽略 bind_node_id 解析错误（不再整行跳过）",
+     "refresh"),
+
+    ("P5b.license_snapshot.refresh.local_fallback",
+     0x00F14A03, bytes.fromhex("0f8418010000"), bytes.fromhex("b80100000090"),
+     "license_snapshot.Refresh: 节点号解析为 0 时回退本地节点 1（快照不再为空）",
+     "refresh"),
+
+    ("P6.cron.license_check.disable",
+     0x0107F4C0, bytes.fromhex("4c8da424c8fdffff4d3b6610"),
+     bytes.fromhex("c39090909090909090909090"),
+     "cron/jobs.(*LicenseCheck).Run 直接返回：删除每日 0:23 的定时授权校验任务",
+     "symbol"),
+
+    ("P7.license_helper.report.disable",
+     0x00EF14E0, bytes.fromhex("4c8da424b8fdffff4d3b6610"),
+     bytes.fromhex("31c031dbc390909090909090"),
+     "license_helper.Report 直接返回 nil：删除向授权服务器上报（出网）",
+     "symbol"),
+
+    ("P8.license_helper.checkversion.disable",
+     0x00EEFCC0, bytes.fromhex("48894424084885db0f84d300"),
+     bytes.fromhex("31c0c3909090909090909090"),
+     "license_helper.CheckVersion 恒 false：删除在线版本校验（出网）",
+     "symbol"),
+
+    ("P9.alert.sync_sms.disable",
+     0x00F31820, bytes.fromhex("493b66100f86080100005548"),
+     bytes.fromhex("c39090909090909090909090"),
+     "alert.SyncSmsCountAsync 直接返回：删除在线短信计数同步（出网）",
+     "symbol"),
+
+    ("P10.license_helper.egress.disable",
+     0x00EF1DA0, bytes.fromhex("4c8da42400feffff4d3b6610"),
+     bytes.fromhex("31c031db31c931ff31f6c390"),
+     "license_helper.handleRequest 直接返回空：切断唯一出网出口（所有授权服务器 HTTP 请求）",
+     "symbol"),
 ]
+
+# 符号定位用：补丁名 -> Go 符号后缀（换版本/架构时用符号重新定位）
+SYMBOL_SUFFIX = {
+    "P6.cron.license_check.disable": "core/xpack/cron/jobs.(*LicenseCheck).Run",
+    "P7.license_helper.report.disable": "core/xpack/utils/license_helper.Report",
+    "P8.license_helper.checkversion.disable": "core/xpack/utils/license_helper.CheckVersion",
+    "P9.alert.sync_sms.disable": "core/xpack/utils/alert.SyncSmsCountAsync",
+    "P10.license_helper.egress.disable": "core/xpack/utils/license_helper.handleRequest",
+}
 
 # C7 的指令特征：cmp qword ptr [rdx+0x90], 0 ; jne rel8
 C7_CTX = bytes.fromhex("4883ba9000000000")     # 48 83 ba 90 00 00 00 00
@@ -296,6 +356,96 @@ def _plausible(cur, orig):
     return False
 
 
+def _sym_off(data, suffix):
+    """按 Go 符号名后缀找函数体起始的文件偏移；找不到返回 None。"""
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from gosym import read_syms          # noqa: PLC0415
+    except Exception:                        # noqa: BLE001
+        return None
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False) as fh:
+            fh.write(data)
+            tmp = fh.name
+        _d, syms = read_syms(tmp)
+    except Exception:                        # noqa: BLE001
+        return None
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+    for s in syms:
+        if s["name"].endswith(suffix):
+            return s["off"]
+    return None
+
+
+def _refresh_offsets(data):
+    """在 license_snapshot.Refresh 里定位 bind_node_id 解析后的两处条件跳转。
+
+    目标指令序列（amd64）：
+        call  strconv.Atoi
+        test  rbx,rbx ; jne <skip>          <- 解析出错就跳过该行
+        nop5
+        test  rax,rax ; je  <skip>          <- 节点号为 0 也跳过该行
+    返回 (jne_off, je_off)；定位不到返回 (None, None)。
+    """
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from gosym import read_syms          # noqa: PLC0415
+    except Exception:                        # noqa: BLE001
+        return None, None
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False) as fh:
+            fh.write(data)
+            tmp = fh.name
+        _d, syms = read_syms(tmp)
+    except Exception:                        # noqa: BLE001
+        return None, None
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+    if detect_machine(data) != 62:            # 只对 amd64 做指令级定位
+        return None, None
+    fn = next((s for s in syms
+               if s["name"].endswith("core/xpack/utils/license_snapshot.Refresh")), None)
+    if fn is None:
+        return None, None
+    lo, hi = fn["off"], fn["off"] + fn["size"]
+    atoi = next((s for s in syms if s["name"].endswith("strconv.Atoi")), None)
+    if atoi is None:
+        return None, None
+    atoi_va = atoi["entry"] + 0x401000
+    for off in range(lo, hi - 32, 1):
+        if data[off] != 0xE8:
+            continue
+        rel = struct.unpack_from("<i", data, off + 1)[0]
+        if (off + 0x400000) + 5 + rel != atoi_va:
+            continue
+        p = off + 5
+        if data[p:p + 3] != b"\x48\x85\xdb":           # test rbx,rbx
+            continue
+        if data[p + 3:p + 5] != b"\x0f\x85":           # jne rel32
+            continue
+        jne_off = p + 3
+        q = jne_off + 6
+        if data[q:q + 5] == b"\x0f\x1f\x44\x00\x00":   # nopl 0x0(%rax,%rax,1)
+            q += 5
+        if data[q:q + 3] != b"\x48\x85\xc0":           # test rax,rax
+            continue
+        if data[q + 3:q + 5] != b"\x0f\x84":           # je rel32
+            continue
+        return jne_off, q + 3
+    return None, None
+
+
 def _resolve(data, name, off, orig, patched, how):
     """返回该补丁在这次二进制里的真实偏移；定位不到返回 None。"""
     if data is None:
@@ -316,6 +466,16 @@ def _resolve(data, name, off, orig, patched, how):
         alt = _init_license_c7_off(data)
         if alt is not None:
             return alt
+    if how == "symbol":
+        # 函数入口补丁：按符号名重新定位（换版本/架构时偏移会变）
+        suffix = SYMBOL_SUFFIX.get(name)
+        if suffix:
+            alt = _sym_off(data, suffix)
+            if alt is not None:
+                return alt
+    if how == "refresh":
+        jne_off, je_off = _refresh_offsets(data)
+        return jne_off if name.startswith("P5a") else je_off
     return None
 
 # 旧版「状态伪造」补丁：全部删除。

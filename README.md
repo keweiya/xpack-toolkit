@@ -71,6 +71,32 @@ sudo SKIP_AGENT=1 bash unlock.sh    # 不处理 agent
 脚本做的事：检测架构 → 取该架构最新 Release → 校验 `sha256` 与 `root_fingerprint`
 → 备份并替换内核 → 写根证书 4 行 → 重启 → 放行 agent → 生成企业版永久离线授权并写入面板。
 
+## 离线化：删除在线验证 + 定时验证
+
+授权链路原本依赖 `1p-cert.0rz.li`。只要有一次出网失败，`updateStatus` 就拿不到授权内容，
+紧接着 `license_snapshot.RefreshWithLog` 用**空快照覆盖**启动时建好的快照，
+`GET /api/v2/core/licenses/status` 于是永远返回空 —— 面板显示「社区版」。
+
+内核补丁把这件两件事从二进制里摘掉，授权完全本地生效：
+
+| 补丁 | 目标 | 效果 |
+| --- | --- | --- |
+| `P5a/P5b` | `xpack/utils/license_snapshot.Refresh` | `bind_node_id` 解析失败/为 0 时回退本地节点 1，快照不再为空 |
+| `P6` | `xpack/cron/jobs.(*LicenseCheck).Run` | 删除每日 0:23 的定时授权校验任务 |
+| `P7` | `xpack/utils/license_helper.Report` | 删除向授权服务器上报 |
+| `P8` | `xpack/utils/license_helper.CheckVersion` | 删除在线版本校验 |
+| `P9` | `xpack/utils/alert.SyncSmsCountAsync` | 删除在线短信计数同步 |
+| `P10` | `xpack/utils/license_helper.handleRequest` | 切断唯一出网出口（所有授权服务器 HTTP 请求） |
+
+补丁按 Go 符号名定位（`how="symbol"`），换版本或换架构时自动重定位，不依赖固化偏移。
+`CheckInLocal` 与解密逻辑**不做短路** —— 否则字段会被二次加密写成乱码。
+
+验证（应看不到任何 `alert response failed` / `sync alert count` 日志）：
+
+```bash
+journalctl -u <product>-core --since "1 min ago" | grep -i xpack
+```
+
 ## 回滚
 
 ```bash

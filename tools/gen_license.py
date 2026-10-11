@@ -305,12 +305,18 @@ def build(edition, expires, nodes, assignee, device_id, issuer,
         "smsUsed": 0,
     }
     row = {
+        # GORM 把 created_at/updated_at 扫成 time.Time，留 NULL 会让整行扫描失败
+        # （表现为 /licenses/status 永远返回空），必须显式写入。
+        "created_at": now.strftime("%Y-%m-%d %H:%M:%S.%f+00:00"),
+        "updated_at": now.strftime("%Y-%m-%d %H:%M:%S.%f+00:00"),
         "license_name": product,
         "usage_name": _P,
         "assignee_name": assignee,
         "version_constraint": version,
         "device_id": device_id,
-        "license": encrypt_blob(json.dumps(content, ensure_ascii=False).encode()),
+        # 面板 getLicenseContent 会把解密结果按 '-' 切段，取第 0 段 base64 解码后
+        # json.Unmarshal。所以这里必须存完整的三段式 envelope，不能存裸 JSON。
+        "license": encrypt_blob(encode_license(content).encode()),
         "offline": "true" if offline else "false",
         "trial": "true" if trial else "false",
         "issuer": issuer,
@@ -349,12 +355,17 @@ def row_from_content(content, device_id=None):
     ann = content.get("annotations") or {}
     now = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
     return {
+        # 同 build()：NULL 时间戳会让 GORM 扫描整行失败。
+        "created_at": now.strftime("%Y-%m-%d %H:%M:%S.%f+00:00"),
+        "updated_at": now.strftime("%Y-%m-%d %H:%M:%S.%f+00:00"),
         "license_name": content.get("licenseName") or _EP + " Professional",
         "usage_name": content.get("usageName") or _P,
         "assignee_name": content.get("assigneeName") or "YG",
         "version_constraint": content.get("versionConstraint") or "2.x",
         "device_id": content.get("deviceID") or device_id or machine_id(),
-        "license": encrypt_blob(json.dumps(content, ensure_ascii=False).encode()),
+        # 面板 getLicenseContent 会把解密结果按 '-' 切段，取第 0 段 base64 解码后
+        # json.Unmarshal。所以这里必须存完整的三段式 envelope，不能存裸 JSON。
+        "license": encrypt_blob(encode_license(content).encode()),
         "offline": "true" if content.get("offline") else "false",
         "trial": "true" if content.get("trial") else "false",
         "issuer": content.get("issuer") or "lxware",
