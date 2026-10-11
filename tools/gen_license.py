@@ -187,7 +187,10 @@ def build(edition, expires, nodes, assignee, device_id, issuer,
     status, _product, _ = EDITIONS[edition]
     exp = dt.datetime.strptime(expires, "%Y-%m-%d").replace(tzinfo=dt.timezone.utc)
     now = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
-    pro_unix = str(int(exp.timestamp()))
+    # 年份 >= 9999 视为永久授权：product_pro 写 "0"（面板 checkLicense 以 "0" 为永久标记，
+    # 跳过过期比较）；前端再配合 versionConstraint="all" 显示「永久授权」。
+    permanent = exp.year >= 9999
+    pro_unix = "0" if permanent else str(int(exp.timestamp()))
     pro_iso = exp.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     products = [{
@@ -259,6 +262,7 @@ def row_from_content(content, device_id=None, text=""):
     ts = dt.datetime.fromisoformat(expires.replace("Z", "+00:00"))
     if ts.tzinfo is None:
         raise ValueError("certificate expiration requires a timezone")
+    permanent = ts.year >= 9999
     nodes = int(pro.get("maxNodeCount") or 0)
     now = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
     return {
@@ -271,7 +275,7 @@ def row_from_content(content, device_id=None, text=""):
         "offline": "true" if content.get("offline") else "false",
         "trial": "true" if content.get("trial") else "false",
         "issuer": content.get("issuer") or "lxware",
-        "product_pro": str(int(ts.timestamp())),
+        "product_pro": "0" if permanent else str(int(ts.timestamp())),
         "last_sync_at": str(int(now.timestamp())),
         "sms_total": int(content.get("smsTotal") or 0),
         "sms_used": int(content.get("smsUsed") or 0),
@@ -481,8 +485,11 @@ def verify_database(db=XPACK_DB, serial_path=None, bind_node_id=None):
                   "free_count", "status"):
         if row[field] != expected[field]:
             raise ValueError("database metadata differs from certificate: " + field)
-    if row["offline"] != "true" or int(row["product_pro"]) <= int(dt.datetime.now().timestamp()):
-        raise ValueError("master-bound license must be offline and unexpired")
+    product_pro = row["product_pro"]
+    if row["offline"] != "true":
+        raise ValueError("master-bound license must be offline")
+    if product_pro != "0" and int(product_pro) <= int(dt.datetime.now().timestamp()):
+        raise ValueError("master-bound license must be unexpired")
     serial_path = serial_path or os.path.join(os.path.dirname(db), ".serial")
     with open(serial_path) as fh:
         if fh.read().strip() != row["device_id"]:
@@ -490,8 +497,9 @@ def verify_database(db=XPACK_DB, serial_path=None, bind_node_id=None):
     return {
         "licenseName": row["license_name"], "assigneeName": row["assignee_name"],
         "versionConstraint": row["version_constraint"], "status": row["status"],
-        "expiresAt": dt.datetime.fromtimestamp(int(row["product_pro"]),
-            dt.timezone.utc).isoformat(), "maxNodeCount": int(row["free_count"]),
+        "expiresAt": "permanent" if product_pro == "0" else
+        dt.datetime.fromtimestamp(int(product_pro), dt.timezone.utc).isoformat(),
+        "maxNodeCount": int(row["free_count"]),
         "bindNodeID": node_id, "offline": True,
     }
 
@@ -508,15 +516,15 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--edition", choices=sorted(EDITIONS), default="enterprise",
                     help="授权类型：free / pro / enterprise（默认 enterprise 企业版）")
-    ap.add_argument("--expires", default="2099-12-31",
-                    help="授权期限 YYYY-MM-DD（默认 2099-12-31 永久）")
+    ap.add_argument("--expires", default="9999-12-31",
+                    help="授权期限 YYYY-MM-DD（年份 >= 9999 视为永久，默认 9999-12-31 永久）")
     ap.add_argument("--nodes", type=int, default=999,
                     help="允许绑定的子节点数量（默认 999）")
     ap.add_argument("--assignee", default="YG", help="被授权人")
     ap.add_argument("--device-id", default=None, help="设备号，默认取 machine-id")
     ap.add_argument("--issuer", default="lxware", help="签发者")
     ap.add_argument("--sms-total", type=int, default=100000, help="短信条数")
-    ap.add_argument("--version", default="2.x", help="版本约束")
+    ap.add_argument("--version", default="all", help="版本约束（默认 all，配合永久授权显示「永久授权」）")
     ap.add_argument("--trial", action="store_true", help="标记为试用授权")
     ap.add_argument("--offline", action=argparse.BooleanOptionalAction, default=True,
                     help="离线授权（默认开启）")
@@ -560,7 +568,8 @@ def main():
         print("== 导入证书 : %s" % a.import_file)
         print("== 产品版本 : %s" % row["license_name"])
         print("== 授权期限 : %s  -> product_pro=%s" % (
-            (content.get("products") or [{}])[0].get("expiresAt", ""), row["product_pro"]))
+            (content.get("products") or [{}])[0].get("expiresAt", ""),
+            "永久" if row["product_pro"] == "0" else row["product_pro"]))
         print("== 子节点数 : %s" % row["free_count"])
         print("== 授权对象 : %s" % row["assignee_name"])
         if a.sql:
@@ -585,7 +594,8 @@ def main():
     assert decode_license(text)["products"][0]["expiresAt"].startswith(a.expires)
 
     print("== 授权类型 : %s (%s)" % (a.edition, EDITIONS[a.edition][1]))
-    print("== 授权期限 : %s  -> product_pro=%s" % (a.expires, row["product_pro"]))
+    print("== 授权期限 : %s  -> product_pro=%s" % (
+        a.expires, "永久" if row["product_pro"] == "0" else row["product_pro"]))
     print("== 子节点数 : %s  -> free_count=%s / maxNodeCount=%s"
           % (a.nodes, row["free_count"], content["products"][0]["maxNodeCount"]))
     print("== 设备号   : %s" % row["device_id"])

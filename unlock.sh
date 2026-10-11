@@ -540,7 +540,7 @@ install -m 0755 "$RUN/core" "$CORE_BIN"
 PROMPT_FLAGS=()
 [ "$PROMPT_UNBIND" = 1 ] && PROMPT_FLAGS=(--prompt-unbind)
 LICENSE_OUT="$RUN/license.txt"
-python3 "$GEN_LICENSE" --edition enterprise --expires "${EXPIRES:-2099-12-31}" \
+python3 "$GEN_LICENSE" --edition enterprise --expires "${EXPIRES:-9999-12-31}" \
   --nodes "${NODES:-999}" --assignee "${ASSIGNEE:-YG}" --offline \
   --out "$LICENSE_OUT" --db "$XPACK_DB" --serial-path "$SERIAL_PATH"
 python3 "$GEN_LICENSE" --import-file "$LICENSE_OUT" --apply --no-restart \

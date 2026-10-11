@@ -56,6 +56,17 @@ class LicenseCodecTests(unittest.TestCase):
         self.assertEqual(row["status"], "Bound")
         self.assertGreater(int(row["product_pro"]), 0)
 
+    def test_year_ge_9999_is_permanent(self):
+        # 年份 >= 9999 视为永久：product_pro 写 "0"，面板跳过过期比较。
+        content, row = gen.build("enterprise", "9999-12-31", 999, "YG",
+                                 "d" * 32, "lxware", 100000, False, True, "all")
+        self.assertEqual(row["product_pro"], "0")
+        self.assertEqual(row["version_constraint"], "all")
+        self.assertEqual(content["products"][0]["expiresAt"], "9999-12-31T00:00:00Z")
+        # 往返导入后仍是永久标记
+        back = gen.row_from_content(content, text="dummy")
+        self.assertEqual(back["product_pro"], "0")
+
 
 class DatabaseTests(unittest.TestCase):
     def setUp(self):
