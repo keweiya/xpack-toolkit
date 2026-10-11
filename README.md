@@ -89,6 +89,10 @@ sudo SKIP_AGENT=1 bash unlock.sh    # 不处理 agent
 | `P10` | `xpack/utils/license_helper.handleRequest` | 切断唯一出网出口（所有授权服务器 HTTP 请求） |
 
 补丁按 Go 符号名定位（`how="symbol"`），换版本或换架构时自动重定位，不依赖固化偏移。
+`P5a/P5b` 用 `Refresh` 函数体内的指令特征定位（amd64：`test rbx,rbx` + `test rax,rax`；
+arm64：`cbnz x1` + `cbz x0`），两种架构都不依赖固化偏移。
+arm64 的补丁字节单独维护（`ARM64_PATCHES`）—— AArch64 的 `ret`/`nop`/`mov xN,xzr`
+与 x86 完全不同，直接套用 amd64 字节会把指令流写坏。
 `CheckInLocal` 与解密逻辑**不做短路** —— 否则字段会被二次加密写成乱码。
 
 验证（应看不到任何 `alert response failed` / `sync alert count` 日志）：
