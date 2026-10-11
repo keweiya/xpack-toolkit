@@ -268,7 +268,15 @@ elif name == "install":
     raise SystemExit(subprocess.call([os.environ["REAL_INSTALL"]]+args))
 elif name == "curl":
     url = args[-1]; dst = args[args.index("-o")+1]; confined(dst)
-    if url == os.environ.get("API_URL_CHECK"):
+    trace = os.environ.get("CURL_TRACE")
+    if trace:
+        with open(trace, "a") as f:
+            f.write(json.dumps({"args": args, "proxy_env": {key: os.environ[key] for key in
+                ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "all_proxy", "ALL_PROXY")
+                if key in os.environ}})+"\n")
+    api = os.environ.get("API_URL_CHECK", "")
+    original_url = url[url.find(api):] if api and api in url else url
+    if api and original_url == api:
         assert pathlib.Path(dst).resolve().is_relative_to(pathlib.Path(os.environ["TMPDIR"]).resolve())
         assert not pathlib.Path(os.environ["UNLOCK_WORK"]).exists(), "persistent runtime before first API"
         assert not pathlib.Path(os.environ["BACKUP"]).exists(), "backup before first API"
@@ -280,6 +288,16 @@ elif name == "curl":
         assert not list(pathlib.Path(os.environ["MOCK_STATE"]).glob("*.stopped"))
         with open(os.environ["EVENT_LOG"], "a") as f: f.write("first-api-readonly\n")
     if os.environ.get("FAIL_CURL"): raise SystemExit(22)
+    failures = os.environ.get("MOCKFAIL_URLS")
+    failures = json.loads(pathlib.Path(failures).read_text()) if failures else {}
+    if url in failures:
+        pathlib.Path(dst).write_bytes(b"incomplete HTTP response")
+        raise SystemExit(int(failures[url]))
+    bad_map = os.environ.get("CURL_BAD_MAP")
+    bad_map = json.loads(pathlib.Path(bad_map).read_text()) if bad_map else {}
+    if url in bad_map:
+        shutil.copyfile(bad_map[url], dst)
+        raise SystemExit(0)
     urls = json.loads(pathlib.Path(os.environ["CURL_MAP"]).read_text())
     if url not in urls or not pathlib.Path(urls[url]).is_file():
         with open(os.environ["EVENT_LOG"], "a") as f: f.write("CURL_MISTAKE "+url+"\n")
@@ -360,7 +378,8 @@ class Fixture:
                     "STATE": str(self.state), "SIGN_CRT": str(self.state / "license.crt"),
                     "SIGN_KEY": str(self.state / "license.key"), "REPO": "fixture/xpack", "VERSION": "v2.3.2",
                     "EVENT_LOG": str(self.events), "MOCK_STATE": str(self.base), "FIXTURE_ROOT": str(self.base),
-                    "CURL_MAP": str(self.downloads / "urls.json"), "REAL_INSTALL": shutil.which("install")}
+                    "CURL_MAP": str(self.downloads / "urls.json"), "REAL_INSTALL": shutil.which("install"),
+                    "GH_MIRRORS": "", "CURL_TRACE": str(self.downloads / "curl-trace.jsonl")}
 
         self.env["PANEL_CTL"] = str(self.ctl)
 
@@ -435,6 +454,35 @@ class Fixture:
     def asset_url(self, name, version=None):
         version = self.man["version"] if version is None else version
         return "https://github.com/fixture/xpack/releases/download/core-"+version+"/"+name
+
+    def mirror_urls(self, prefixes):
+        path = Path(self.env["CURL_MAP"])
+        urls = json.loads(path.read_text())
+        originals = {url: filename for url, filename in urls.items()
+                     if url.startswith(("https://github.com/", "https://api.github.com/",
+                                        "https://raw.githubusercontent.com/"))}
+        for prefix in prefixes:
+            urls.update({prefix.rstrip("/")+"/"+url: filename for url, filename in originals.items()})
+        path.write_text(json.dumps(urls))
+
+    def curl_failures(self, urls):
+        path = self.downloads / "curl-failures.json"
+        path.write_text(json.dumps({url: 22 for url in urls} if not isinstance(urls, dict) else urls))
+        self.env["MOCKFAIL_URLS"] = str(path)
+
+    def curl_responses(self, responses):
+        mapping = {}
+        for index, (url, data) in enumerate(responses.items()):
+            path = self.downloads / ("curl-response-%d" % index)
+            path.write_bytes(data.encode() if isinstance(data, str) else data)
+            mapping[url] = str(path)
+        path = self.downloads / "curl-bad-map.json"
+        path.write_text(json.dumps(mapping))
+        self.env["CURL_BAD_MAP"] = str(path)
+
+    def curl_trace(self):
+        path = Path(self.env["CURL_TRACE"])
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
 
     def set_target_version(self, version):
         self.man["version"] = version

@@ -28,7 +28,135 @@ case "$(uname -m)" in
 esac
 PLATFORM="linux-$ARCH"
 PANEL_CTL="${PANEL_CTL:-/usr/local/bin/1pctl}"
-fetch() { curl --proto '=https' --tlsv1.2 -fsSL --retry 2 -o "$2" "$1"; }
+# Public gateways receive public GitHub URLs only; never local signing material.
+MIRROR_CONFIG="$(python3 - "${GH_PROXY:-}" "${GH_MIRRORS-https://ghfast.top/ https://gh-proxy.com/ https://ghproxy.net/}" <<'PY'
+import re, sys, urllib.parse
+preferred, configured = sys.argv[1:]
+if preferred == "direct":
+    raise SystemExit(0)
+seen = set()
+for value in ([preferred] if preferred else []) + re.split(r"[\s,]+", configured.strip()):
+    if not value:
+        continue
+    parsed = urllib.parse.urlsplit(value)
+    if (parsed.scheme not in ("http", "https") or not parsed.hostname or
+            parsed.username is not None or parsed.password is not None or
+            parsed.query or parsed.fragment or any(ord(c) < 33 for c in value)):
+        raise SystemExit("Invalid GitHub mirror prefix; expected an HTTP(S) URL without credentials/query/fragment")
+    try:
+        parsed.port
+    except ValueError:
+        raise SystemExit("Invalid GitHub mirror port")
+    value = value.rstrip("/") + "/"
+    if value not in seen:
+        print(value)
+        seen.add(value)
+PY
+)" || die "Invalid GitHub mirror configuration"
+MIRRORS=()
+if [ -n "$MIRROR_CONFIG" ]; then
+  while IFS= read -r PREFIX; do MIRRORS+=("$PREFIX"); done <<< "$MIRROR_CONFIG"
+fi
+validate_download() {
+  python3 - "$1" "$2" "$PLATFORM" <<'PY'
+import hashlib, json, os, pathlib, re, ssl, sys
+candidate, destination, platform = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), sys.argv[3]
+name = destination.name
+if not candidate.is_file() or candidate.stat().st_size == 0:
+    raise SystemExit("Empty download")
+if name in ("releases.json", "manifest.json"):
+    with candidate.open() as stream:
+        data = json.load(stream)
+    if name == "releases.json":
+        if not isinstance(data, list) or any(not isinstance(r, dict) or
+                not isinstance(r.get("tag_name"), str) or
+                not isinstance(r.get("assets", []), list) for r in data):
+            raise SystemExit("Expected GitHub release-list JSON, not a gateway page")
+    else:
+        if (not isinstance(data, dict) or data.get("schema_version") != 2 or
+                data.get("name") != "xpack-toolkit" or data.get("mode") != "offline" or
+                data.get("remote_base") != "" or not isinstance(data.get("platforms"), dict) or
+                platform not in data["platforms"] or not isinstance(data.get("runtime"), dict)):
+            raise SystemExit("Expected an offline schema-2 unified release manifest")
+        tag = destination.with_name("release.tag")
+        if tag.is_file() and tag.read_text() != "core-" + str(data.get("version", "")):
+            raise SystemExit("Release tag/version mismatch")
+        declared = data.get("root_fingerprint")
+        if not isinstance(declared, str) or not re.fullmatch(r"[0-9a-f]{64}", declared):
+            raise SystemExit("Invalid manifest signing root")
+        cert = os.environ.get("SIGN_CRT")
+        expected_root = "cb8cc410354dbbda7b542c952a8c8ffb47a0f3d886c7e7273c89cb7a44156030" if not cert else None
+        if cert and pathlib.Path(cert).is_file():
+            expected_root = hashlib.sha256(ssl.PEM_cert_to_DER_cert(pathlib.Path(cert).read_text())).hexdigest()
+        if expected_root is not None and declared != expected_root:
+            raise SystemExit("Manifest signing root mismatch")
+        meta = data["platforms"][platform]
+        if (not isinstance(meta, dict) or meta.get("os") != "linux" or
+                meta.get("arch") != platform[6:] or meta.get("patches") != 3 or
+                meta.get("core_asset") != "core-" + platform or
+                meta.get("orig_asset") != "core-" + platform + ".orig"):
+            raise SystemExit("Invalid platform declaration")
+        for entry, hash_key, size_key in ((data["runtime"], "sha256", "size"),
+                                         (meta, "sha256", "size"), (meta, "orig_sha256", "orig_size")):
+            value = entry.get(hash_key)
+            if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+                raise SystemExit("Invalid manifest download hash")
+            size = entry.get(size_key)
+            if size is not None and (type(size) is not int or size < 1):
+                raise SystemExit("Invalid manifest download size")
+        if data["runtime"].get("asset") != "runtime.tar.gz" or type(data["runtime"].get("size")) is not int:
+            raise SystemExit("Invalid runtime declaration")
+    raise SystemExit(0)
+if name in ("runtime.tar.gz", "core", "core.orig", "agent.orig"):
+    manifest = json.loads(destination.with_name("manifest.json").read_text())
+    platform_meta = manifest["platforms"][platform]
+    if name == "runtime.tar.gz":
+        expected, size = manifest["runtime"]["sha256"], manifest["runtime"]["size"]
+    elif name == "agent.orig":
+        expected, size = platform_meta["agent_orig_sha256"], platform_meta["agent_orig_size"]
+    else:
+        expected = platform_meta["sha256" if name == "core" else "orig_sha256"]
+        size = platform_meta.get("size" if name == "core" else "orig_size", platform_meta.get("size"))
+    digest = hashlib.sha256()
+    with candidate.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected) or digest.hexdigest() != expected:
+        raise SystemExit("Download SHA-256 mismatch: " + name)
+    if size is not None and candidate.stat().st_size != size:
+        raise SystemExit("Download size mismatch: " + name)
+PY
+}
+fetch() {
+  local URL="$1" DEST="$2" PREFIX CANDIDATE PART ERROR HOST
+  local -a ROUTES=("$URL") CURL_PROXY=()
+  case "$URL" in
+    https://github.com/*|https://raw.githubusercontent.com/*|https://api.github.com/*)
+      if [ -n "${GH_PROXY:-}" ] && [ "$GH_PROXY" != direct ] && [ "${#MIRRORS[@]}" -gt 0 ]; then
+        ROUTES=("${MIRRORS[0]}$URL" "$URL")
+        for PREFIX in "${MIRRORS[@]:1}"; do ROUTES+=("$PREFIX$URL"); done
+      else
+        for PREFIX in "${MIRRORS[@]}"; do ROUTES+=("$PREFIX$URL"); done
+      fi ;;
+  esac
+  [ -z "${XPACK_HTTP_PROXY:-}" ] || CURL_PROXY=(--proxy "$XPACK_HTTP_PROXY")
+  for CANDIDATE in "${ROUTES[@]}"; do
+    PART="$(mktemp "$DEST.part.XXXXXX")"
+    ERROR="$PART.log"
+    if curl --proto '=http,https' --proto-redir '=http,https' --tlsv1.2 -fsSL \
+      --connect-timeout 10 --max-time 180 --retry 1 --retry-max-time 20 \
+      "${CURL_PROXY[@]}" -o "$PART" "$CANDIDATE" 2> "$ERROR" \
+      && validate_download "$PART" "$DEST" 2>> "$ERROR"; then
+      mv -f -- "$PART" "$DEST"
+      rm -f -- "$ERROR"
+      return 0
+    fi
+    HOST="${CANDIDATE#*://}"; HOST="${HOST%%/*}"
+    printf '== Download route %s failed or returned invalid data; trying next route\n' "$HOST" >&2
+    rm -f -- "$PART" "$ERROR"
+  done
+  die "All download routes failed: ${DEST##*/}"
+}
 WORK=""
 if [[ "$MODE" = restore || "$MODE" = verify ]] && [ -f "$PERSIST/runtime.path" ]; then
   IFS= read -r WORK < "$PERSIST/runtime.path"
