@@ -5,7 +5,7 @@
 set -euo pipefail
 umask 077
 REPO="${REPO:-keweiya/xpack-toolkit}"
-BRANCH="${BRANCH:-main}"
+
 PANEL_ROOT="${PANEL_ROOT:-/opt/1panel}"
 CORE_BIN="${CORE_BIN:-/usr/local/bin/1panel-core}"
 AGENT_BIN="${AGENT_BIN:-/usr/local/bin/1panel-agent}"
@@ -20,53 +20,107 @@ die() { printf '!! %s\n' "$*" >&2; exit 1; }
 trap 'printf "!! Failed; artifacts/backups retained: %s / %s\n" "$PERSIST" "$BACKUP" >&2' ERR
 case "$MODE" in install|deploy|restore|verify|cert) ;; *) die "usage: $0 {install|restore|verify|cert}" ;; esac
 [ "$(id -u)" -eq 0 ] || die "Run as root"
-case "$(uname -m)" in x86_64|amd64) ARCH=amd64 ;; aarch64|arm64) ARCH=arm64 ;; *) die "Unknown architecture" ;; esac
+[ "$(uname -s)" = Linux ] || die "This release provides Linux cores"
+case "$(uname -m)" in
+  x86_64|amd64) ARCH=amd64 ;; aarch64|arm64) ARCH=arm64 ;;
+  armv7l) ARCH=armv7 ;; ppc64le|s390x|riscv64) ARCH="$(uname -m)" ;;
+  *) die "Unknown architecture: $(uname -m)" ;;
+esac
+PLATFORM="linux-$ARCH"
 mkdir -p "$PERSIST" "$BACKUP"
 fetch() { curl --proto '=https' --tlsv1.2 -fsSL --retry 2 -o "$2" "$1"; }
-SELF="${BASH_SOURCE[0]:-}"
 WORK=""
-if [ -n "$SELF" ] && [ -f "$SELF" ]; then
-  CANDIDATE="$(cd "$(dirname "$SELF")" && pwd)"
-  [ ! -f "$CANDIDATE/tools/gen_license.py" ] || WORK="$CANDIDATE"
-fi
-if [ -z "$WORK" ] && [ "$MODE" = restore ] && [ -f "$PERSIST/runtime.path" ]; then
+RUN="$(mktemp -d "$PERSIST/run.XXXXXX")"
+if [[ "$MODE" = restore || "$MODE" = verify ]] && [ -f "$PERSIST/runtime.path" ]; then
   IFS= read -r WORK < "$PERSIST/runtime.path"
   [ -f "$WORK/tools/gen_license.py" ] || WORK=""
 fi
 if [ -z "$WORK" ]; then
-  WORK="$(mktemp -d "$PERSIST/runtime.XXXXXX")"
-  mkdir -p "$WORK/tools" "$WORK/web/state"
-  RAW="https://raw.githubusercontent.com/$REPO/$BRANCH"
-  # Whitelist public code/certificates: no repository archive/private state.
-  for PAIR in 'patch_1panel_core.py patch_core.py' 'patch_1panel_agent.py patch_agent.py' \
-              'rootcert_store.py cert_store.py' 'gen_license.py gen_license.py' \
-              'aes128.py aes128.py' 'gosym.py gosym.py'; do
-    read -r LONG SHORT <<< "$PAIR"
-    if ! fetch "$RAW/tools/$LONG" "$WORK/tools/$LONG"; then
-      fetch "$RAW/tools/$SHORT" "$WORK/tools/$LONG" || die "Missing public tool: $LONG / $SHORT"
-    fi
-  done
-  if [ "$MODE" != restore ]; then
-    fetch "$RAW/web/state/license.crt" "$WORK/web/state/license.crt" \
-      || fetch "$RAW/state/license.crt" "$WORK/web/state/license.crt"
+  if [ -n "${ARTIFACT_DIR:-}" ]; then
+    install -m 0600 "$ARTIFACT_DIR/manifest.json" "$RUN/manifest.json"
+    install -m 0600 "$ARTIFACT_DIR/runtime.tar.gz" "$RUN/runtime.tar.gz"
+  else
+    fetch "https://api.github.com/repos/$REPO/releases?per_page=100" "$RUN/releases.json"
+    python3 - "$RUN" "${VERSION:-}" "$PLATFORM" <<'PY'
+import json, pathlib, re, sys
+run, requested, platform = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+wanted = "core-v" + requested.lstrip("v") if requested else None
+for release in json.loads((run / "releases.json").read_text()):
+    tag = release.get("tag_name", "")
+    if release.get("draft") or release.get("prerelease") or not re.fullmatch(r"core-v\d+\.\d+\.\d+(?:[-.][\w.]+)?", tag):
+        continue
+    if wanted and tag != wanted:
+        continue
+    assets = {a["name"]: a["browser_download_url"] for a in release.get("assets", [])}
+    needed = ("manifest.json", "runtime.tar.gz", "core-" + platform, "core-" + platform + ".orig")
+    if not all(name in assets for name in needed):
+        if wanted:
+            raise SystemExit("Release " + tag + " has no verified core for " + platform)
+        continue
+    (run / "manifest.url").write_text(assets["manifest.json"])
+    (run / "runtime.url").write_text(assets["runtime.tar.gz"])
+    (run / "core.url").write_text(assets["core-" + platform])
+    (run / "orig.url").write_text(assets["core-" + platform + ".orig"])
+    (run / "release.tag").write_text(tag)
+    break
+else:
+    raise SystemExit("No published verified Linux core for " + platform + (" / " + wanted if wanted else ""))
+PY
+    log "Release $(<"$RUN/release.tag") / $PLATFORM"
+    fetch "$(<"$RUN/manifest.url")" "$RUN/manifest.json"
+    fetch "$(<"$RUN/runtime.url")" "$RUN/runtime.tar.gz"
   fi
-  fetch "$RAW/tools/official_rootcert.json" "$WORK/tools/official_rootcert.json" || true
+  WORK="$(mktemp -d "$PERSIST/runtime.XXXXXX")"
+  python3 - "$RUN" "$WORK" "$PLATFORM" <<'PY'
+import hashlib, json, pathlib, ssl, tarfile, sys
+run, work, platform = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), sys.argv[3]
+m = json.loads((run / "manifest.json").read_text())
+if m.get("schema_version") != 2 or m.get("name") != "xpack-toolkit" or m.get("mode") != "offline" or m.get("remote_base") != "":
+    raise SystemExit("Expected an offline schema-2 unified release manifest")
+if platform not in m.get("platforms", {}):
+    raise SystemExit("Release has no verified core for " + platform)
+if (run / "release.tag").exists() and (run / "release.tag").read_text() != "core-" + m.get("version", ""):
+    raise SystemExit("Release tag/version mismatch")
+p = m["platforms"][platform]
+if p.get("os") != "linux" or p.get("arch") != platform[6:] or p.get("patches") != 3:
+    raise SystemExit("Invalid platform declaration")
+if p.get("core_asset") != "core-" + platform or p.get("orig_asset") != "core-" + platform + ".orig":
+    raise SystemExit("Unexpected platform asset names")
+meta = m["runtime"]
+archive = run / "runtime.tar.gz"
+data = archive.read_bytes()
+if meta.get("asset") != archive.name or meta.get("size") != len(data) or meta.get("sha256") != hashlib.sha256(data).hexdigest():
+    raise SystemExit("Runtime archive checksum mismatch")
+allowed = {"tools/" + f for f in ("gen_license.py", "patch_core.py", "patch_agent.py", "cert_store.py", "aes128.py", "gosym.py", "official_rootcert.json")} | {"state/license.crt"}
+with tarfile.open(archive, "r:gz") as tf:
+    members = tf.getmembers()
+    if len(members) != len(allowed) or {a.name for a in members} != allowed or any(not a.isfile() for a in members):
+        raise SystemExit("Runtime archive must contain only the public file whitelist")
+    for item in members:
+        target = work / item.name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(tf.extractfile(item).read())
+        target.chmod(0o600)
+fp = hashlib.sha256(ssl.PEM_cert_to_DER_cert((work / "state/license.crt").read_text())).hexdigest()
+if m.get("root_fingerprint") != fp:
+    raise SystemExit("Bundled signing root differs from release manifest")
+print("Verified bundled runtime / " + m["version"] + " / " + platform)
+PY
   printf '%s\n' "$WORK" > "$PERSIST/runtime.path"
 fi
-tool() {
-  if [ -f "$WORK/tools/$1" ]; then printf '%s\n' "$WORK/tools/$1"
-  elif [ -f "$WORK/tools/$2" ]; then printf '%s\n' "$WORK/tools/$2"
-  else die "Missing tool: $1 / $2"; fi
-}
-PATCH_CORE="$(tool patch_1panel_core.py patch_core.py)"
-PATCH_AGENT="$(tool patch_1panel_agent.py patch_agent.py)"
-CERT_STORE="$(tool rootcert_store.py cert_store.py)"
-GEN_LICENSE="$(tool gen_license.py gen_license.py)"
-export STATE="${STATE:-}"
-if [ -z "$STATE" ]; then
-  if [ -f "$WORK/web/state/license.crt" ]; then STATE="$WORK/web/state"
-  else STATE="$WORK/state"; fi
+PATCH_CORE="$WORK/tools/patch_core.py"
+PATCH_AGENT="$WORK/tools/patch_agent.py"
+CERT_STORE="$WORK/tools/cert_store.py"
+GEN_LICENSE="$WORK/tools/gen_license.py"
+# Older cached runtimes used long local filenames; no network probes are needed.
+[ -f "$PATCH_CORE" ] || PATCH_CORE="$WORK/tools/patch_1panel_core.py"
+[ -f "$PATCH_AGENT" ] || PATCH_AGENT="$WORK/tools/patch_1panel_agent.py"
+[ -f "$CERT_STORE" ] || CERT_STORE="$WORK/tools/rootcert_store.py"
+if [ -z "${STATE:-}" ]; then
+  if [ -f "$WORK/state/license.crt" ]; then STATE="$WORK/state"
+  else STATE="$WORK/web/state"; fi
 fi
+export STATE
 export SIGN_CRT="${SIGN_CRT:-$STATE/license.crt}"
 export SIGN_KEY="${SIGN_KEY:-$STATE/license.key}"
 export REMOTE_BASE=""
@@ -135,7 +189,8 @@ backup_orig() {
 }
 restore_source() {
   local NAME="$1" FILE
-  for FILE in "$BACKUP/1panel-$NAME.orig" "$BACKUP/$NAME.orig"; do
+  for FILE in "$BACKUP/1panel-$NAME.orig" "$BACKUP/$NAME.orig" \
+              "$PANEL_ROOT/backup/1panel-$NAME.orig" "$PANEL_ROOT/backup/$NAME.orig"; do
     if [ -f "$FILE" ]; then
       official "$FILE" "$NAME" || return 1
       if [ -f "$FILE.sha256" ]; then sha256sum -c "$FILE.sha256" >&2 || return 1; fi
@@ -148,7 +203,10 @@ restore_source() {
 if [ "$MODE" = restore ]; then
   CORE_ORIG="$(restore_source core)"
   AGENT_ORIG=""
-  if [ -f "$BACKUP/1panel-agent.orig" ] || [ -f "$BACKUP/agent.orig" ]; then AGENT_ORIG="$(restore_source agent)"; fi
+  if [ -f "$BACKUP/1panel-agent.orig" ] || [ -f "$BACKUP/agent.orig" ] \
+     || [ -f "$PANEL_ROOT/backup/1panel-agent.orig" ] || [ -f "$PANEL_ROOT/backup/agent.orig" ]; then
+    AGENT_ORIG="$(restore_source agent)"
+  fi
   [ -f "$XPACK_DB" ] || die "Missing initialized database: $XPACK_DB"
   systemctl stop "$CORE_SVC"
   [ -z "$AGENT_ORIG" ] || systemctl stop "$AGENT_SVC"
@@ -173,7 +231,6 @@ if [ "$MODE" = verify ]; then
   systemctl is-active --quiet "$CORE_SVC"
   exit 0
 fi
-RUN="$(mktemp -d "$PERSIST/run.XXXXXX")"
 LICENSE_OUT="$RUN/license.txt"
 if [ -n "${LICENSE_FILE:-}" ]; then
   install -m 0600 "$LICENSE_FILE" "$LICENSE_OUT"
@@ -219,45 +276,24 @@ if [ "${NO_APPLY:-0}" != 1 ]; then
   done
 fi
 if [ -n "${ARTIFACT_DIR:-}" ]; then
-  install -m 0600 "$ARTIFACT_DIR/manifest.json" "$RUN/manifest.json"
-  for NAME in 1panel-core core; do
-    if [ -f "$ARTIFACT_DIR/$NAME" ]; then install -m 0755 "$ARTIFACT_DIR/$NAME" "$RUN/core"; break; fi
-  done
-  for NAME in 1panel-core.orig core.orig orig/1panel-core.orig orig/core.orig; do
-    if [ -f "$ARTIFACT_DIR/$NAME" ]; then install -m 0755 "$ARTIFACT_DIR/$NAME" "$RUN/core.orig"; break; fi
-  done
+  install -m 0755 "$ARTIFACT_DIR/core-$PLATFORM" "$RUN/core"
+  install -m 0755 "$ARTIFACT_DIR/core-$PLATFORM.orig" "$RUN/core.orig"
 else
-  if [ -n "${ARTIFACT_URL:-}" ]; then BASE="${ARTIFACT_URL%/}"
-  else
-    if [ -n "${VERSION:-}" ]; then TAG="core-v${VERSION#v}-${ARCH}"
-    else
-      fetch "https://api.github.com/repos/$REPO/releases?per_page=100" "$RUN/releases.json"
-      TAG="$(python3 - "$RUN/releases.json" "$ARCH" <<'PY'
-import json, re, sys
-for release in json.load(open(sys.argv[1])):
-    tag = release.get("tag_name", "")
-    if not release.get("draft") and not release.get("prerelease") and re.fullmatch(r"core-v?\d[^/]*-" + sys.argv[2], tag):
-        print(tag)
-        break
-PY
-)"
-    fi
-    [ -n "$TAG" ] || die "No Release for $ARCH"
-    BASE="https://github.com/$REPO/releases/download/$TAG"
-  fi
-  fetch "$BASE/manifest.json" "$RUN/manifest.json"
-  fetch "$BASE/1panel-core" "$RUN/core" || fetch "$BASE/core" "$RUN/core"
-  fetch "$BASE/1panel-core.orig" "$RUN/core.orig" || fetch "$BASE/core.orig" "$RUN/core.orig"
+  fetch "$(<"$RUN/core.url")" "$RUN/core"
+  fetch "$(<"$RUN/orig.url")" "$RUN/core.orig"
 fi
 python3 - "$RUN" "$SIGN_CRT" "$ARCH" <<'PY'
 import hashlib, json, pathlib, ssl, struct, sys
 dl, cert, arch = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), sys.argv[3]
 man = json.loads((dl / "manifest.json").read_text())
 fp = hashlib.sha256(ssl.PEM_cert_to_DER_cert(cert.read_text())).hexdigest()
-if man.get("name", "core") not in ("core", "1panel-core"):
-    raise SystemExit("Wrong artifact name")
-if man.get("arch") != arch or man.get("root_fingerprint") != fp:
+if man.get("root_fingerprint") != fp:
+    raise SystemExit("Manifest signing root mismatch")
+man = man["platforms"]["linux-" + arch]
+if man.get("arch") != arch or man.get("os") != "linux" or man.get("patches") != 3:
     raise SystemExit("Manifest arch/root_fingerprint mismatch")
+if man.get("core_asset") != "core-linux-" + arch or man.get("orig_asset") != "core-linux-" + arch + ".orig":
+    raise SystemExit("Manifest core asset names mismatch")
 for name, key, alias in (("core", "sha256", "output_sha256"), ("core.orig", "orig_sha256", "source_sha256")):
     data = (dl / name).read_bytes()
     want = man.get(key) or man.get(alias)
@@ -284,6 +320,10 @@ for host in ("hk", "cn"):
         raise SystemExit("P3/P4 not cleared; update local patch_core tool")
 PY
 AGENT_SOURCE=""
+if [ "$ARCH" != amd64 ] && [ "${SKIP_AGENT:-0}" != 1 ]; then
+  log "Agent byte patches are validated for amd64 only; preserving the installed $ARCH agent"
+  SKIP_AGENT=1
+fi
 if [ "${SKIP_AGENT:-0}" != 1 ] && [ -f "$AGENT_BIN" ]; then
   if official "$AGENT_BIN" agent; then AGENT_SOURCE="$AGENT_BIN"
   else AGENT_SOURCE="$(restore_source agent)"; fi

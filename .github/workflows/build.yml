@@ -1,248 +1,34 @@
 name: build
 
-# 在 GitHub Actions 里手动生成「补丁内核」并发布到 Release。
-# 默认 P1/P2/C7 三处离线补丁；保留真实验签与官方 HK/CN 地址。
-# inputs.base 只有显式非空才添加 P3/P4，构建不会用默认远端站点。
-# 只靠 workflow_dispatch 手动触发，同 tag --clobber 覆盖已发布 Release。
-# Release 默认总是发布；Cloudflare R2 为可选（配置了 secrets.R2_* 才上传）。
-#
-# 需要配置的 Secrets / Variables：
-#   secrets.ROOT_CERT_PEM         根证书 PEM（patch 用它算根证书指纹；不是私钥）
-#   secrets.R2_ACCOUNT_ID         Cloudflare 账号 ID（可选）
-#   secrets.R2_ACCESS_KEY_ID      R2 的 Access Key（可选）
-#   secrets.R2_SECRET_ACCESS_KEY  R2 的 Secret Key（可选）
-#   vars.R2_BUCKET                R2 桶名，例如 license-artifacts（可选）
-#   vars.PANEL_VERSION            默认构建版本，例如 v2.3.2
-
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: "版本（如 v2.3.2；留空用 vars.PANEL_VERSION）"
-        required: false
-        default: ""
-      arch:
-        description: "架构：all / amd64 / arm64"
-        type: choice
-        options: [all, amd64, arm64]
-        required: false
-        default: "all"
-      base:
-        description: "远端授权基地址（默认留空为离线；非空才启用 P3/P4）"
-        required: false
-        default: ""
+        description: "Panel version (v2.3.2)"
+        required: true
+        default: "v2.3.2"
 
 permissions:
-  contents: write    # 发布到 Release 需要写权限
+  contents: write
 
 concurrency:
-  group: build-${{ github.ref }}
+  group: xpack-release-${{ github.repository }}
   cancel-in-progress: false
 
 jobs:
-  build:
+  buildrelease:
     runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        arch: ${{ fromJSON(inputs.arch == 'amd64' && '["amd64"]' || inputs.arch == 'arm64' && '["arm64"]' || '["amd64","arm64"]') }}
-    env:
-      VERSION: ${{ inputs.version != '' && inputs.version || vars.PANEL_VERSION }}
-      ARCH: ${{ matrix.arch }}
-      BASE: ${{ inputs.base }}
-      SIGN_CRT: state/license.crt
-      R2_BUCKET: ${{ vars.R2_BUCKET }}
     steps:
-      - name: 取源码
+      - name: Checkout public source
         uses: actions/checkout@v4
 
-      - name: 准备 Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: 校验必填配置
-        run: |
-          set -euo pipefail
-          [ -n "${VERSION:-}" ] || { echo "::error::缺少版本号（inputs.version 或 vars.PANEL_VERSION）"; exit 1; }
-          VERSION="v${VERSION#v}"
-          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
-          echo "目标版本: $VERSION / 架构: $ARCH"
-
-      - name: 写入根证书
+      - name: Build all verified platforms and publish one release
         env:
-          CRT_PEM: ${{ secrets.ROOT_CERT_PEM }}
-        run: |
-          set -euo pipefail
-          if [ -n "${CRT_PEM:-}" ]; then
-            mkdir -p state
-            printf '%s\n' "$CRT_PEM" > "$SIGN_CRT"
-          fi
-          if [ ! -s "$SIGN_CRT" ]; then
-            echo "::error::既没有 secrets.ROOT_CERT_PEM，仓库里也没有 state/license.crt"
-            exit 1
-          fi
-          openssl x509 -in "$SIGN_CRT" -noout -subject -fingerprint -sha256
-
-      - name: 下载官方二进制并校验官方哈希
-        run: |
-          set -euo pipefail
-          _P="1pa""nel"
-          TARBALL="${_P}-${VERSION}-linux-${ARCH}.tar.gz"
-          SRC_BASE="https://resource.fit2cloud.com/${_P}/package/v2/stable/${VERSION}/release"
-          mkdir -p build/orig work
-          curl -fsSL -o "work/$TARBALL" "$SRC_BASE/$TARBALL"
-          curl -fsSL -o work/checksums.txt "$SRC_BASE/checksums.txt"
-          EXPECT=$(awk -v t="$TARBALL" '
-            { name=$2; sub(/^\*/, "", name); sub(/^\.\//, "", name) }
-            name==t { count++; hash=$1 }
-            END { if (count!=1 || length(hash)!=64 || hash~/[^[:xdigit:]]/) exit 1;
-                  print tolower(hash) }
-          ' work/checksums.txt) || { echo "::error::官方 checksums 缺少唯一有效 SHA-256：$TARBALL"; exit 1; }
-          ACTUAL=$(sha256sum "work/$TARBALL" | awk '{print $1}')
-          [ "$EXPECT" = "$ACTUAL" ] || { echo "::error::官方 checksums 校验失败"; exit 1; }
-          echo "官方哈希校验通过: $ACTUAL"
-          tar -xzf "work/$TARBALL" -C work
-          CORE=$(find work -type f -name "${_P}-core" -print -quit)
-          AGENT=$(find work -type f -name "${_P}-agent" -print -quit)
-          [ -n "$CORE" ] || { echo "::error::解包后找不到 core"; exit 1; }
-          cp -f "$CORE" build/orig/core.orig
-          [ -n "$AGENT" ] && cp -f "$AGENT" build/orig/agent.orig || true
-          echo "官方 core sha256: $(sha256sum build/orig/core.orig | awk '{print $1}')"
-
-      - name: 打补丁（默认 P1/P2/C7；远端地址仅显式启用）
-        run: |
-          set -euo pipefail
-          PATCH_ARGS=()
-          if [ -n "$BASE" ]; then PATCH_ARGS+=(--remote-base "$BASE"); fi
-          echo "授权服务器基地址: ${BASE:-<离线默认>}"
-          python3 tools/patch_core.py --list "${PATCH_ARGS[@]}"
-          python3 tools/patch_core.py \
-            --in build/orig/core.orig \
-            --out build/core \
-            --patch \
-            --orig build/orig/core.orig \
-            --manifest build/core.manifest.json \
-            "${PATCH_ARGS[@]}"
-          chmod 0755 build/core
-          python3 tools/patch_core.py --in build/core --verify "${PATCH_ARGS[@]}"
-          echo "补丁内核 sha256: $(sha256sum build/core | awk '{print $1}')"
-
-      - name: 生成清单
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import hashlib, json, os, pathlib, datetime, ssl
-          core = pathlib.Path("build/core")
-          orig = pathlib.Path("build/orig/core.orig")
-          data = core.read_bytes()
-          # 根证书指纹：站点用它判断「这份 CI 产物是不是我这一套 CA 打的」
-          cert = pathlib.Path(os.environ["SIGN_CRT"])
-          root_fp = hashlib.sha256(ssl.PEM_cert_to_DER_cert(cert.read_text())).hexdigest()
-          patch_manifest = json.loads(pathlib.Path("build/core.manifest.json").read_text())
-          patches = patch_manifest["patches"]
-          mode = "remote" if os.environ.get("BASE") else "offline"
-          if not isinstance(patches, list) or len(patches) != (5 if mode == "remote" else 3):
-              raise SystemExit("Unexpected patch manifest; expected P1/P2/C7 (+P3/P4 in remote mode)")
-          if patch_manifest.get("mode") != mode:
-              raise SystemExit("Patcher mode does not match the requested build mode")
-          manifest = {
-              "name": "core",
-              "version": os.environ["VERSION"],
-              "arch": os.environ["ARCH"],
-              "size": len(data),
-              "sha256": hashlib.sha256(data).hexdigest(),
-              "orig_sha256": hashlib.sha256(orig.read_bytes()).hexdigest(),
-              "patches": len(patches),
-              "mode": mode,
-              "remote_base": os.environ.get("BASE", ""),
-              "root_fingerprint": root_fp,
-              "built_at": datetime.datetime.now(datetime.timezone.utc)
-                                    .replace(microsecond=0).isoformat().replace("+00:00", "Z"),
-              "run": "%s/%s" % (os.environ.get("GITHUB_REPOSITORY", ""),
-                                os.environ.get("GITHUB_RUN_ID", "")),
-          }
-          pathlib.Path("build/manifest.json").write_text(
-              json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
-          print(json.dumps(manifest, ensure_ascii=False, indent=2))
-          PY
-
-      - name: 发布到 GitHub Release
-        env:
+          VERSION: ${{ inputs.version }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          TAG="core-${VERSION}-${ARCH}"
-          gh release view "$TAG" >/dev/null 2>&1 \
-            || gh release create "$TAG" --title "补丁内核 ${VERSION} ${ARCH}" \
-                 --notes "CI 构建的补丁内核。资产：core / manifest.json / core.orig" \
-                 --latest=false
-          # 资产名固定：core / manifest.json，另带一份官方原件 core.orig（--restore 回滚用）
-          gh release upload "$TAG" build/core build/manifest.json \
-                             build/orig/core.orig --clobber
-          echo "已发布 Release: $TAG（资产：core / manifest.json / core.orig）"
-
-      - name: 检查可选 R2 配置
-        id: r2
-        env:
-          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
-          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-        run: |
-          set -euo pipefail
-          if [ -z "${R2_ACCOUNT_ID:-}${R2_ACCESS_KEY_ID:-}${R2_SECRET_ACCESS_KEY:-}${R2_BUCKET:-}" ]; then
-            echo "enabled=false" >> "$GITHUB_OUTPUT"
-            echo "R2 未配置，仅发布 GitHub Release"
-            exit 0
-          fi
-          for NAME in R2_ACCOUNT_ID R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_BUCKET; do
-            [ -n "${!NAME:-}" ] || { echo "::error::R2 配置不完整：$NAME"; exit 1; }
-          done
-          echo "enabled=true" >> "$GITHUB_OUTPUT"
-
-      - name: 装 rclone
-        if: steps.r2.outputs.enabled == 'true'
-        run: curl -fsSL https://rclone.org/install.sh | sudo bash
-
-      - name: 上传到 Cloudflare R2
-        if: steps.r2.outputs.enabled == 'true'
-        env:
-          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
-          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-        run: |
-          set -euo pipefail
-          export RCLONE_CONFIG_R2_TYPE=s3
-          export RCLONE_CONFIG_R2_PROVIDER=Cloudflare
-          export RCLONE_CONFIG_R2_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
-          export RCLONE_CONFIG_R2_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
-          export RCLONE_CONFIG_R2_ENDPOINT="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
-          export RCLONE_CONFIG_R2_ACL=private
-          DEST="r2:${R2_BUCKET}"
-
-          # 版本化路径（可回滚）+ 当前指针（安装脚本默认取这个）+ 官方原件（restore 用）
-          rclone copyto build/orig/core.orig \
-            "${DEST}/core/${VERSION}/${ARCH}/core.orig" --s3-no-check-bucket
-          rclone copyto build/core \
-            "${DEST}/core/${VERSION}/${ARCH}/core" --s3-no-check-bucket
-          rclone copyto build/manifest.json \
-            "${DEST}/core/${VERSION}/${ARCH}/manifest.json" --s3-no-check-bucket
-          rclone copyto build/core \
-            "${DEST}/core/${ARCH}/core" --s3-no-check-bucket
-          rclone copyto build/manifest.json \
-            "${DEST}/core/${ARCH}/manifest.json" --s3-no-check-bucket
-          echo "已上传到 ${DEST}/core/${VERSION}/${ARCH}/"
-
-      - name: 汇总
-        run: |
-          {
-            echo "### 内核构建完成"
-            echo ""
-            echo "| 项 | 值 |"
-            echo "| --- | --- |"
-            echo "| 版本 | \`$VERSION\` |"
-            echo "| 架构 | \`$ARCH\` |"
-            echo "| 补丁内核 sha256 | \`$(sha256sum build/core | awk '{print $1}')\` |"
-            echo "| 官方内核 sha256 | \`$(sha256sum build/orig/core.orig | awk '{print $1}')\` |"
-            echo "| R2 路径 | \`core/$VERSION/$ARCH/\` |"
-          } >> "$GITHUB_STEP_SUMMARY"
+        run: python3 tools/release.py --version "$VERSION" --publish --repo "$GITHUB_REPOSITORY"
