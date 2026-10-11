@@ -14,11 +14,41 @@ AGENT_SVC="${AGENT_SVC:-1panel-agent}"
 XPACK_DB="${XPACK_DB:-$PANEL_ROOT/db/xpack.db}"
 BACKUP="${BACKUP:-$PANEL_ROOT/crack/backup}"
 PERSIST="${UNLOCK_WORK:-$PANEL_ROOT/unlock}"
-MODE="${1:-install}"
+MODE=install
 log() { printf '== %s\n' "$*"; }
 die() { printf '!! %s\n' "$*" >&2; exit 1; }
 trap 'printf "!! Failed; artifacts/backups retained: %s / %s\n" "$PERSIST" "$BACKUP" >&2' ERR
-case "$MODE" in install|deploy|restore|verify|cert) ;; *) die "usage: $0 {install|restore|verify|cert}" ;; esac
+usage() {
+  printf '%s\n' 'Usage: unlock.sh [install|restore|verify|cert] [options]' \
+    '  --use-mirror, --mirror auto  Measure built-in mirrors and use the fastest valid one' \
+    '  --mirror URL                Use only the specified HTTP(S) GitHub gateway' \
+    '  --no-mirror, --direct        Use GitHub directly, without mirror fallback' \
+    '  --http-proxy URL            Set a local HTTP(S) network proxy for curl' \
+    '  --help                      Show this help'
+}
+CLI_ROUTE=""
+MODE_SET=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    install|deploy|restore|verify|cert)
+      [ "$MODE_SET" = 0 ] || die "Specify only one operation"
+      MODE="$1"; MODE_SET=1 ;;
+    --use-mirror) CLI_ROUTE=auto ;;
+    --mirror)
+      [ "$#" -ge 2 ] && [ -n "$2" ] || die "--mirror requires auto or an HTTP(S) URL"
+      CLI_ROUTE="$2"; shift ;;
+    --mirror=*) CLI_ROUTE="${1#*=}"; [ -n "$CLI_ROUTE" ] || die "--mirror requires auto or an HTTP(S) URL" ;;
+    --no-mirror|--direct) CLI_ROUTE=direct ;;
+    --http-proxy)
+      [ "$#" -ge 2 ] && [ -n "$2" ] || die "--http-proxy requires a proxy URL"
+      export XPACK_HTTP_PROXY="$2"; shift ;;
+    --http-proxy=*) export XPACK_HTTP_PROXY="${1#*=}"; [ -n "$XPACK_HTTP_PROXY" ] || die "--http-proxy requires a proxy URL" ;;
+    --help|-h) usage; exit 0 ;;
+    *) usage >&2; die "Unknown installation argument" ;;
+  esac
+  shift
+done
+MIRROR_CHOICE="${CLI_ROUTE:-${GH_PROXY:-}}"
 [ "$(id -u)" -eq 0 ] || die "Run as root"
 [ "$(uname -s)" = Linux ] || die "This release provides Linux cores"
 case "$(uname -m)" in
@@ -29,13 +59,15 @@ esac
 PLATFORM="linux-$ARCH"
 PANEL_CTL="${PANEL_CTL:-/usr/local/bin/1pctl}"
 # Public gateways receive public GitHub URLs only; never local signing material.
-MIRROR_CONFIG="$(python3 - "${GH_PROXY:-}" "${GH_MIRRORS-https://ghfast.top/ https://gh-proxy.com/ https://ghproxy.net/}" <<'PY'
+MIRROR_CONFIG="$(python3 - "$MIRROR_CHOICE" "${GH_MIRRORS-https://ghfast.top/ https://gh-proxy.com/ https://ghproxy.net/}" <<'PY'
 import re, sys, urllib.parse
 preferred, configured = sys.argv[1:]
 if preferred == "direct":
     raise SystemExit(0)
+if preferred == "auto":
+    preferred = ""
 seen = set()
-for value in ([preferred] if preferred else []) + re.split(r"[\s,]+", configured.strip()):
+for value in ([preferred] if preferred else re.split(r"[\s,]+", configured.strip())):
     if not value:
         continue
     parsed = urllib.parse.urlsplit(value)
@@ -54,9 +86,71 @@ for value in ([preferred] if preferred else []) + re.split(r"[\s,]+", configured
 PY
 )" || die "Invalid GitHub mirror configuration"
 MIRRORS=()
-if [ -n "$MIRROR_CONFIG" ]; then
-  while IFS= read -r PREFIX; do MIRRORS+=("$PREFIX"); done <<< "$MIRROR_CONFIG"
-fi
+MIRROR_READY=0
+rank_mirrors() {
+  python3 - "$REPO" "$MIRROR_CONFIG" <<'PY'
+import concurrent.futures, json, math, os, pathlib, subprocess, sys, tempfile
+repo, configured = sys.argv[1:]
+prefixes = configured.splitlines()
+probe_url = "https://api.github.com/repos/" + repo + "/releases?per_page=100"
+def probe(item):
+    index, prefix = item
+    with tempfile.TemporaryDirectory(prefix="xpack-mirror-probe-") as directory:
+        target = pathlib.Path(directory) / "releases.json"
+        command = ["curl", "--proto", "=http,https", "--proto-redir", "=http,https",
+                   "--tlsv1.2", "-fsSL", "--connect-timeout", "3", "--max-time", "12",
+                   "--max-filesize", "2097152", "--write-out", "\n%{http_code}\t%{time_starttransfer}\n"]
+        if os.environ.get("XPACK_HTTP_PROXY"):
+            command += ["--proxy", os.environ["XPACK_HTTP_PROXY"]]
+        command += ["-o", str(target), prefix + probe_url]
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=15)
+            status, measured = result.stdout.strip().split("\t")
+            elapsed = float(measured)
+            if result.returncode or status != "200" or not math.isfinite(elapsed) or not 0 < elapsed <= 12:
+                return None
+            data = json.loads(target.read_text())
+            if (not isinstance(data, list) or not data or any(not isinstance(r, dict) or
+                    not isinstance(r.get("tag_name"), str) or not isinstance(r.get("assets", []), list) for r in data)):
+                return None
+            return elapsed, index, prefix
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return None
+with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+    ranked = sorted(item for item in pool.map(probe, enumerate(prefixes)) if item is not None)
+if not ranked:
+    raise SystemExit("No valid GitHub mirror responded; select --no-mirror or specify --mirror URL")
+for elapsed, index, prefix in ranked:
+    print(prefix)
+    print("== Mirror " + prefix + " response latency: " + format(elapsed * 1000, ".1f") + " ms", file=sys.stderr)
+PY
+}
+configure_mirrors() {
+  [ "$MIRROR_READY" = 0 ] || return 0
+  local ANSWER="" RANKED="" PREFIX
+  if [ -z "$MIRROR_CHOICE" ]; then
+    MIRROR_CHOICE=direct
+    # The controlling terminal is separate from stdin, including curl | bash.
+    if { exec 3<>/dev/tty; } 2>/dev/null; then
+      printf '是否使用内置 GitHub 镜像？[y/N]（启用后自动选择延迟最低的有效镜像）：' >&3
+      if IFS= read -r ANSWER <&3; then
+        case "$ANSWER" in y|Y|yes|YES|1) MIRROR_CHOICE=auto ;; esac
+      fi
+      exec 3>&-
+    fi
+  fi
+  case "$MIRROR_CHOICE" in
+    direct) MIRRORS=(); log "GitHub download mode: direct (mirrors disabled)" ;;
+    auto)
+      [ -n "$MIRROR_CONFIG" ] || die "No mirror candidates configured"
+      log "Measuring GitHub mirror response latency"
+      RANKED="$(rank_mirrors)" || die "All mirror probes failed; no installation changes were made"
+      while IFS= read -r PREFIX; do MIRRORS+=("$PREFIX"); done <<< "$RANKED"
+      log "Selected lowest-latency GitHub mirror: ${MIRRORS[0]}" ;;
+    *) MIRRORS=("$MIRROR_CONFIG"); log "Using user-specified GitHub mirror: ${MIRRORS[0]}" ;;
+  esac
+  MIRROR_READY=1
+}
 validate_download() {
   python3 - "$1" "$2" "$PLATFORM" <<'PY'
 import hashlib, json, os, pathlib, re, ssl, sys
@@ -129,13 +223,12 @@ PY
 }
 fetch() {
   local URL="$1" DEST="$2" PREFIX CANDIDATE PART ERROR HOST
-  local -a ROUTES=("$URL") CURL_PROXY=()
+  local -a ROUTES=("$URL") CURL_PROXY=() ORDER=()
   case "$URL" in
     https://github.com/*|https://raw.githubusercontent.com/*|https://api.github.com/*)
-      if [ -n "${GH_PROXY:-}" ] && [ "$GH_PROXY" != direct ] && [ "${#MIRRORS[@]}" -gt 0 ]; then
-        ROUTES=("${MIRRORS[0]}$URL" "$URL")
-        for PREFIX in "${MIRRORS[@]:1}"; do ROUTES+=("$PREFIX$URL"); done
-      else
+      configure_mirrors
+      if [ "${#MIRRORS[@]}" -gt 0 ]; then
+        ROUTES=()
         for PREFIX in "${MIRRORS[@]}"; do ROUTES+=("$PREFIX$URL"); done
       fi ;;
   esac
@@ -149,6 +242,12 @@ fetch() {
       && validate_download "$PART" "$DEST" 2>> "$ERROR"; then
       mv -f -- "$PART" "$DEST"
       rm -f -- "$ERROR"
+      if [ "$CANDIDATE" != "$URL" ]; then
+        PREFIX="${CANDIDATE%"$URL"}"
+        ORDER=("$PREFIX")
+        for HOST in "${MIRRORS[@]}"; do [ "$HOST" = "$PREFIX" ] || ORDER+=("$HOST"); done
+        MIRRORS=("${ORDER[@]}")
+      fi
       return 0
     fi
     HOST="${CANDIDATE#*://}"; HOST="${HOST%%/*}"

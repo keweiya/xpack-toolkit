@@ -5,7 +5,7 @@
 ## 一键安装 / 更新
 
 ```bash
-curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/keweiya/xpack-toolkit/main/unlock.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/keweiya/xpack-toolkit/main/unlock.sh | sudo bash
 ```
 
 脚本自动完成：
@@ -18,11 +18,19 @@ curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/keweiya/xpack-to
 
 版本校验通过前仅临时下载和只读检测。兼容其它来源旧内核：保存旧二进制和许可证验证根，再替换仓库组件。网站 HTTPS、系统证书及第三方许可证签名原文均保留；导入项目许可证时仅解除旧许可证的主节点绑定，不删除旧许可证。不卸载整个 1Panel。
 
+## GitHub 镜像选择
+
+镜像地址内置在脚本中：`https://ghfast.top/`、`https://gh-proxy.com/`、`https://ghproxy.net/`。安装时询问是否使用镜像，回车默认直连，没有交互终端也默认直连，未选择时不会自动启用。选择使用后，并发测量有效 GitHub API 响应的首字节延迟，用最低者下载内核和全部相关 GitHub 文件，失效时只切换到其它测速合格的镜像。
+
+跳过询问可在上面命令末尾加参数：`--use-mirror` 或 `--mirror auto` 启用内置镜像并自动选最低延迟；`--mirror https://ghfast.top/`（也支持 `--mirror=URL`）只用指定镜像；`--no-mirror` 只用直连；`--http-proxy http://127.0.0.1:7890` 设置本机网络代理。例如：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/keweiya/xpack-toolkit/main/unlock.sh | sudo bash -s -- --use-mirror
+```
+
+兼容环境变量 `GH_PROXY=auto/镜像地址/direct`（命令行优先）与 `GH_MIRRORS`（仅改测速候选，不会自行启用）；curl 沿用 `http_proxy` / `https_proxy`，经 sudo 运行需显式传入。入口脚本本身无法直连时，可自行给原始 URL 加镜像前缀，例如 `curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/keweiya/xpack-toolkit/main/unlock.sh | sudo bash`；入口选择与脚本内下载模式相互独立。所有下载仍做格式、版本与 SHA-256 校验。
+
 ## 当前支持
-
-下载默认直连，失败自动依次切换 `https://ghfast.top/`、`https://gh-proxy.com/`、`https://ghproxy.net/`。镜像返回 HTML、无效 JSON 或校验不符会继续切换；全部失败才退出。入口命令已使用 ghfast；入口镜像失效时可替换其前缀为其它镜像，或去掉前缀直连。
-
-可在上述命令的 `sudo bash` 处设置：`sudo env GH_PROXY=https://gh-proxy.com/ bash` 优先指定镜像；`GH_MIRRORS` 自定义逗号/空格分隔的镜像列表；`GH_PROXY=direct` 仅直连；`XPACK_HTTP_PROXY=http://127.0.0.1:7890` 使用本机 HTTP 代理。curl 也沿用环境里的 `http_proxy` / `https_proxy`；经 sudo 运行时需显式传入。
 
 - 仓库当前最高稳定版本 `v2.3.2`；机器版本高于它时提前退出。
 - 内核：`amd64 / x86_64`、`arm64 / aarch64`。

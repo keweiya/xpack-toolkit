@@ -268,10 +268,27 @@ elif name == "install":
     raise SystemExit(subprocess.call([os.environ["REAL_INSTALL"]]+args))
 elif name == "curl":
     url = args[-1]; dst = args[args.index("-o")+1]; confined(dst)
+    probe = "--write-out" in args or "-w" in args
+    if probe:
+        assert pathlib.Path(dst).resolve().is_relative_to(pathlib.Path(os.environ["TMPDIR"]).resolve()), "probe escaped TMPDIR"
+        assert args[args.index("--connect-timeout")+1] == "3"
+        assert args[args.index("--max-time")+1] == "12"
+        option = "--write-out" if "--write-out" in args else "-w"
+        assert args[args.index(option)+1] == "\n%{http_code}\t%{time_starttransfer}\n"
+    probe_map = os.environ.get("TEST_PROBE_MAP")
+    probe_map = json.loads(pathlib.Path(probe_map).read_text()) if probe_map else {}
+    metric = probe_map.get(url)
+    if metric is None:
+        metric = next((value for prefix, value in probe_map.items() if url.startswith(prefix)), {})
+    if not isinstance(metric, dict): metric = {"time": metric}
+    def finish(code=0):
+        if probe:
+            print("\n%s\t%s" % (metric.get("status", "200"), metric.get("time", "0.100")))
+        raise SystemExit(int(metric.get("exit", code)) if probe else code)
     trace = os.environ.get("CURL_TRACE")
     if trace:
         with open(trace, "a") as f:
-            f.write(json.dumps({"args": args, "proxy_env": {key: os.environ[key] for key in
+            f.write(json.dumps({"args": args, "probe": probe, "proxy_env": {key: os.environ[key] for key in
                 ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "all_proxy", "ALL_PROXY")
                 if key in os.environ}})+"\n")
     api = os.environ.get("API_URL_CHECK", "")
@@ -287,22 +304,23 @@ elif name == "curl":
             assert actual == expected, "machine data changed before first API: " + filename
         assert not list(pathlib.Path(os.environ["MOCK_STATE"]).glob("*.stopped"))
         with open(os.environ["EVENT_LOG"], "a") as f: f.write("first-api-readonly\n")
-    if os.environ.get("FAIL_CURL"): raise SystemExit(22)
+    if os.environ.get("FAIL_CURL"): finish(22)
     failures = os.environ.get("MOCKFAIL_URLS")
     failures = json.loads(pathlib.Path(failures).read_text()) if failures else {}
     if url in failures:
         pathlib.Path(dst).write_bytes(b"incomplete HTTP response")
-        raise SystemExit(int(failures[url]))
+        finish(int(failures[url]))
     bad_map = os.environ.get("CURL_BAD_MAP")
     bad_map = json.loads(pathlib.Path(bad_map).read_text()) if bad_map else {}
     if url in bad_map:
         shutil.copyfile(bad_map[url], dst)
-        raise SystemExit(0)
+        finish()
     urls = json.loads(pathlib.Path(os.environ["CURL_MAP"]).read_text())
     if url not in urls or not pathlib.Path(urls[url]).is_file():
         with open(os.environ["EVENT_LOG"], "a") as f: f.write("CURL_MISTAKE "+url+"\n")
-        raise SystemExit(22)
+        finish(22)
     shutil.copyfile(urls[url], dst)
+    finish()
 else: raise AssertionError("Unexpected mock command")
 '''
 
@@ -379,7 +397,7 @@ class Fixture:
                     "SIGN_KEY": str(self.state / "license.key"), "REPO": "fixture/xpack", "VERSION": "v2.3.2",
                     "EVENT_LOG": str(self.events), "MOCK_STATE": str(self.base), "FIXTURE_ROOT": str(self.base),
                     "CURL_MAP": str(self.downloads / "urls.json"), "REAL_INSTALL": shutil.which("install"),
-                    "GH_MIRRORS": "", "CURL_TRACE": str(self.downloads / "curl-trace.jsonl")}
+                    "GH_PROXY": "", "GH_MIRRORS": "", "CURL_TRACE": str(self.downloads / "curl-trace.jsonl")}
 
         self.env["PANEL_CTL"] = str(self.ctl)
 
@@ -484,6 +502,14 @@ class Fixture:
         path = Path(self.env["CURL_TRACE"])
         return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
 
+    def probe_responses(self, responses):
+        path = self.downloads / "probe-map.json"
+        path.write_text(json.dumps(responses))
+        self.env["TEST_PROBE_MAP"] = str(path)
+
+    def download_urls(self):
+        return [call["args"][-1] for call in self.curl_trace() if not call["probe"]]
+
     def set_target_version(self, version):
         self.man["version"] = version
         self.write_manifest()
@@ -525,7 +551,17 @@ class Fixture:
         args = ["bash", "-s", "--"] if piped else ["bash", str(self.script)]
         if mode is not None: args.append(mode)
         return subprocess.run(args, input=self.script.read_text() if piped else None,
-                              cwd=self.base, env={**self.env, **env}, capture_output=True, text=True, timeout=120)
+                              cwd=self.base, env={**self.env, **env}, capture_output=True, text=True,
+                              start_new_session=True, timeout=120)
+
+    def run_cli(self, *options, mode="install", **env):
+        # The operation token comes first; option values must never absorb it.
+        args = ["bash", "-s", "--"]
+        if mode is not None: args.append(mode)
+        args += list(options)
+        return subprocess.run(args, input=self.script.read_text(), cwd=self.base,
+                              env={**self.env, **env}, capture_output=True, text=True,
+                              start_new_session=True, timeout=120)
 
     def log(self):
         return self.events.read_text() if self.events.exists() else ""
