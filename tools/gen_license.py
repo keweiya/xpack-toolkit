@@ -70,6 +70,7 @@ import os
 import secrets
 import sqlite3
 import ssl
+import stat
 import subprocess
 import sys
 import tempfile
@@ -449,7 +450,7 @@ def _binding_fields(stored):
         return plain
 
 
-def _database_scope(con, fingerprints, bind_node_id=None):
+def _database_scope(con, fingerprints, bind_node_id=None, preserve_foreign=False):
     if bind_node_id is None:
         nodes = con.execute("select id from nodes where name='local'").fetchall()
     else:
@@ -463,19 +464,19 @@ def _database_scope(con, fingerprints, bind_node_id=None):
         plain = _binding_fields(stored)
         owned = _owned_license(stored, fingerprints)
         bound = str(plain.get("bind_node_id") or "")
-        if bound == master_id and not owned:
+        if bound == master_id and not owned and not preserve_foreign:
             raise ValueError("master already bound to a different issuer's license")
         scoped.append((stored, plain, owned, bound))
     return master_id, scoped
 
 
 def preflight_database(db=XPACK_DB, serial_path=None, bind_node_id=None,
-                       replace_root_fingerprints=()):
+                       replace_root_fingerprints=(), preserve_foreign=False):
     """Check master ownership without exporting, signing or changing any file."""
     fingerprints = _known_roots(replace_root_fingerprints)
     with sqlite3.connect(database_uri(db), uri=True) as con:
         con.row_factory = sqlite3.Row
-        master_id, scoped = _database_scope(con, fingerprints, bind_node_id)
+        master_id, scoped = _database_scope(con, fingerprints, bind_node_id, preserve_foreign)
     serial_path = serial_path or os.path.join(os.path.dirname(db), ".serial")
     serial = None
     if os.path.isfile(serial_path):
@@ -486,9 +487,99 @@ def preflight_database(db=XPACK_DB, serial_path=None, bind_node_id=None,
             "foreignLicenseCount": sum(not owned for _, _, owned, _ in scoped)}
 
 
-def apply_row(row, db=XPACK_DB, restart=True, bind_node_id=None,
-              serial_path=None, replace_root_fingerprints=()):
+def _publish_snapshot(directory, name, payload):
+    """Publish a complete, private archive without following or replacing a target."""
+    directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    temporary = ".foreign-licenses-%s.tmp" % secrets.token_hex(16)
+    try:
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                     0o600, dir_fd=directory_fd)
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                os.fchmod(fh.fileno(), 0o600)
+                fh.write(payload)
+                fh.flush()
+                os.fsync(fh.fileno())
+            try:
+                os.link(temporary, name, src_dir_fd=directory_fd,
+                        dst_dir_fd=directory_fd, follow_symlinks=False)
+            except FileExistsError:
+                existing_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                                      dir_fd=directory_fd)
+                with os.fdopen(existing_fd, "rb") as fh:
+                    info = os.fstat(fh.fileno())
+                    if (not stat.S_ISREG(info.st_mode) or
+                            stat.S_IMODE(info.st_mode) != 0o600 or fh.read() != payload):
+                        raise ValueError("foreign license archive target differs from snapshot")
+                    os.fsync(fh.fileno())
+            os.fsync(directory_fd)
+        finally:
+            os.unlink(temporary, dir_fd=directory_fd)
+            os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+    return os.path.join(directory, name)
+
+
+def _archive_foreign_licenses(con, db, master_id, scoped, foreign_backup_dir=None):
+    """Capture all foreign raw rows under the same writer lock as the migration."""
+    if not any(not owned and bound == master_id for _, _, owned, bound in scoped):
+        return None
+    archive = {
+        "schema": 1, "name": "xpack-toolkit-foreign-licenses",
+        "database": os.path.abspath(db), "master": master_id,
+        "columns": [r[1] for r in con.execute("pragma table_info(licenses)")],
+        "rows": [stored for stored, _, owned, _ in scoped if not owned],
+    }
+    archive["rows"].sort(key=lambda row: row["id"])
+    payload = (json.dumps(archive, sort_keys=True, ensure_ascii=True, separators=(",", ":"),
+                          default=lambda value: {"$base64": base64.b64encode(value).decode()})
+               + "\n").encode("ascii")
+    name = "foreign-licenses.%s.json" % hashlib.sha256(payload).hexdigest()
+    directory = os.path.abspath(foreign_backup_dir or os.path.dirname(db) or ".")
+    return _publish_snapshot(directory, name, payload)
+
+
+def _backup_database(db, backup):
+    """Keep an existing baseline untouched and publish a consistent new one once."""
+    if os.path.lexists(backup):
+        return
+    directory = os.path.dirname(os.path.abspath(db))
+    fd, temporary = tempfile.mkstemp(prefix=".pre-license-", suffix=".db", dir=directory)
+    os.close(fd)
+    try:
+        with sqlite3.connect(database_uri(db), uri=True) as source:
+            with sqlite3.connect(temporary) as dest:
+                source.backup(dest)
+        with open(temporary, "rb") as fh:
+            os.fsync(fh.fileno())
+        try:
+            os.link(temporary, backup, follow_symlinks=False)
+        except FileExistsError:
+            pass
+        directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        os.unlink(temporary)
+
+
+def _unbound_foreign_value(stored):
+    try:
+        name = decrypt_blob(stored["license_name"])
+    except (ValueError, UnicodeError, TypeError):
+        return ""
+    # The repository expects encrypted metadata whenever the stored name decrypts.
+    return encrypt_blob(b"", repository_key(name))
+
+
+def _validated_project_row(row):
     content = verify_license(row["license"])
+    if any(not isinstance(content.get(field), str) or not content[field]
+           for field in ("licenseName", "deviceID", "license")):
+        raise ValueError("signed certificate requires license name, device ID and license")
     row = row_from_content(content, text=row["license"])
     if not row["device_id"] or int(row["free_count"]) < 1:
         raise ValueError("missing device ID or invalid node allowance")
@@ -496,26 +587,58 @@ def apply_row(row, db=XPACK_DB, restart=True, bind_node_id=None,
         raise ValueError("local import requires a signed offline certificate")
     if int(row["product_pro"]) <= int(dt.datetime.now(dt.timezone.utc).timestamp()):
         raise ValueError("certificate has expired")
+    return row
+
+
+def _check_serial(serial_path, device_id):
+    if os.path.exists(serial_path):
+        with open(serial_path) as fh:
+            if fh.read().strip() != device_id:
+                raise ValueError("certificate device ID differs from panel serial")
+
+
+def archive_foreign_database(row, db=XPACK_DB, bind_node_id=None, serial_path=None,
+                            replace_root_fingerprints=(), preserve_foreign=False,
+                            foreign_backup_dir=None):
+    """Archive before component replacement, without changing any database row."""
+    if not preserve_foreign:
+        raise ValueError("foreign archival requires --preserve-foreign")
+    row = _validated_project_row(row)
+    serial_path = serial_path or os.path.join(os.path.dirname(db), ".serial")
+    fingerprints = _known_roots(replace_root_fingerprints)
+    with sqlite3.connect(database_uri(db), uri=True) as con:
+        con.row_factory = sqlite3.Row
+        con.execute("begin")
+        master_id, scoped = _database_scope(con, fingerprints, bind_node_id, True)
+        _check_serial(serial_path, row["device_id"])
+        archive = _archive_foreign_licenses(con, db, master_id, scoped, foreign_backup_dir)
+    return {"ready": True, "bindNodeID": master_id, "archive": archive,
+            "foreignLicenseCount": sum(not owned for _, _, owned, _ in scoped)}
+
+
+def apply_row(row, db=XPACK_DB, restart=True, bind_node_id=None,
+              serial_path=None, replace_root_fingerprints=(), preserve_foreign=False,
+              foreign_backup_dir=None):
+    row = _validated_project_row(row)
     if not os.path.isfile(db):
         raise ValueError("missing initialized database: %s" % db)
     serial_path = serial_path or os.path.join(os.path.dirname(db), ".serial")
     fingerprints = _known_roots(replace_root_fingerprints)
-    preflight_database(db, serial_path, bind_node_id, replace_root_fingerprints)
-    con = sqlite3.connect(db, timeout=30)
+    preflight_database(db, serial_path, bind_node_id, replace_root_fingerprints, preserve_foreign)
+    con = sqlite3.connect(database_uri(db, "rw"), uri=True, timeout=30)
     con.row_factory = sqlite3.Row
     backup = db + ".pre-license"
     try:
         con.execute("begin immediate")
-        master_id, scoped = _database_scope(con, fingerprints, bind_node_id)
-        if os.path.exists(serial_path):
-            with open(serial_path) as fh:
-                if fh.read().strip() != row["device_id"]:
-                    raise ValueError("certificate device ID differs from panel serial")
-        if not os.path.exists(backup):
-            with sqlite3.connect(database_uri(db), uri=True) as source:
-                with sqlite3.connect(backup) as dest:
-                    source.backup(dest)
-            os.chmod(backup, 0o600)
+        master_id, scoped = _database_scope(con, fingerprints, bind_node_id, preserve_foreign)
+        _check_serial(serial_path, row["device_id"])
+        if preserve_foreign:
+            _archive_foreign_licenses(con, db, master_id, scoped, foreign_backup_dir)
+        _backup_database(db, backup)
+        for foreign, _, owned, bound in scoped:
+            if not owned and bound == master_id:
+                con.execute("update licenses set bind_node_id=? where id=?",
+                            (_unbound_foreign_value(foreign), foreign["id"]))
         row = dict(row, bind_node_id=master_id)
         replace_ids, keep_id = [], None
         for stored, plain, owned, bound in scoped:
@@ -563,7 +686,7 @@ def existing_license(db=XPACK_DB):
     if not os.path.isfile(db):
         raise ValueError("missing initialized database: %s" % db)
     matches = set()
-    with sqlite3.connect("file:" + db + "?mode=ro", uri=True) as con:
+    with sqlite3.connect(database_uri(db), uri=True) as con:
         for (stored,) in con.execute("select license from licenses"):
             if not stored:
                 continue
@@ -582,7 +705,7 @@ def existing_license(db=XPACK_DB):
                 except (ValueError, UnicodeError, KeyError, TypeError, subprocess.CalledProcessError):
                     continue
     if len(matches) != 1:
-        raise ValueError("expected one valid existing offline certificate; provide LICENSE_FILE or a local signing key")
+        raise ValueError("expected one valid project offline certificate; awaiting LICENSE_FILE import or a local signing key")
     return matches.pop()
 
 
@@ -664,6 +787,12 @@ def main():
     ap.add_argument("--export-existing", metavar="FILE", help="export one existing verified certificate without a signing key")
     ap.add_argument("--replace-root-fingerprint", action="append", default=[],
                     help="previous script CA fingerprint to replace during rotation")
+    ap.add_argument("--preserve-foreign", action="store_true",
+                    help="archive foreign licenses and release only their master binding")
+    ap.add_argument("--foreign-backup-dir", default=None,
+                    help="foreign raw-license archive directory (apply only; default: database parent)")
+    ap.add_argument("--archive-foreign", action="store_true",
+                    help="archive foreign rows before install; requires --preserve-foreign --import-file")
     ap.add_argument("--serial", action="store_true",
                     help="with --apply, create serial if missing (never replace existing)")
     ap.add_argument("--show", metavar="FILE", help="解析并打印已有授权文件")
@@ -672,12 +801,25 @@ def main():
     a = ap.parse_args()
     if a.serial and not a.apply:
         ap.error("--serial requires --apply")
+    if a.archive_foreign:
+        if not a.preserve_foreign or not a.import_file:
+            ap.error("--archive-foreign requires --preserve-foreign --import-file")
+        with open(a.import_file) as fh:
+            row = {"license": fh.read().strip()}
+        print(json.dumps(archive_foreign_database(row, a.db, a.bind_node_id,
+                                                 a.serial_path, a.replace_root_fingerprint,
+                                                 True, a.foreign_backup_dir)))
+        return 0
     if a.preflight_db:
         print(json.dumps(preflight_database(a.db, a.serial_path, a.bind_node_id,
-                                           a.replace_root_fingerprint)))
+                                           a.replace_root_fingerprint, a.preserve_foreign)))
         return 0
     if a.export_existing:
-        text = existing_license(a.db)
+        try:
+            text = existing_license(a.db)
+        except (ValueError, OSError, sqlite3.Error, subprocess.SubprocessError) as exc:
+            print("Project certificate export failed: %s" % exc, file=sys.stderr)
+            return 1
         fd = os.open(a.export_existing, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w") as fh:
             fh.write(text + "\n")
@@ -709,7 +851,8 @@ def main():
             print("== SQL ==\n%s" % sql_for(encrypt_row(row)))
         if a.apply:
             backup = apply_row(row, a.db, not a.no_restart, a.bind_node_id,
-                               a.serial_path, a.replace_root_fingerprint)
+                               a.serial_path, a.replace_root_fingerprint,
+                               a.preserve_foreign, a.foreign_backup_dir)
             print("已写入 %s（备份 %s）；主节点已绑定" % (a.db, backup))
         return 0
 
@@ -740,7 +883,8 @@ def main():
         print("== SQL ==\n%s" % sql_for(encrypt_row(row)))
     if a.apply:
         backup = apply_row(row, a.db, not a.no_restart, a.bind_node_id,
-                           a.serial_path, a.replace_root_fingerprint)
+                           a.serial_path, a.replace_root_fingerprint,
+                           a.preserve_foreign, a.foreign_backup_dir)
         print("已写入 %s（备份 %s）；主节点已绑定" % (a.db, backup))
     return 0
 

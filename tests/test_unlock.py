@@ -74,39 +74,45 @@ if __name__ == "__main__":
 '''
 
 GEN_LICENSE = r'''
-import argparse, json, os, pathlib, sqlite3
-with open(os.environ["EVENT_LOG"], "a") as f: f.write("code gen_license\n")
+import argparse, hashlib, json, os, pathlib, sqlite3, sys
+with open(os.environ["EVENT_LOG"], "a") as f: f.write("code gen_license "+" ".join(sys.argv[1:])+"\n")
 def verify_license(text):
     d = json.loads(text)
     if d.get("signed") is not True: raise ValueError("Unsigned fixture license")
+    if d.get("foreign"): raise ValueError("Wrong project signing key")
     return d
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    for x in ("edition", "expires", "nodes", "assignee", "out", "import-file", "db", "serial-path", "export-existing"):
+    for x in ("edition", "expires", "nodes", "assignee", "out", "import-file", "db", "serial-path", "export-existing", "foreign-backup-dir"):
         p.add_argument("--"+x)
     p.add_argument("--replace-root-fingerprint", action="append", default=[])
-    for x in ("offline", "apply", "no-restart", "verify-db", "preflight-db"): p.add_argument("--"+x, action="store_true")
+    for x in ("offline", "apply", "no-restart", "verify-db", "preflight-db", "preserve-foreign", "archive-foreign"): p.add_argument("--"+x, action="store_true")
     a = p.parse_args()
     if a.preflight_db:
         with sqlite3.connect("file:" + pathlib.Path(a.db).resolve().as_posix() + "?mode=ro", uri=True) as c:
             local = c.execute("select id from nodes where local=1").fetchone()
             rows = c.execute("select bind_node_id from licenses").fetchall()
-        if not local or any(str(row[0]) != str(local[0]) for row in rows):
+        if not local or (not a.preserve_foreign and any(str(row[0]) != str(local[0]) for row in rows)):
             raise SystemExit("Foreign-bound fixture license")
         with open(os.environ["EVENT_LOG"], "a") as f: f.write("preflight-db\n")
         raise SystemExit(0)
     if a.export_existing:
-        with sqlite3.connect(a.db) as c: row = c.execute("select license from licenses").fetchone()
-        if not row: raise SystemExit(10)
-        verify_license(row[0])
-        pathlib.Path(a.export_existing).write_text(row[0])
+        with sqlite3.connect(a.db) as c: rows = c.execute("select license from licenses").fetchall()
+        matches = []
+        for (text,) in rows:
+            try: verify_license(text)
+            except (ValueError, TypeError): continue
+            matches.append(text)
+        if len(matches) != 1: raise SystemExit(10)
+        pathlib.Path(a.export_existing).write_text(matches[0])
         with open(os.environ["EVENT_LOG"], "a") as f: f.write("export-existing\n")
         raise SystemExit(0)
     if a.verify_db:
         if os.environ.get("FAIL_VERIFY_DB"): raise SystemExit(9)
-        with sqlite3.connect(a.db) as c: row = c.execute("select bind_node_id,license from licenses").fetchone()
-        assert row and row[0] == 17
-        verify_license(row[1]); raise SystemExit(0)
+        with sqlite3.connect(a.db) as c: rows = c.execute("select bind_node_id,license from licenses").fetchall()
+        matches = [row for row in rows if row[0] == 17 and not json.loads(row[1]).get("foreign")]
+        assert len(matches) == 1
+        verify_license(matches[0][1]); raise SystemExit(0)
     if a.out:
         assert a.db == os.environ["XPACK_DB"]
         assert a.serial_path == os.environ["PANEL_ROOT"] + "/db/.serial"
@@ -115,21 +121,50 @@ if __name__ == "__main__":
              "assigneeName": a.assignee, "deviceID": "fixture-device",
              "products": [{"expiresAt": a.expires+"T00:00:00Z", "maxNodeCount": int(a.nodes)}]}
         pathlib.Path(a.out).write_text(json.dumps(d))
+    if a.archive_foreign:
+        assert a.preserve_foreign and a.foreign_backup_dir
+        verify_license(pathlib.Path(a.import_file).read_text())
+        with sqlite3.connect(a.db) as c: rows = c.execute("select rowid,bind_node_id,license from licenses").fetchall()
+        foreign = [row for row in rows if json.loads(row[2]).get("foreign")]
+        if foreign:
+            raw = json.dumps({"rows": [{"rowid": row[0], "bind_node_id": row[1], "license": row[2]} for row in foreign]}, sort_keys=True).encode()
+            digest = hashlib.sha256(raw).hexdigest()
+            backup = pathlib.Path(a.foreign_backup_dir)/("foreign-licenses."+digest+".json")
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            if backup.exists(): assert backup.read_bytes() == raw
+            else: backup.write_bytes(raw)
+            pathlib.Path(str(backup)+".sha256").write_text(digest+"  "+str(backup)+"\n")
+        raise SystemExit(0)
     if a.apply:
         if os.environ.get("FAIL_APPLY"): raise SystemExit(8)
         assert a.no_restart
         text = pathlib.Path(a.import_file).read_text(); verify_license(text)
         with sqlite3.connect(a.db) as c:
             node = c.execute("select id from nodes where local=1").fetchone()[0]
-            c.execute("delete from licenses")
+            rows = c.execute("select rowid,bind_node_id,license from licenses").fetchall()
+            foreign = [row for row in rows if json.loads(row[2]).get("foreign")]
+            if foreign and a.preserve_foreign:
+                assert a.foreign_backup_dir
+                raw = json.dumps({"rows": [{"rowid": row[0], "bind_node_id": row[1], "license": row[2]} for row in foreign]}, sort_keys=True).encode()
+                digest = hashlib.sha256(raw).hexdigest()
+                backup = pathlib.Path(a.foreign_backup_dir)/("foreign-licenses."+digest+".json")
+                backup.parent.mkdir(parents=True, exist_ok=True)
+                if backup.exists(): assert backup.read_bytes() == raw
+                else: backup.write_bytes(raw)
+                pathlib.Path(str(backup)+".sha256").write_text(digest+"  "+str(backup)+"\n")
+                for row in foreign:
+                    if str(row[1]) == str(node): c.execute("update licenses set bind_node_id=0 where rowid=?", (row[0],))
+            elif any(str(row[1]) == str(node) for row in foreign): raise SystemExit("Foreign-bound fixture license")
+            for row in rows:
+                if row not in foreign: c.execute("delete from licenses where rowid=?", (row[0],))
             c.execute("insert into licenses values (?,?)", (node, text))
         with open(os.environ["EVENT_LOG"], "a") as f:
             f.write("apply "+str(node)+" "+",".join(a.replace_root_fingerprint)+"\n")
 '''
 
 CERT_STORE = r'''
-import argparse, hashlib, json, os, pathlib, sqlite3, ssl
-with open(os.environ["EVENT_LOG"], "a") as f: f.write("code cert_store\n")
+import argparse, hashlib, json, os, pathlib, sqlite3, ssl, sys
+with open(os.environ["EVENT_LOG"], "a") as f: f.write("code cert_store "+" ".join(sys.argv[1:])+"\n")
 OFFICIAL_FP = {"hk": "a"*64, "cn": "b"*64}
 def decrypt(v): return v
 def fingerprint(pem): return hashlib.sha256(ssl.PEM_cert_to_DER_cert(pem)).hexdigest()
@@ -138,6 +173,8 @@ if __name__ == "__main__":
     for x in ("cert", "db", "bak"): p.add_argument("--"+x)
     p.add_argument("--restore", action="store_true"); p.add_argument("--show", action="store_true")
     p.add_argument("--check-owned", action="store_true")
+    p.add_argument("--preserve-foreign", action="store_true")
+    p.add_argument("--archive-current", action="store_true")
     a = p.parse_args()
     if a.show: raise SystemExit(0)
     if a.check_owned:
@@ -147,8 +184,25 @@ if __name__ == "__main__":
                 ("LicenseRootCertHKFingerprint", "LicenseRootCertCNFingerprint", "LicenseRootCertHK", "LicenseRootCertCN")).fetchall()
         for key, value in roots:
             allowed = {fp, OFFICIAL_FP["hk"], OFFICIAL_FP["cn"]} if key.endswith("Fingerprint") else {pem}
-            if value not in allowed: raise SystemExit("Unknown fixture root")
+            if value not in allowed and not a.preserve_foreign: raise SystemExit("Unknown fixture root")
         with open(os.environ["EVENT_LOG"], "a") as f: f.write("check-owned\n")
+        raise SystemExit(0)
+    if a.archive_current:
+        assert a.preserve_foreign
+        with sqlite3.connect(a.db) as c:
+            rows = dict(c.execute("select key,value from core_settings where key in (?, ?, ?, ?)",
+                ("LicenseRootCertHKFingerprint", "LicenseRootCertCNFingerprint", "LicenseRootCertHK", "LicenseRootCertCN")).fetchall())
+        pem = pathlib.Path(a.cert).read_text(); fp = fingerprint(pem)
+        if rows and any(value != (fp if key.endswith("Fingerprint") else pem) for key, value in rows.items()):
+            backup = pathlib.Path(a.bak)
+            if not backup.exists(): backup.write_text(json.dumps(rows))
+            preserved = pathlib.Path(str(backup)+".preserved.json")
+            raw = json.dumps(rows, sort_keys=True).encode()
+            if not preserved.exists(): preserved.write_bytes(raw)
+            digest = hashlib.sha256(raw).hexdigest()
+            archived = backup.parent/("core_settings_license_rootcert.preserved."+digest+".json")
+            if not archived.exists(): archived.write_bytes(raw)
+            pathlib.Path(str(preserved)+".sha256").write_text(hashlib.sha256(preserved.read_bytes()).hexdigest()+"  "+str(preserved)+"\n")
         raise SystemExit(0)
     if os.environ.get("FAIL_CERT"): raise SystemExit(7)
     with sqlite3.connect(a.db) as c:
@@ -160,9 +214,14 @@ if __name__ == "__main__":
                     c.execute("insert into core_settings values (?,?)", (key, value))
         else:
             backup = pathlib.Path(a.bak)
-            if not backup.exists():
-                backup.write_text(json.dumps(dict(c.execute("select key,value from core_settings where key in (?, ?, ?, ?)",
-                    ("LicenseRootCertHKFingerprint", "LicenseRootCertCNFingerprint", "LicenseRootCertHK", "LicenseRootCertCN")).fetchall())))
+            rows = dict(c.execute("select key,value from core_settings where key in (?, ?, ?, ?)",
+                ("LicenseRootCertHKFingerprint", "LicenseRootCertCNFingerprint", "LicenseRootCertHK", "LicenseRootCertCN")).fetchall())
+            if not backup.exists(): backup.write_text(json.dumps(rows))
+            if a.preserve_foreign:
+                preserved = pathlib.Path(str(backup)+".preserved.json")
+                raw = json.dumps(rows, sort_keys=True).encode()
+                if not preserved.exists(): preserved.write_bytes(raw)
+                pathlib.Path(str(preserved)+".sha256").write_text(hashlib.sha256(preserved.read_bytes()).hexdigest()+"  "+str(preserved)+"\n")
             pem = pathlib.Path(a.cert).read_text(); fp = fingerprint(pem)
             for key in ("LicenseRootCertHKFingerprint", "LicenseRootCertCNFingerprint", "LicenseRootCertHK", "LicenseRootCertCN"):
                 c.execute("delete from core_settings where key=?", (key,))
@@ -429,6 +488,70 @@ class Fixture:
     def last_license(self):
         return max(self.work.glob("run.*/license.txt"), key=lambda p: p.stat().st_mtime_ns)
 
+    def real_license_tools(self):
+        tools = self.repo / "tools"
+        tools.mkdir(exist_ok=True)
+        for name in PUBLIC_TOOLS:
+            shutil.copy2(ROOT / "tools" / name, tools / name)
+            if name not in ("patch_core.py", "patch_agent.py", "gosym.py"):
+                self.public["tools/"+name] = (tools / name).read_bytes()
+        with sqlite3.connect(self.db) as c:
+            c.executescript("drop table core_settings; drop table nodes; drop table licenses;"
+                            "create table core_settings(id integer primary key,created_at text,updated_at text,"
+                            "key text,value text,description text);"
+                            "create table nodes(id integer primary key,name text);insert into nodes values(17,'local');")
+            fields = ("license_name usage_name assignee_name version_constraint device_id license offline trial issuer "
+                      "product_pro last_sync_at sms_total sms_used bind_node_id free_count free_nodes status message")
+            c.execute("create table licenses(id integer primary key,created_at text,updated_at text,"+
+                      ",".join('"%s" text' % name for name in fields.split())+")")
+            c.execute("insert into core_settings(key,value,description) values('UnrelatedSetting','keep','application metadata')")
+        self.pack_runtime()
+        return tools
+
+    def real_foreign_fixture(self):
+        tools = self.real_license_tools()
+        foreign = self.base / "foreign-state"; foreign.mkdir()
+        subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                        "-keyout", str(foreign / "license.key"), "-out", str(foreign / "license.crt"),
+                        "-days", "1", "-subj", "/CN=temporary-foreign-unlock-test"],
+                       capture_output=True, check=True, timeout=30)
+        code = r'''
+import json, pathlib, sqlite3, sys
+sys.path.insert(0, sys.argv[1]); import gen_license as g; import cert_store as cs
+pem = pathlib.Path(g.SIGN_CRT).read_text()
+cs.write(sys.argv[2], pem, cs.fingerprint(pem))
+content, row = g.build("enterprise", "2037-01-01", 23, "foreign-assignee", "fixture-device", "foreign-issuer", 7, False, True, "2.x")
+row.update(license=g.encode_license(content), bind_node_id="17", free_nodes='["foreign-child"]',
+           message="foreign message", created_at="foreign-created", updated_at="foreign-updated", id=41)
+encrypted = g.encrypt_row(row)
+with sqlite3.connect(sys.argv[2]) as c:
+    c.execute("insert into licenses (%s) values (%s)" % (",".join(encrypted), ",".join("?" * len(encrypted))), list(encrypted.values()))
+'''
+        result = subprocess.run([sys.executable, "-c", code, str(tools), str(self.db)],
+                                env={**self.env, "SIGN_KEY": str(foreign / "license.key"),
+                                     "SIGN_CRT": str(foreign / "license.crt")},
+                                capture_output=True, text=True, timeout=30)
+        if result.returncode: raise AssertionError(result.stdout+result.stderr)
+        return tools, foreign
+
+    def rows(self, table):
+        with sqlite3.connect(self.db) as c:
+            c.row_factory = sqlite3.Row
+            return [dict(row) for row in c.execute("select * from "+table+" order by id")]
+
+    def root_values(self):
+        with sqlite3.connect(self.db) as c:
+            return dict(c.execute("select key,value from core_settings where key like 'LicenseRootCert%'"))
+
+    def real_project_license(self, tools):
+        issued = self.base / "project-license.txt"
+        result = subprocess.run([sys.executable, str(tools / "gen_license.py"), "--offline",
+                                 "--expires", "2038-01-01", "--nodes", "42", "--db", str(self.db),
+                                 "--serial-path", str(self.panel / "db/.serial"), "--out", str(issued)],
+                                env=self.env, capture_output=True, text=True, timeout=30)
+        if result.returncode: raise AssertionError(result.stdout+result.stderr)
+        return issued
+
 
 class UnlockTests(unittest.TestCase):
     def setUp(self):
@@ -565,26 +688,32 @@ class UnlockTests(unittest.TestCase):
         before = self.f.machine_snapshot(); self.f.guard_first_api()
         self.assert_version_preflight_exit(self.f.run(VERSION="v2.3.2"), before)
 
-    def test_foreign_bound_license_db_is_preserved_before_service_stop(self):
+    def test_foreign_bound_license_db_is_archived_then_project_bound(self):
+        text = json.dumps({"signed": True, "foreign": True, "metadata": "untouched"})
         with sqlite3.connect(self.f.db) as c:
-            c.execute("insert into licenses values(88,?)", (json.dumps({"signed": True}),))
-        before = self.f.machine_snapshot()
-        self.before_stop(self.f.run())
-        self.assertEqual(self.f.machine_snapshot(), before)
-        self.assertNotIn("apply 17", self.f.log())
-        self.assertNotIn("code patch_core", self.f.log())
+            c.execute("insert into licenses values(17,?)", (text,))
+        self.ok(self.f.run())
+        with sqlite3.connect(self.f.db) as c: rows = c.execute("select bind_node_id,license from licenses order by rowid").fetchall()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0], (0, text)); self.assertEqual(rows[1][0], 17)
+        archives = list(self.f.backup.glob("foreign-licenses.*.json")); self.assertEqual(len(archives), 1)
+        self.assertEqual(json.loads(archives[0].read_text())["rows"][0]["license"], text)
+        self.assertIn("--preserve-foreign --foreign-backup-dir", self.f.log())
 
-    def test_unknown_root_and_fingerprint_history_do_not_establish_ownership(self):
+    def test_unknown_root_and_history_migrate_without_touching_other_keys(self):
         foreign = "c"*64
         with sqlite3.connect(self.f.db) as c:
             c.execute("insert into core_settings values('LicenseRootCertHKFingerprint',?)", (foreign,))
+            c.execute("insert into core_settings values('UnrelatedSetting','keep')")
         self.f.backup.mkdir()
         (self.f.backup / "script_root_fingerprints").write_text(foreign+"\n")
-        before = self.f.machine_snapshot()
-        self.before_stop(self.f.run())
-        self.assertEqual(self.f.machine_snapshot(), before)
-        self.assertNotIn("apply 17", self.f.log())
-        self.assertNotIn("code patch_core", self.f.log())
+        self.ok(self.f.run())
+        preserved = self.f.backup / "core_settings_license_rootcert.json.preserved.json"
+        self.assertEqual(json.loads(preserved.read_text())["LicenseRootCertHKFingerprint"], foreign)
+        self.assertEqual((self.f.backup / "script_root_fingerprints").read_text(), self.f.fp+"\n")
+        self.ok(self.f.run("restore", FAIL_CURL="1"))
+        with sqlite3.connect(self.f.db) as c: settings = dict(c.execute("select key,value from core_settings"))
+        self.assertEqual(settings, {"LicenseRootCertHKFingerprint": foreign, "UnrelatedSetting": "keep"})
 
     def test_known_official_project_roots_preserve_unrelated_settings_and_restore(self):
         with sqlite3.connect(self.f.db) as c:
@@ -634,9 +763,14 @@ class UnlockTests(unittest.TestCase):
         self.assertIn("export-existing", self.f.log())
         self.assert_downloads("amd64", 2)
 
-    def test_no_key_no_existing_license_fails_before_stop(self):
+    def test_no_key_no_existing_license_installs_pending(self):
         (self.f.state / "license.key").unlink()
-        self.before_stop(self.f.run())
+        self.f.agent.write_bytes(b"foreign agent without signing material")
+        self.ok(self.f.run())
+        self.assertEqual(self.f.core.read_bytes(), self.f.outputs["amd64"])
+        self.assertEqual(self.f.agent.read_bytes(), self.f.agent_originals["amd64"].replace(b"ORIG", b"KEEP"))
+        self.assertEqual((self.f.work / "license.status").read_text().strip(), "pending")
+        self.assertNotIn("apply 17", self.f.log()); self.assertNotIn("--verify-db", self.f.log())
 
     def test_preissued_license_and_piped_entry_without_key(self):
         self.ok(self.f.run("cert"))
@@ -851,7 +985,9 @@ class UnlockTests(unittest.TestCase):
     def test_no_apply_retains_artifacts_and_never_imports_license(self):
         result = self.f.run(NO_APPLY="1"); self.ok(result)
         self.assertIn("license NOT applied", result.stdout)
+        self.assertEqual((self.f.work / "license.status").read_text().strip(), "not-applied")
         self.assertNotIn("apply 17", self.f.log())
+        self.assertNotIn("--verify-db", self.f.log())
         run = self.f.last_license().parent
         for name in ("license.txt", "manifest.json", "runtime.tar.gz", "core", "core.orig", "core.offline"):
             self.assertTrue((run / name).is_file(), name)
@@ -1043,6 +1179,147 @@ class UnlockTests(unittest.TestCase):
         result = self.f.run("restore", FAIL_CURL="1")
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.f.log().count("systemctl stop"), before)
+
+    def test_pending_foreign_license_without_current_ca_never_reuses_foreign_signature(self):
+        tools, foreign = self.f.real_foreign_fixture()
+        old_rows = self.f.rows("licenses"); old_roots = self.f.root_values()
+        (self.f.state / "license.key").unlink(); (self.f.state / "license.crt").unlink()
+        self.f.agent.write_bytes(b"foreign installed agent")
+        result = self.f.run(); self.ok(result)
+        self.assertEqual(self.f.rows("licenses"), old_rows)
+        self.assertEqual((self.f.work / "license.status").read_text().strip(), "pending")
+        self.assertEqual(self.f.core.read_bytes(), self.f.outputs["amd64"])
+        self.assertEqual(self.f.agent.read_bytes(), self.f.agent_originals["amd64"].replace(b"ORIG", b"KEEP"))
+        self.assertNotEqual(self.f.root_values(), old_roots)
+        self.assertEqual(list(self.f.work.glob("run.*/license.txt")), [])
+        self.assertEqual(list(self.f.backup.glob("foreign-licenses.*.json")), [])
+        self.assertNotIn("offline license applied", result.stdout)
+        self.assertIn("import a project-signed license", result.stdout.lower())
+        self.assertFalse((tools / "license.key").exists())
+        self.assertTrue((foreign / "license.key").is_file())
+
+    def test_current_foreign_core_and_agent_are_archived_immutably_not_executed(self):
+        marker = self.f.base / "foreign-binary-executed"
+        core = ("#!/bin/sh\ntouch "+str(marker)+"\nexit 1\n").encode()
+        agent = b"foreign agent binary exact bytes"
+        self.f.installed_version("v2.3.2")
+        self.f.core.write_bytes(core); self.f.core.chmod(0o755); self.f.agent.write_bytes(agent)
+        self.ok(self.f.run())
+        first = {}
+        for name, raw in (("core", core), ("agent", agent)):
+            path = self.f.backup / ("1panel-"+name+".previous."+sha(raw))
+            self.assertEqual(path.read_bytes(), raw)
+            self.assertTrue(path.name.endswith(sha(path.read_bytes())))
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            first[path] = (path.read_bytes(), path.stat().st_mtime_ns)
+        self.f.core.write_bytes(b"next foreign core"); self.f.agent.write_bytes(agent)
+        self.ok(self.f.run())
+        for path, original in first.items(): self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), original)
+        self.assertFalse(marker.exists())
+        self.assertEqual((self.f.backup / "1panel-core.orig").read_bytes(), self.f.originals["amd64"])
+        self.assertEqual((self.f.backup / "1panel-agent.orig").read_bytes(), self.f.agent_originals["amd64"])
+        self.assertEqual((self.f.backup / ("1panel-core.previous."+sha(b"next foreign core"))).read_bytes(), b"next foreign core")
+
+    def test_lower_release_exits_before_archiving_foreign_state_with_single_api(self):
+        self.f.real_foreign_fixture()
+        self.f.installed_version("v2.10.0")
+        self.f.agent.write_bytes(b"foreign agent retained on unsupported downgrade")
+        before = self.f.machine_snapshot(); self.f.guard_first_api()
+        self.assert_version_preflight_exit(self.f.run(), before)
+        self.assertEqual(self.f.urls(), [API_URL])
+        self.assertEqual(list(self.f.base.glob("backup*")), [])
+
+    def test_preserved_foreign_roots_repeat_restore_exact_raw_values_and_other_metadata(self):
+        self.f.real_foreign_fixture()
+        roots = self.f.root_values(); unrelated = self.f.rows("core_settings")[0]
+        self.ok(self.f.run())
+        preserved = self.f.backup / "core_settings_license_rootcert.json.preserved.json"
+        self.assertEqual(json.loads(preserved.read_text()), roots)
+        original = preserved.read_bytes()
+        archives = list(self.f.backup.glob("core_settings_license_rootcert.preserved.*.json"))
+        self.assertTrue(archives)
+        for path in archives:
+            self.assertIn(sha(path.read_bytes()), path.name)
+        self.ok(self.f.run())
+        self.assertEqual(preserved.read_bytes(), original)
+        self.ok(self.f.run("restore", FAIL_CURL="1"))
+        self.assertEqual(self.f.root_values(), roots)
+        self.assertEqual(self.f.rows("core_settings")[0], unrelated)
+
+    def test_real_foreign_bound_signed_import_preserves_license_and_archives_all_metadata(self):
+        tools, _ = self.f.real_foreign_fixture()
+        before = self.f.rows("licenses")[0]
+        issued = self.f.real_project_license(tools)
+        (self.f.state / "license.key").unlink()
+        self.ok(self.f.run(LICENSE_FILE=str(issued)))
+        rows = self.f.rows("licenses"); self.assertEqual(len(rows), 2)
+        foreign = next(row for row in rows if row["id"] == before["id"])
+        self.assertEqual(foreign["license"], before["license"])
+        for field in ("license_name", "usage_name", "assignee_name", "version_constraint", "device_id", "offline",
+                      "trial", "issuer", "product_pro", "last_sync_at", "sms_total", "sms_used", "free_count", "created_at"):
+            self.assertEqual(foreign[field], before[field], field)
+        archives = list(self.f.backup.glob("foreign-licenses.*.json")); self.assertEqual(len(archives), 1)
+        data = json.loads(archives[0].read_text())
+        self.assertEqual(data["rows"], [before])
+        self.assertIn(sha(archives[0].read_bytes()), archives[0].name)
+        self.assertEqual((self.f.work / "license.status").read_text().strip(), "applied")
+        code = r'''
+import sqlite3, sys
+sys.path.insert(0, sys.argv[1]); import gen_license as g
+with sqlite3.connect(sys.argv[2]) as c:
+    c.row_factory = sqlite3.Row
+    rows = [g.decrypt_row(dict(row)) for row in c.execute("select * from licenses order by id")]
+assert rows[0]["bind_node_id"] in ("", "0")
+assert rows[1]["bind_node_id"] == "17"
+assert g.verify_license(rows[1]["license"])["products"][0]["maxNodeCount"] == 42
+'''
+        self.ok(subprocess.run([sys.executable, "-c", code, str(tools), str(self.f.db)],
+                               env=self.f.env, capture_output=True, text=True, timeout=30))
+
+    def test_explicit_bad_project_signature_and_wrong_issuer_abort_before_changes(self):
+        tools, _ = self.f.real_foreign_fixture()
+        issued = self.f.real_project_license(tools)
+        with sqlite3.connect(self.f.db) as c: foreign_blob = c.execute("select license from licenses").fetchone()[0]
+        code = "import sys; sys.path.insert(0, sys.argv[1]); import gen_license as g; print(g.decrypt_blob(sys.argv[2]))"
+        foreign = subprocess.run([sys.executable, "-c", code, str(tools), foreign_blob],
+                                 env=self.f.env, capture_output=True, text=True, check=True, timeout=30).stdout.strip()
+        parts = issued.read_text().split("-")
+        parts[1] = ("A" if parts[1][0] != "A" else "B")+parts[1][1:]
+        for text in (foreign, "-".join(parts)):
+            with self.subTest(kind="wrong-issuer" if text == foreign else "bad-signature"):
+                explicit = self.f.base / "invalid-project-license.txt"; explicit.write_text(text)
+                before = self.f.machine_snapshot(); self.f.events.unlink(missing_ok=True)
+                self.before_stop(self.f.run(LICENSE_FILE=str(explicit)))
+                self.assertEqual(self.f.machine_snapshot(), before)
+                self.assertNotIn("offline license applied", self.f.log())
+                self.assertEqual(list(self.f.backup.glob("foreign-licenses.*.json")), [])
+
+    def test_pending_verify_checks_binaries_roots_services_without_network_or_bound_claim(self):
+        self.f.real_foreign_fixture()
+        (self.f.state / "license.key").unlink()
+        self.ok(self.f.run())
+        before_urls = self.f.urls(); rows = self.f.rows("licenses")
+        self.f.events.unlink(missing_ok=True)
+        result = self.f.run("verify", FAIL_CURL="1"); self.ok(result)
+        self.assertEqual(self.f.urls(), [])
+        self.assertEqual(self.f.rows("licenses"), rows)
+        self.assertNotIn("--verify-db", self.f.log())
+        self.assertIn("code patch_core", self.f.log())
+        self.assertIn("systemctl is-active --quiet fixture-core", self.f.log())
+        self.assertIn("pending", result.stdout.lower()); self.assertNotIn('"status": "Bound"', result.stdout)
+        self.assertNotIn("offline license applied", result.stdout)
+        self.assertTrue(before_urls)
+
+    def test_no_apply_signed_foreign_license_leaves_all_foreign_binding_fields_unchanged(self):
+        tools, _ = self.f.real_foreign_fixture()
+        issued = self.f.real_project_license(tools); before = self.f.rows("licenses")
+        result = self.f.run(LICENSE_FILE=str(issued), NO_APPLY="1"); self.ok(result)
+        self.assertEqual(self.f.rows("licenses"), before)
+        self.assertEqual((self.f.work / "license.status").read_text().strip(), "not-applied")
+        self.assertEqual(list(self.f.backup.glob("foreign-licenses.*.json")), [])
+        self.assertNotIn("offline license applied", result.stdout)
+        self.ok(self.f.run("verify", FAIL_CURL="1"))
+        self.assertEqual(self.f.rows("licenses"), before)
 
     def test_real_tools_encrypted_metadata_signature_binding_and_restore(self):
         available = [arch for arch in ("amd64", "arm64") if (ROOT / "build/releases" / arch / "core.orig").is_file()]

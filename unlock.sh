@@ -216,6 +216,9 @@ fi
 export STATE
 export SIGN_CRT="${SIGN_CRT:-$STATE/license.crt}"
 export SIGN_KEY="${SIGN_KEY:-$STATE/license.key}"
+if [ ! -s "$SIGN_CRT" ] && [ -s "$WORK/state/license.crt" ]; then
+  export SIGN_CRT="$WORK/state/license.crt"
+fi
 export REMOTE_BASE=""
 check_root() {
   python3 - "$CERT_STORE" "$XPACK_DB" "$SIGN_CRT" <<'PY'
@@ -312,7 +315,7 @@ restore_source() {
 if [ "$MODE" = restore ]; then
   RESTORE_CRT="$SIGN_CRT"
   [ -s "$RESTORE_CRT" ] || RESTORE_CRT="$WORK/state/license.crt"
-  python3 "$CERT_STORE" --check-owned --cert "$RESTORE_CRT" --db "$XPACK_DB"
+  python3 "$CERT_STORE" --preserve-foreign --check-owned --cert "$RESTORE_CRT" --db "$XPACK_DB"
   CORE_ORIG="$(restore_source core)"
   AGENT_ORIG=""
   if [ -f "$BACKUP/1panel-agent.orig" ] || [ -f "$BACKUP/agent.orig" ] \
@@ -323,7 +326,7 @@ if [ "$MODE" = restore ]; then
   systemctl stop "$CORE_SVC"
   [ -z "$AGENT_ORIG" ] || systemctl stop "$AGENT_SVC"
   install -m 0755 "$CORE_ORIG" "$CORE_BIN"
-  python3 "$CERT_STORE" --cert "$RESTORE_CRT" --db "$XPACK_DB" --bak "$BACKUP/core_settings_license_rootcert.json" --restore
+  python3 "$CERT_STORE" --preserve-foreign --cert "$RESTORE_CRT" --db "$XPACK_DB" --bak "$BACKUP/core_settings_license_rootcert.json" --restore
   if [ -n "$AGENT_ORIG" ]; then
     install -m 0755 "$AGENT_ORIG" "$AGENT_BIN"
     systemctl start "$AGENT_SVC"
@@ -339,15 +342,20 @@ if [ "$MODE" = verify ]; then
   python3 "$PATCH_CORE" --verify --in "$CORE_BIN"
   python3 "$CERT_STORE" --db "$XPACK_DB" --show
   check_root
-  python3 "$GEN_LICENSE" --verify-db --db "$XPACK_DB" --serial-path "$PANEL_ROOT/db/.serial"
+  if [ -f "$PERSIST/license.status" ] && [[ "$(<"$PERSIST/license.status")" != applied ]]; then
+    log "Components verified; a project-signed license is pending import"
+  else
+    python3 "$GEN_LICENSE" --verify-db --db "$XPACK_DB" --serial-path "$PANEL_ROOT/db/.serial"
+  fi
   systemctl is-active --quiet "$CORE_SVC"
   exit 0
 fi
 if [[ "$MODE" = install || "$MODE" = deploy || "$MODE" = cert ]]; then
-  python3 "$CERT_STORE" --check-owned --cert "$SIGN_CRT" --db "$XPACK_DB"
-  python3 "$GEN_LICENSE" --preflight-db --db "$XPACK_DB" --serial-path "$PANEL_ROOT/db/.serial"
+  python3 "$CERT_STORE" --preserve-foreign --check-owned --cert "$SIGN_CRT" --db "$XPACK_DB"
+  python3 "$GEN_LICENSE" --preserve-foreign --preflight-db --db "$XPACK_DB" --serial-path "$PANEL_ROOT/db/.serial"
 fi
 LICENSE_OUT="$RUN/license.txt"
+LICENSE_READY=1
 if [ -n "${LICENSE_FILE:-}" ]; then
   install -m 0600 "$LICENSE_FILE" "$LICENSE_OUT"
 elif [ -s "$SIGN_KEY" ]; then
@@ -355,10 +363,15 @@ elif [ -s "$SIGN_KEY" ]; then
     --nodes "${NODES:-999}" --assignee "${ASSIGNEE:-YG}" --offline --out "$LICENSE_OUT" \
     --db "$XPACK_DB" --serial-path "$PANEL_ROOT/db/.serial"
 else
-  python3 "$GEN_LICENSE" --export-existing "$LICENSE_OUT" --db "$XPACK_DB"
-  log "Reusing verified existing certificate; expiry and node allowance remain signed values"
+  if python3 "$GEN_LICENSE" --export-existing "$LICENSE_OUT" --db "$XPACK_DB" 2> "$RUN/license-export.log"; then
+    log "Reusing verified project certificate; expiry and node allowance remain signed values"
+  else
+    LICENSE_READY=0
+    log "No reusable project-signed license; preserving all old licenses and installing components pending import"
+  fi
 fi
 # Shared generator owns encrypted three-segment decoding/signature verification.
+if [ "$LICENSE_READY" = 1 ]; then
 python3 - "$GEN_LICENSE" "$LICENSE_OUT" "$PANEL_ROOT/db/.serial" <<'PY'
 import datetime as dt, importlib.util, pathlib, sys
 sys.path.insert(0, str(pathlib.Path(sys.argv[1]).parent))
@@ -383,11 +396,16 @@ if serial.is_file() and serial.read_text().strip() != content["deviceID"]:
 print("License: %s / expiry %s / nodes %s" % (
     content.get("licenseName"), content["products"][0]["expiresAt"], content["products"][0]["maxNodeCount"]))
 PY
-if [ "$MODE" = cert ]; then log "Signed offline license retained: $LICENSE_OUT"; exit 0; fi
+fi
+if [ "$MODE" = cert ]; then
+  [ "$LICENSE_READY" = 1 ] || die "No project-signed license to export; provide LICENSE_FILE or local signing material"
+  log "Signed offline license retained: $LICENSE_OUT"
+  exit 0
+fi
 [ -f "$XPACK_DB" ] || die "Missing initialized database: $XPACK_DB"
-if [ "${NO_APPLY:-0}" != 1 ]; then
+if [ "${NO_APPLY:-0}" != 1 ] && [ "$LICENSE_READY" = 1 ]; then
   HELP="$(python3 "$GEN_LICENSE" --help)"
-  for FLAG in --db --serial-path --no-restart --preflight-db --verify-db; do
+  for FLAG in --db --serial-path --no-restart --preflight-db --verify-db --preserve-foreign --foreign-backup-dir; do
     [[ "$HELP" == *"$FLAG"* ]] || die "Update gen_license.py: missing $FLAG (legacy expiry patching is not used)"
   done
 fi
@@ -466,8 +484,29 @@ PY
     --orig "$RUN/agent.orig" --manifest "$RUN/agent.manifest.json"
   python3 "$PATCH_AGENT" --verify --in "$RUN/agent"
 fi
+python3 "$CERT_STORE" --preserve-foreign --archive-current --cert "$SIGN_CRT" --db "$XPACK_DB" \
+  --bak "$BACKUP/core_settings_license_rootcert.json"
+if [ "${NO_APPLY:-0}" != 1 ] && [ "$LICENSE_READY" = 1 ]; then
+  python3 "$GEN_LICENSE" --preserve-foreign --archive-foreign --foreign-backup-dir "$BACKUP" \
+    --import-file "$LICENSE_OUT" --db "$XPACK_DB" --serial-path "$PANEL_ROOT/db/.serial"
+fi
 backup_orig "$RUN/core.orig" core
 [ -z "$AGENT_SOURCE" ] || backup_orig "$RUN/agent.orig" agent
+# Preserve replaced binaries separately from verified official rollback images.
+for KIND in core agent; do
+  if [ "$KIND" = core ]; then PREVIOUS="$CORE_BIN"
+  elif [ -n "$AGENT_SOURCE" ]; then PREVIOUS="$AGENT_BIN"
+  else continue; fi
+  if [ -f "$PREVIOUS" ]; then
+    SUM="$(sha256sum "$PREVIOUS")"; SUM="${SUM%% *}"
+    SAVED="$BACKUP/1panel-$KIND.previous.$SUM"
+    if [ -e "$SAVED" ]; then
+      [ ! -L "$SAVED" ] && cmp -s "$PREVIOUS" "$SAVED" || die "Previous binary backup mismatch: $SAVED"
+    else
+      install -m 0600 "$PREVIOUS" "$SAVED"
+    fi
+  fi
+done
 systemctl stop "$CORE_SVC"
 [ -z "$AGENT_SOURCE" ] || systemctl stop "$AGENT_SVC"
 install -m 0755 "$RUN/core.offline" "$CORE_BIN"
@@ -478,10 +517,15 @@ import hashlib, pathlib, ssl, sys
 print(hashlib.sha256(ssl.PEM_cert_to_DER_cert(pathlib.Path(sys.argv[1]).read_text())).hexdigest())
 PY
 install -m 0600 "$RUN/project-root-fingerprint" "$BACKUP/script_root_fingerprints"
-python3 "$CERT_STORE" --cert "$SIGN_CRT" --db "$XPACK_DB" --bak "$BACKUP/core_settings_license_rootcert.json"
-if [ "${NO_APPLY:-0}" != 1 ]; then
-  python3 "$GEN_LICENSE" --import-file "$LICENSE_OUT" --apply --db "$XPACK_DB" \
+python3 "$CERT_STORE" --preserve-foreign --cert "$SIGN_CRT" --db "$XPACK_DB" --bak "$BACKUP/core_settings_license_rootcert.json"
+if [ "${NO_APPLY:-0}" != 1 ] && [ "$LICENSE_READY" = 1 ]; then
+  python3 "$GEN_LICENSE" --preserve-foreign --foreign-backup-dir "$BACKUP" --import-file "$LICENSE_OUT" --apply --db "$XPACK_DB" \
     --serial-path "$PANEL_ROOT/db/.serial" --no-restart
+  printf 'applied\n' > "$PERSIST/license.status"
+elif [ "${NO_APPLY:-0}" = 1 ]; then
+  printf 'not-applied\n' > "$PERSIST/license.status"
+else
+  printf 'pending\n' > "$PERSIST/license.status"
 fi
 cmp -s "$RUN/core.offline" "$CORE_BIN" || die "Installed core changed during license apply"
 if [ -n "$AGENT_SOURCE" ]; then
@@ -493,10 +537,11 @@ systemctl is-active --quiet "$CORE_SVC"
 python3 "$PATCH_CORE" --verify --in "$CORE_BIN"
 python3 "$CERT_STORE" --db "$XPACK_DB" --show
 check_root
-if [ "${NO_APPLY:-0}" != 1 ]; then
+if [ "${NO_APPLY:-0}" != 1 ] && [ "$LICENSE_READY" = 1 ]; then
   python3 "$GEN_LICENSE" --verify-db --db "$XPACK_DB" --serial-path "$PANEL_ROOT/db/.serial"
 fi
-if [ "${NO_APPLY:-0}" = 1 ]; then log "Core/certificate replaced; license NOT applied (NO_APPLY=1)"
+if [ "$LICENSE_READY" != 1 ]; then log "Repository components installed; third-party certificates/licenses retained; import a project-signed license to activate"
+elif [ "${NO_APPLY:-0}" = 1 ]; then log "Core/certificate replaced; license NOT applied (NO_APPLY=1)"
 else log "Core/certificate replaced; offline license applied with automatic main-node binding"; fi
 log "License and verified artifacts retained: $RUN"
 log "Rollback: bash unlock.sh restore (official images: $BACKUP)"
