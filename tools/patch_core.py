@@ -237,6 +237,67 @@ SYMBOL_SUFFIX = {
     "P10.license_helper.egress.disable": "core/xpack/utils/license_helper.handleRequest",
 }
 
+# ---------------------------------------------------------------------------
+# arm64（AArch64）补丁字节。
+#
+# 表里的 orig/patched 是 amd64 指令；arm64 指令编码完全不同，所以这里按架构
+# 覆盖：{补丁名: (原值字节数, arm64 替换字节)}。原值从目标二进制现场读取。
+#
+#   ret              = 0xd65f03c0 -> c0 03 5f d6
+#   nop              = 0xd503201f -> 1f 20 03 d5
+#   mov xN, xzr      = 0xaa1f03eN -> eN 03 1f aa
+#   mov x0, #1       = 0xd2800020 -> 20 00 80 d2
+# ---------------------------------------------------------------------------
+_A64_RET = bytes.fromhex("c0035fd6")
+_A64_NOP = bytes.fromhex("1f2003d5")
+_A64_X0Z = bytes.fromhex("e0031faa")
+_A64_X1Z = bytes.fromhex("e1031faa")
+_A64_X2Z = bytes.fromhex("e2031faa")
+_A64_X3Z = bytes.fromhex("e3031faa")
+
+ARM64_PATCHES = {
+    # Refresh: cbnz x1,<skip> -> nop ；cbz x0,<skip> -> mov x0,#1
+    "P5a.license_snapshot.refresh.ignore_err": (4, _A64_NOP),
+    "P5b.license_snapshot.refresh.local_fallback": (4, bytes.fromhex("200080d2")),
+    # 无返回值：直接 ret
+    "P6.cron.license_check.disable": (24, _A64_RET + _A64_NOP * 5),
+    "P9.alert.sync_sms.disable": (24, _A64_RET + _A64_NOP * 5),
+    # 返回 error（x0/x1）：清零后 ret
+    "P7.license_helper.report.disable": (24, _A64_X0Z + _A64_X1Z + _A64_RET + _A64_NOP * 3),
+    # 返回 bool（x0）：清零后 ret
+    "P8.license_helper.checkversion.disable": (24, _A64_X0Z + _A64_RET + _A64_NOP * 4),
+    # 返回 ([]byte, error)：x0..x3 清零后 ret
+    "P10.license_helper.egress.disable": (32, _A64_X0Z + _A64_X1Z + _A64_X2Z + _A64_X3Z + _A64_RET + _A64_NOP * 3),
+}
+
+
+# arm64 官方 v2.3.2 的原值。仅用于「已经是打过补丁的镜像」时（--verify）判定，
+# 换版本时若不匹配会被现场读取的值取代，不会误判。
+ARM64_ORIG = {
+    "P5a.license_snapshot.refresh.ignore_err": "610600b5",
+    "P5b.license_snapshot.refresh.local_fallback": "400600b4",
+    "P6.cron.license_check.disable": "900b40f9f10309d13f0210eba9070054f4030bd19dfa3fa9",
+    "P7.license_helper.report.disable": "900b40f9f14309d13f0210ebc9180054f4430bd19dfa3fa9",
+    "P8.license_helper.checkversion.disable": "900b40f9ff6330ebe90b0054fe0f1ef8fd831ff8fd2300d1",
+    "P9.alert.sync_sms.disable": "900b40f9ff6330ebe9070054fe0f1bf8fd831ff8fd2300d1",
+    "P10.license_helper.egress.disable": "900b40f9f14308d13f0210ebe98e0054f4430ad19dfa3fa99f020091fd2300d1",
+}
+
+
+def arch_bytes(data, name, off, orig, patched):
+    """按目标架构返回 (orig, patched)；arm64 用 ARM64_PATCHES 覆盖并现场取原值。"""
+    spec = ARM64_PATCHES.get(name)
+    if spec is None or detect_machine(data) != 183:
+        return orig, patched
+    n, arm_patched = spec
+    cur = data[off:off + n]
+    if cur == arm_patched:
+        # 已经是打过补丁的镜像：原值回退到固化表，否则 --verify 会把它当成未打补丁
+        fixed = ARM64_ORIG.get(name)
+        if fixed and len(bytes.fromhex(fixed)) == n:
+            return bytes.fromhex(fixed), arm_patched
+    return cur, arm_patched
+
 # C7 的指令特征：cmp qword ptr [rdx+0x90], 0 ; jne rel8
 C7_CTX = bytes.fromhex("4883ba9000000000")     # 48 83 ba 90 00 00 00 00
 C7_FUNC_SUFFIX = "core/xpack.initLicense"
@@ -383,6 +444,41 @@ def _sym_off(data, suffix):
     return None
 
 
+def _refresh_offsets_arm64(data, syms):
+    """arm64 版：在 Refresh 里定位 Atoi 之后的 cbnz x1 / cbz x0。
+
+    目标指令序列（AArch64）：
+        bl    strconv.Atoi      ; 0x94000000 | imm26
+        cbnz  x1, <skip>        ; 0xB5000000 | imm19<<5 | 1   <- 解析出错就跳过
+        cbz   x0, <skip>        ; 0xB4000000 | imm19<<5 | 0   <- 节点号为 0 也跳过
+
+    bl 的 imm26 是相对 vaddr 的，而符号表给的是文件偏移，两者相差一个段偏移，
+    直接换算容易出错，所以这里改用纯结构匹配：两条跳转的目标必须是同一条指令
+    （cbnz 在 cbz 前 4 字节，所以 imm19 恰好相差 1）。
+    返回 (cbnz_off, cbz_off)；定位不到返回 (None, None)。
+    """
+    fn = next((s for s in syms
+               if s["name"].endswith("core/xpack/utils/license_snapshot.Refresh")), None)
+    if fn is None:
+        return None, None
+    lo, hi = fn["off"], fn["off"] + fn["size"]
+    hits = []
+    for off in range(lo, hi - 12, 4):
+        w0 = struct.unpack_from("<I", data, off)[0]
+        if (w0 >> 26) != 0x25:                          # bl
+            continue
+        w1 = struct.unpack_from("<I", data, off + 4)[0]
+        w2 = struct.unpack_from("<I", data, off + 8)[0]
+        if (w1 >> 24) != 0xB5 or (w1 & 0x1F) != 1:      # cbnz x1
+            continue
+        if (w2 >> 24) != 0xB4 or (w2 & 0x1F) != 0:      # cbz x0
+            continue
+        if ((w1 >> 5) & 0x7FFFF) != ((w2 >> 5) & 0x7FFFF) + 1:
+            continue                                    # 必须跳到同一条指令
+        hits.append((off + 4, off + 8))
+    return hits[0] if len(hits) == 1 else (None, None)
+
+
 def _refresh_offsets(data):
     """在 license_snapshot.Refresh 里定位 bind_node_id 解析后的两处条件跳转。
 
@@ -412,7 +508,9 @@ def _refresh_offsets(data):
                 os.unlink(tmp)
             except OSError:
                 pass
-    if detect_machine(data) != 62:            # 只对 amd64 做指令级定位
+    if detect_machine(data) == 183:
+        return _refresh_offsets_arm64(data, syms)
+    if detect_machine(data) != 62:            # 只对 amd64 / arm64 做指令级定位
         return None, None
     fn = next((s for s in syms
                if s["name"].endswith("core/xpack/utils/license_snapshot.Refresh")), None)
@@ -543,6 +641,9 @@ def build_table(data, remote_base=None, cert_path=None, verbose=True):
         if real != off and verbose:
             print("   %s: 偏移自动重定位 %#x -> %#x（版本/架构不同）"
                   % (name, off, real))
+        if name in ARM64_PATCHES:
+            # 离线化补丁：arm64 指令编码与 amd64 不同，定位到之后再按架构换字节
+            orig, patched = arch_bytes(data, name, real, orig, patched)
         out.append((name, real, orig, patched, comment))
     return out
 
