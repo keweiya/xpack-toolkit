@@ -89,8 +89,12 @@ def _default_cert_path():
     state = (os.environ.get("STATE") or "").strip()
     if state:
         return os.path.join(state, "license.crt")
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                        "..", "web", "state", "license.crt")
+    root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+    for cand in ("state", os.path.join("web", "state")):
+        p = os.path.join(root, cand, "license.crt")
+        if os.path.exists(p):
+            return p
+    return os.path.join(root, "state", "license.crt")
 
 
 ROOT_CERT_PATH = os.environ.get("SIGN_CRT") or _default_cert_path()

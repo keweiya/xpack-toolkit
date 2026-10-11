@@ -109,7 +109,15 @@ EDITIONS = {
 # --------------------------------------------------------------------------- #
 # 本地签名材料：授权文件第 2 段 = RSA-SHA256 签名，第 3 段 = 签名证书链
 # （形状与官方签发站一致：base64(内容)-base64(签名)-base64(证书)）
-STATE_DIR = os.environ.get("STATE", os.path.join(ROOT, "web", "state"))
+def _default_state_dir():
+    root = ROOT
+    for cand in ("state", os.path.join("web", "state")):
+        if os.path.exists(os.path.join(root, cand, "license.key")):
+            return os.path.join(root, cand)
+    return os.path.join(root, "state")
+
+
+STATE_DIR = os.environ.get("STATE") or _default_state_dir()
 SIGN_KEY = os.environ.get("SIGN_KEY", os.path.join(STATE_DIR, "license.key"))
 SIGN_CRT = os.environ.get("SIGN_CRT", os.path.join(STATE_DIR, "license.crt"))
 
@@ -126,8 +134,13 @@ def sign_payload(raw: bytes) -> str:
             ["openssl", "dgst", "-sha256", "-sign", SIGN_KEY],
             input=raw, capture_output=True, check=True).stdout
         return base64.b64encode(out).decode()
-    except Exception:  # noqa: BLE001  没有私钥时退化成占位段
-        return base64.b64encode(b"license-unsigned").decode()
+    except Exception as exc:  # noqa: BLE001
+        # 缺私钥时绝不静默产出「未签名」授权（面板会直接判无效）
+        if os.environ.get("ALLOW_UNSIGNED") == "1":
+            return base64.b64encode(b"license-unsigned").decode()
+        raise RuntimeError(
+            "签名失败：读不到私钥 %s（%s）。用 STATE=<状态目录> 或 SIGN_KEY=<私钥路径> 指定。"
+            % (SIGN_KEY, exc)) from exc
 
 
 def cert_chain() -> str:
@@ -137,8 +150,12 @@ def cert_chain() -> str:
             pem = fh.read()
         der = ssl.PEM_cert_to_DER_cert(pem)
         return base64.b64encode(der).decode()
-    except Exception:  # noqa: BLE001
-        return base64.b64encode(b"license-self-signed").decode()
+    except Exception as exc:  # noqa: BLE001
+        if os.environ.get("ALLOW_UNSIGNED") == "1":
+            return base64.b64encode(b"license-self-signed").decode()
+        raise RuntimeError(
+            "读不到签名证书 %s（%s）。用 STATE=<状态目录> 或 SIGN_CRT=<证书路径> 指定。"
+            % (SIGN_CRT, exc)) from exc
 
 
 def encode_license(content: dict, extra_segments=None) -> str:
@@ -449,7 +466,7 @@ def main():
             print("已写入 %s（备份 %s）" % (XPACK_DB, backup))
             old, new = set_binary_expiry(row["product_pro"])
             if new:
-                print("已把面板授权期限字面量 %s -> %s 写入 %s" % (old, new, CORE_BIN))
+                print("已把面板授权期限字面量 %s -> %s 写入 %s" % (old, new.decode(), CORE_BIN))
             print("%s 已重启" % CORE_SVC)
         return 0
 
@@ -485,7 +502,7 @@ def main():
         print("已写入 %s（备份 %s）" % (XPACK_DB, backup))
         old, new = set_binary_expiry(row["product_pro"])
         if new:
-            print("已把面板授权期限字面量 %s -> %s 写入 %s" % (old, new, CORE_BIN))
+            print("已把面板授权期限字面量 %s -> %s 写入 %s" % (old, new.decode(), CORE_BIN))
         print("%s 已重启" % CORE_SVC)
     return 0
 

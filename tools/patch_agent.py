@@ -161,6 +161,7 @@ def main():
         if not os.path.exists(args.orig):
             shutil.copy2(src, args.orig)
             print("pristine copy -> %s" % args.orig)
+        os.makedirs(os.path.dirname(os.path.abspath(dst)), exist_ok=True)
         open(dst, "wb").write(bytes(data))
         os.chmod(dst, 0o755)
 
@@ -177,7 +178,9 @@ def main():
             "patches": [{"name": n, "file_offset": hex(o), "orig": or_.hex(),
                          "patch": p.hex(), "note": c} for n, o, or_, p, c in PATCHES],
         }
-        json.dump(man, open(args.manifest, "w"), indent=2, ensure_ascii=False)
+        os.makedirs(os.path.dirname(os.path.abspath(args.manifest)), exist_ok=True)
+        with open(args.manifest, "w") as fh:
+            json.dump(man, fh, indent=2, ensure_ascii=False)
         print("applied  : %s" % (", ".join(applied) or "(none)"))
         print("skipped  : %s" % (", ".join(skipped) or "(none)"))
         print("output   : %s" % dst)

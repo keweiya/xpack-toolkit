@@ -67,6 +67,8 @@ fi
 [ -f "$WORK/tools/gen_license.py" ] || die "仓库里缺少 tools/gen_license.py"
 [ -f "$WORK/state/license.key" ]    || die "仓库里缺少 state/license.key"
 [ -f "$WORK/state/license.crt" ]    || die "仓库里缺少 state/license.crt"
+# 固定签名材料目录，避免默认路径猜错（否则会产出未签名授权）
+export STATE="$WORK/state"
 
 # ---- 回滚模式：unlock.sh restore ----
 if [ "${1:-install}" = "restore" ]; then
@@ -151,12 +153,11 @@ systemctl stop "$CORE_SVC" 2>/dev/null || true
 install -m 0755 "$DL/core" "$CORE_BIN"
 log "内核已安装 -> $CORE_BIN"
 
-# ---- 5) 写入根证书（core_settings 的 4 行）----
+# ---- 5) 写入根证书（core_settings 的 4 行；写之前会自动备份官方原值）----
 if [ -f "$XPACK_DB" ]; then
-  python3 "$WORK/tools/cert_store.py" --cert "$WORK/state/license.crt" \
-      --db "$XPACK_DB" --backup || true
+  python3 "$WORK/tools/cert_store.py" --cert "$WORK/state/license.crt" --db "$XPACK_DB"
 else
-  echo "!! 未找到 $XPACK_DB —— 面板还没初始化过。请先启动一次面板再重跑本脚本。"
+  die "未找到 $XPACK_DB —— 面板还没初始化过。请先启动一次面板再重跑本脚本。"
 fi
 
 systemctl start "$CORE_SVC" 2>/dev/null || true
@@ -191,6 +192,36 @@ fi
 python3 "$WORK/tools/gen_license.py" --edition enterprise --expires "$EXPIRES" \
     --nodes "$NODES" --assignee "$ASSIGNEE" --offline \
     --out "$WORK/license.txt" --apply
+
+# ---- 8) 自检：内核补丁 / 根证书行 / 授权签名，任一不过就报错退出 ----
+echo
+log "自检"
+python3 "$WORK/tools/patch_core.py" --verify --in "$CORE_BIN" | tail -n 4
+python3 "$WORK/tools/cert_store.py" --db "$XPACK_DB" --show | tail -n 4
+python3 - "$WORK/license.txt" <<'PY'
+import base64, json, pathlib, ssl, subprocess, sys, tempfile
+segs = pathlib.Path(sys.argv[1]).read_text().strip().split("-")
+if len(segs) < 3:
+    raise SystemExit("!! 授权段数不足 3（内容-签名-证书）")
+raw, sig, der = (base64.b64decode(s) for s in segs[:3])
+if sig == b"license-unsigned":
+    raise SystemExit("!! 授权未签名（第 2 段是占位符）—— 面板会判无效")
+tmp = tempfile.mkdtemp()
+for name, data in (("raw", raw), ("sig", sig), ("crt.pem", ssl.DER_cert_to_PEM_cert(der).encode())):
+    open(tmp + "/" + name, "wb").write(data)
+pub = subprocess.run(["openssl", "x509", "-in", tmp + "/crt.pem", "-pubkey", "-noout"],
+                     capture_output=True, check=True).stdout
+open(tmp + "/pub.pem", "wb").write(pub)
+r = subprocess.run(["openssl", "dgst", "-sha256", "-verify", tmp + "/pub.pem",
+                    "-signature", tmp + "/sig", tmp + "/raw"], capture_output=True)
+if r.returncode != 0:
+    raise SystemExit("!! 签名校验失败: %s" % r.stderr.decode().strip())
+d = json.loads(raw)
+print("   授权解析  : %s / %s / 到期 %s / 节点 %s" % (
+    d.get("licenseName"), (d.get("annotations") or {}).get("lxware.cn/edition"),
+    d["products"][0]["expiresAt"], d["products"][0]["maxNodeCount"]))
+print("   签名校验  : RSA-SHA256 通过")
+PY
 
 echo
 log "全部完成"
