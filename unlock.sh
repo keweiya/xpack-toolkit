@@ -395,6 +395,63 @@ PY
 }
 
 # ---------------------------------------------------------------------------
+# 1pctl 配置值保真
+# ---------------------------------------------------------------------------
+# 官方发行包里的 /usr/local/bin/1pctl 是「占位符模板」：BASE_DIR=directory、
+# ORIGINAL_PORT=port、ORIGINAL_ENTRANCE=entrance、ORIGINAL_USERNAME=username、
+# ORIGINAL_PASSWORD=password。官方 installer 安装时会用 sed 把这些占位符替换成
+# 用户真实配置。unlock.sh 升级时若直接覆盖 1pctl 而不回填，core 会去读
+# directory/1panel/tmp/.secret，agent 会把端口解析成字符串 "port"，两者都以
+# exit 2 崩溃。因此覆盖前先提取旧 1pctl 的配置值，覆盖后原样回填。
+CTL_CONFIG_KEYS="BASE_DIR ORIGINAL_PORT ORIGINAL_USERNAME ORIGINAL_PASSWORD ORIGINAL_ENTRANCE LANGUAGE PANEL_EDITION"
+
+extract_ctl_config() {
+  local SRC="$1" OUT="$2" KEY VALUE
+  [ -f "$SRC" ] || return 1
+  : > "$OUT"
+  while IFS='=' read -r KEY VALUE; do
+    case " $CTL_CONFIG_KEYS " in
+      *" $KEY "*) printf '%s=%s\n' "$KEY" "$VALUE" >> "$OUT" ;;
+    esac
+  done < "$SRC"
+  [ -s "$OUT" ]
+}
+
+apply_ctl_config() {
+  local SAVED="$1"
+  [ -f "$SAVED" ] || return 0
+  python3 - "$PANEL_CTL" "$SAVED" <<'PY'
+import re, sys
+ctl, saved = sys.argv[1], sys.argv[2]
+kv = {}
+for line in open(saved, encoding="utf-8", errors="replace"):
+    line = line.rstrip("\n")
+    if "=" in line:
+        k, v = line.split("=", 1)
+        kv[k] = v
+text = open(ctl, encoding="utf-8", errors="replace").read()
+def repl(m):
+    k = m.group(1)
+    return "%s=%s" % (k, kv[k]) if k in kv else m.group(0)
+open(ctl, "w", encoding="utf-8").write(re.sub(r"(?m)^([A-Z_][A-Z0-9_]*)=.*$", repl, text))
+PY
+}
+
+upgrade_1pctl() {
+  local SRCDIR="$1" CTL_CONFIG
+  [ -f "$SRCDIR/1pctl" ] || return 0
+  CTL_CONFIG="$(mktemp "${TMPDIR:-/tmp}/xpack-ctl.XXXXXX")"
+  if extract_ctl_config "$PANEL_CTL" "$CTL_CONFIG"; then
+    backup_binary "$PANEL_CTL" ctl
+    install -m 0755 "$SRCDIR/1pctl" "$PANEL_CTL"
+    apply_ctl_config "$CTL_CONFIG"
+  else
+    log "Could not read config from existing 1pctl; keeping it unchanged"
+  fi
+  rm -f "$CTL_CONFIG"
+}
+
+# ---------------------------------------------------------------------------
 # 3.1 官方 1Panel 升级（仅当 Release 版本较新时）
 # ---------------------------------------------------------------------------
 update_panel() {
@@ -414,7 +471,7 @@ update_panel() {
 
   install -m 0755 "$SRCDIR/1panel-core" "$CORE_BIN"
   install -m 0755 "$SRCDIR/1panel-agent" "$AGENT_BIN"
-  if [ -f "$SRCDIR/1pctl" ]; then install -m 0755 "$SRCDIR/1pctl" "$PANEL_CTL"; fi
+  upgrade_1pctl "$SRCDIR"
   if [ -f "$SRCDIR/GeoIP.mmdb" ]; then
     mkdir -p "$PANEL_ROOT/geo"
     install -m 0644 "$SRCDIR/GeoIP.mmdb" "$PANEL_ROOT/geo/GeoIP.mmdb"
@@ -451,6 +508,8 @@ if [ "$MODE" = restore ]; then
   [ -f "$AGENT_ORIG" ] && systemctl stop "$AGENT_SVC" 2>/dev/null || true
   install -m 0755 "$CORE_ORIG" "$CORE_BIN"
   [ -f "$AGENT_ORIG" ] && install -m 0755 "$AGENT_ORIG" "$AGENT_BIN"
+  CTL_ORIG="$BACKUP/1panel-ctl.previous"
+  [ -f "$CTL_ORIG" ] && install -m 0755 "$CTL_ORIG" "$PANEL_CTL"
   systemctl start "$CORE_SVC"
   [ -f "$AGENT_ORIG" ] && { systemctl start "$AGENT_SVC"; systemctl is-active --quiet "$AGENT_SVC"; }
   systemctl is-active --quiet "$CORE_SVC"
