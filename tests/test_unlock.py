@@ -1,7 +1,7 @@
 """Release-only installer tests. Every command and write uses temporary fixtures.
 
 Run: python3 -m unittest discover -s tests -p test_unlock.py -v
-Actual-tool smoke tests use only public tools and read-only build core originals.
+Actual-tool smoke tests use only public tools and read-only official build originals.
 No service, binary, database or signing key from a live installation is touched.
 """
 import hashlib
@@ -162,6 +162,11 @@ if name == "id":
 elif name == "uname":
     assert args in (["-s"], ["-m"])
     print(os.environ.get("TEST_OS", "Linux") if args == ["-s"] else os.environ.get("TEST_ARCH", "x86_64"))
+elif name in ("core", "1pctl"):
+    assert args == ["version"], "version detection attempted a non-version command"
+    assert sys.stdin.read() == "", "version command must receive DEVNULL stdin"
+    if os.environ.get("TEST_VERSIONFAIL"): raise SystemExit(4)
+    print("1Panel version: " + os.environ.get("TEST_VERSION", "v2.3.2"))
 elif name == "systemctl":
     op = args[0]; service = args[-1]
     assert service in (os.environ["CORE_SVC"], os.environ["AGENT_SVC"])
@@ -221,12 +226,15 @@ class Fixture:
                     "mode": "offline", "remote_base": "", "root_fingerprint": self.fp, "platforms": {}}
         self.originals = {}
         self.outputs = {}
+        self.agent_originals = {}
         for arch, machine in (("amd64", 62), ("arm64", 183)):
             head = bytearray(32); head[:6] = b"\x7fELF\x02\x01"
             struct.pack_into("<H", head, 18, machine)
             original = bytes(head) + b"a"*64 + b"b"*64 + b"ORIG" + URL_HK + URL_CN
             patched = bytes(head) + self.fp.encode()*2 + b"KEEP" + URL_HK + URL_CN
             self.set_core(arch, original, patched)
+            head[20:24] = b"ORIG"
+            self.set_agent(arch, bytes(head) + b"trusted official agent fixture")
         self.pack_runtime()
         self.write_api()
         self.panel = self.base / "panel"
@@ -240,12 +248,14 @@ class Fixture:
         self.core = self.base / "core"
         self.core.write_bytes(INITIAL_CORE)
         self.agent = self.base / "agent"
+        self.ctl = self.base / "1pctl"
+        self.ctl.write_text("#!/bin/sh\nORIGINAL_VERSION='v2.3.2'\n")
         self.work = self.base / "unlock-work"
         self.backup = self.base / "backup"
         self.events = self.base / "events"
         self.bin = self.base / "mock-bin"
         self.bin.mkdir()
-        for name in ("systemctl", "curl", "install", "id", "uname"):
+        for name in ("systemctl", "curl", "install", "id", "uname", "1pctl"):
             path = self.bin / name; path.write_text(MOCK_COMMAND); path.chmod(0o755)
         self.env = {"PATH": str(self.bin)+os.pathsep+os.defpath, "HOME": str(self.base),
                     "LANG": "C.UTF-8", "PYTHONDONTWRITEBYTECODE": "1",
@@ -257,14 +267,39 @@ class Fixture:
                     "EVENT_LOG": str(self.events), "MOCK_STATE": str(self.base), "FIXTURE_ROOT": str(self.base),
                     "CURL_MAP": str(self.downloads / "urls.json"), "REAL_INSTALL": shutil.which("install")}
 
+        self.env["PANEL_CTL"] = str(self.ctl)
+
     def set_core(self, arch, original, patched):
         self.originals[arch] = original; self.outputs[arch] = patched
         core = "core-linux-"+arch
         (self.assets / core).write_bytes(patched)
         (self.assets / (core+".orig")).write_bytes(original)
-        self.man["platforms"]["linux-"+arch] = {
+        self.man["platforms"].setdefault("linux-"+arch, {}).update({
             "os": "linux", "arch": arch, "patches": 3, "core_asset": core, "orig_asset": core+".orig",
-            "size": len(patched), "orig_size": len(original), "sha256": sha(patched), "orig_sha256": sha(original)}
+            "size": len(patched), "orig_size": len(original), "sha256": sha(patched), "orig_sha256": sha(original)})
+
+    def set_agent(self, arch, original):
+        self.agent_originals[arch] = original
+        asset = "agent-linux-"+arch+".orig"
+        (self.assets / asset).write_bytes(original)
+        self.man["platforms"]["linux-"+arch].update({
+            "agent_orig_asset": asset, "agent_orig_sha256": sha(original), "agent_orig_size": len(original)})
+
+    def installed_version(self, version):
+        with sqlite3.connect(self.panel / "db/core.db") as c:
+            c.execute("create table if not exists settings(key text,value text)")
+            c.execute("delete from settings where key='SystemVersion'")
+            c.execute("insert into settings values('SystemVersion',?)", (version,))
+
+    def executable_core(self):
+        self.core.write_text(MOCK_COMMAND)
+        self.core.chmod(0o755)
+
+    @staticmethod
+    def backup_file(path, data, checksum=None):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        Path(str(path)+".sha256").write_text((checksum or sha(data))+"  "+str(path)+"\n")
 
     def pack_runtime(self, files=None, symlink=None, duplicate=None):
         files = self.public if files is None else files
@@ -288,7 +323,7 @@ class Fixture:
 
     def write_api(self, releases=None):
         names = ("manifest.json", "runtime.tar.gz", "core-linux-amd64", "core-linux-amd64.orig",
-                 "core-linux-arm64", "core-linux-arm64.orig")
+                 "core-linux-arm64", "core-linux-arm64.orig", "agent-linux-amd64.orig", "agent-linux-arm64.orig")
         assets = [{"name": name, "browser_download_url": self.asset_url(name)} for name in names]
         if releases is None:
             releases = [{"tag_name": "core-v9.9.9", "draft": True, "assets": assets},
@@ -306,7 +341,8 @@ class Fixture:
         return "https://github.com/fixture/xpack/releases/download/core-v2.3.2/"+name
 
     def run(self, mode="install", piped=False, **env):
-        args = ["bash", "-s", "--", mode] if piped else ["bash", str(self.script), mode]
+        args = ["bash", "-s", "--"] if piped else ["bash", str(self.script)]
+        if mode is not None: args.append(mode)
         return subprocess.run(args, input=self.script.read_text() if piped else None,
                               cwd=self.base, env={**self.env, **env}, capture_output=True, text=True, timeout=120)
 
@@ -329,16 +365,17 @@ class UnlockTests(unittest.TestCase):
     def ok(self, result):
         self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
 
-    def before_stop(self, result, before_code=False):
+    def before_stop(self, result, before_code=False, original=INITIAL_CORE):
         self.assertNotEqual(result.returncode, 0, result.stdout+result.stderr)
         self.assertNotIn("systemctl stop", self.f.log())
-        self.assertEqual(self.f.core.read_bytes(), INITIAL_CORE)
+        self.assertEqual(self.f.core.read_bytes(), original)
         self.assertNotIn("CURL_MISTAKE", self.f.log())
         if before_code: self.assertNotIn("code ", self.f.log())
 
-    def assert_downloads(self, arch, repetitions=1):
+    def assert_downloads(self, arch, repetitions=1, agent=False):
         expected = [API_URL] + [self.f.asset_url(name) for name in
                                ("manifest.json", "runtime.tar.gz", "core-linux-"+arch, "core-linux-"+arch+".orig")]
+        if agent: expected.append(self.f.asset_url("agent-linux-"+arch+".orig"))
         self.assertEqual(self.f.urls(), expected*repetitions)
         self.assertNotIn("CURL_MISTAKE", self.f.log())
         self.assertNotIn("license.key", "\n".join(self.f.urls()))
@@ -399,6 +436,77 @@ class UnlockTests(unittest.TestCase):
         self.assertIn("preserving the installed arm64 agent", result.stdout)
         self.ok(self.f.run("verify", TEST_ARCH="aarch64", FAIL_CURL="1"))
         self.assert_downloads("arm64")
+
+    def test_auto_version_no_argument_piped_install_matches_database_version(self):
+        self.f.installed_version("v2.3.2")
+        self.f.executable_core()
+        before_db = (self.f.panel / "db/core.db").read_bytes()
+        self.ok(self.f.run(mode=None, piped=True, VERSION="", TEST_VERSIONFAIL="1"))
+        self.assertNotIn("core version", self.f.log())
+        self.assertEqual((self.f.panel / "db/core.db").read_bytes(), before_db)
+        self.assert_downloads("amd64")
+
+    def test_auto_version_core_command_official_output_and_closed_stdin(self):
+        self.f.executable_core()
+        self.f.ctl.unlink()
+        self.ok(self.f.run(mode=None, piped=True, VERSION="", TEST_VERSION="v2.3.2"))
+        self.assertEqual(self.f.log().count("core version"), 1)
+        self.assertNotIn("1pctl version", self.f.log())
+        self.assert_downloads("amd64")
+
+    def test_auto_version_literal_control_file_fallback_without_execution(self):
+        marker = self.f.base / "control-executed"
+        self.f.ctl.write_text("#!/bin/sh\nORIGINAL_VERSION='v2.3.2'\ntouch " + str(marker) + "\n")
+        self.f.ctl.chmod(0o755)
+        self.ok(self.f.run(VERSION=""))
+        self.assertFalse(marker.exists())
+        self.assertNotIn("1pctl version", self.f.log())
+        self.assert_downloads("amd64")
+
+    def test_auto_version_failed_core_command_falls_back_to_literal(self):
+        self.f.executable_core()
+        self.ok(self.f.run(VERSION="", TEST_VERSIONFAIL="1"))
+        self.assertEqual(self.f.log().count("core version"), 1)
+        self.assert_downloads("amd64")
+
+    def test_auto_version_absent_release_never_guesses_latest(self):
+        self.f.installed_version("v2.3.4")
+        self.before_stop(self.f.run(mode=None, piped=True, VERSION=""), before_code=True)
+        self.assertEqual(self.f.urls(), [API_URL])
+
+    def test_unknown_version_fails_before_network_and_service(self):
+        self.f.ctl.write_text("#!/bin/sh\nORIGINAL_VERSION='unknown'\n")
+        self.before_stop(self.f.run(VERSION=""), before_code=True)
+        self.assertEqual(self.f.urls(), [])
+        self.assertFalse(self.f.work.exists())
+
+    def test_version_control_file_injection_is_never_executed_or_sourced(self):
+        marker = self.f.base / "injected"
+        self.f.ctl.write_text("#!/bin/sh\nORIGINAL_VERSION=$(touch " + str(marker) + "; echo v2.3.2)\n")
+        self.f.ctl.chmod(0o755)
+        self.before_stop(self.f.run(VERSION=""), before_code=True)
+        self.assertFalse(marker.exists())
+        self.assertEqual(self.f.urls(), [])
+        self.assertNotIn("1pctl version", self.f.log())
+
+    def test_explicit_version_strict_validation_precedes_network(self):
+        for version in ("latest", "v2.3", "vv2.3.2", "v2.3.2;echo injected", "2.3.2/../other"):
+            with self.subTest(version=version):
+                self.f.events.unlink(missing_ok=True)
+                self.before_stop(self.f.run(VERSION=version), before_code=True)
+                self.assertEqual(self.f.urls(), [])
+
+    def test_install_retains_apps_database_and_unrelated_backup(self):
+        app = self.f.panel / "apps/example/data"
+        app.mkdir(parents=True)
+        sentinel = app / "keep.txt"; sentinel.write_bytes(b"application data")
+        self.f.installed_version("v2.3.2")
+        db_bytes = (self.f.panel / "db/core.db").read_bytes()
+        other = self.f.base / "legacy-tool.bak"; other.write_bytes(b"unrelated backup")
+        self.ok(self.f.run(VERSION=""))
+        self.assertEqual(sentinel.read_bytes(), b"application data")
+        self.assertEqual((self.f.panel / "db/core.db").read_bytes(), db_bytes)
+        self.assertEqual(other.read_bytes(), b"unrelated backup")
 
     def test_linux_and_unsupported_arch_rejected_before_stop(self):
         for override in ({"TEST_OS": "Darwin"}, {"TEST_ARCH": "mips64"}, {"TEST_ARCH": "armv7l"},
@@ -562,16 +670,154 @@ class UnlockTests(unittest.TestCase):
                 self.before_stop(self.f.run(LICENSE_FILE=str(issued)))
 
     def test_amd64_agent_repeat_and_restore(self):
-        self.f.agent.write_bytes(b"\x00"*20+b"ORIG")
+        self.f.agent.write_bytes(b"dirty installed agent with no backup")
         self.ok(self.f.run()); self.ok(self.f.run())
-        self.assertEqual(self.f.agent.read_bytes()[20:24], b"KEEP")
+        self.assertEqual(self.f.agent.read_bytes(), self.f.agent_originals["amd64"].replace(b"ORIG", b"KEEP"))
+        self.assertEqual((self.f.backup / "1panel-agent.orig").read_bytes(), self.f.agent_originals["amd64"])
+        self.assert_downloads("amd64", 2, agent=True)
+        before = self.f.urls()
         self.ok(self.f.run("restore", FAIL_CURL="1"))
-        self.assertEqual(self.f.agent.read_bytes()[20:24], b"ORIG")
+        self.assertEqual(self.f.agent.read_bytes(), self.f.agent_originals["amd64"])
+        self.assertEqual(self.f.urls(), before)
+
+    def test_dirty_installed_core_agent_and_backups_replaced_with_quarantine(self):
+        dirty_core = self.f.outputs["amd64"]
+        dirty_agent = self.f.agent_originals["amd64"].replace(b"ORIG", b"KEEP")
+        self.f.core.write_bytes(dirty_core); self.f.agent.write_bytes(dirty_agent)
+        old_sums = {}
+        for name, dirty in (("core", dirty_core), ("agent", dirty_agent)):
+            canonical = self.f.backup / ("1panel-"+name+".orig")
+            self.f.backup_file(canonical, dirty)
+            old_sums[name] = Path(str(canonical)+".sha256").read_bytes()
+        self.ok(self.f.run())
+        for name, original, dirty in (("core", self.f.originals["amd64"], dirty_core),
+                                      ("agent", self.f.agent_originals["amd64"], dirty_agent)):
+            canonical = self.f.backup / ("1panel-"+name+".orig")
+            quarantine = self.f.backup / ("1panel-"+name+".invalid."+sha(dirty)+".orig")
+            self.assertEqual(canonical.read_bytes(), original)
+            self.assertEqual(quarantine.read_bytes(), dirty)
+            self.assertEqual(Path(str(quarantine)+".sha256").read_bytes(), old_sums[name])
+            self.assertEqual((self.f.backup / ("1panel-"+name+"."+sha(original)+".orig")).read_bytes(), original)
+        self.assertEqual(self.f.core.read_bytes(), self.f.outputs["amd64"])
+        self.assertEqual(self.f.agent.read_bytes(), dirty_agent)
+        self.assert_downloads("amd64", agent=True)
+
+    def test_wrong_checksum_official_canonical_repaired_for_core_and_agent(self):
+        self.f.agent.write_bytes(b"dirty agent")
+        for name, original in (("core", self.f.originals["amd64"]),
+                                ("agent", self.f.agent_originals["amd64"])):
+            self.f.backup_file(self.f.backup / ("1panel-"+name+".orig"), original, checksum="0"*64)
+        self.ok(self.f.run())
+        for name, original in (("core", self.f.originals["amd64"]),
+                                ("agent", self.f.agent_originals["amd64"])):
+            canonical = self.f.backup / ("1panel-"+name+".orig")
+            self.assertTrue((self.f.backup / ("1panel-"+name+".invalid."+sha(original)+".orig")).is_file())
+            self.assertTrue(Path(str(canonical)+".sha256").read_text().startswith(sha(original)+" "))
+
+    def test_valid_first_canonical_retained_and_current_checksum_variant_saved(self):
+        self.f.agent.write_bytes(b"dirty agent")
+        historical = {"core": self.f.originals["amd64"]+b"historical original core",
+                      "agent": self.f.agent_originals["amd64"]+b"historical original agent"}
+        for name, original in historical.items():
+            self.f.backup_file(self.f.backup / ("1panel-"+name+".orig"), original)
+        self.ok(self.f.run())
+        for name, current in (("core", self.f.originals["amd64"]),
+                               ("agent", self.f.agent_originals["amd64"])):
+            self.assertEqual((self.f.backup / ("1panel-"+name+".orig")).read_bytes(), historical[name])
+            self.assertEqual((self.f.backup / ("1panel-"+name+"."+sha(current)+".orig")).read_bytes(), current)
+            self.assertEqual(list(self.f.backup.glob("1panel-"+name+".invalid.*.orig")), [])
+
+    def test_agent_trusted_sha_size_and_elf_fail_before_service_stop(self):
+        self.f.agent.write_bytes(b"dirty installed agent")
+        original = self.f.agent_originals["amd64"]
+        platform = dict(self.f.man["platforms"]["linux-amd64"])
+        for variant in ("sha", "size", "elf", "already-patched"):
+            with self.subTest(variant=variant):
+                self.f.man["platforms"]["linux-amd64"] = dict(platform)
+                raw = original
+                if variant == "sha": raw = original+b"corrupt"
+                if variant == "size": self.f.man["platforms"]["linux-amd64"]["agent_orig_size"] = len(original)+1
+                if variant == "elf":
+                    raw = bytearray(original); struct.pack_into("<H", raw, 18, 183); raw = bytes(raw)
+                    self.f.set_agent("amd64", raw)
+                if variant == "already-patched":
+                    raw = original.replace(b"ORIG", b"KEEP"); self.f.set_agent("amd64", raw)
+                (self.f.assets / "agent-linux-amd64.orig").write_bytes(raw)
+                self.f.write_manifest(); self.f.events.unlink(missing_ok=True)
+                self.before_stop(self.f.run())
+                self.assertEqual(self.f.agent.read_bytes(), b"dirty installed agent")
+                self.assertNotIn("systemctl stop fixture-agent", self.f.log())
+
+    def test_missing_agent_release_asset_is_not_guessed(self):
+        self.f.agent.write_bytes(b"dirty agent")
+        releases = self.f.write_api()
+        release = releases[-1]
+        release["assets"] = [a for a in release["assets"] if a["name"] != "agent-linux-amd64.orig"]
+        self.f.write_api([release])
+        self.before_stop(self.f.run(), before_code=True)
+        self.assertEqual(self.f.urls(), [API_URL])
+
+    def test_agent_manifest_names_and_missing_metadata_rejected_before_code(self):
+        self.f.agent.write_bytes(b"dirty agent")
+        platform = dict(self.f.man["platforms"]["linux-amd64"])
+        for key in ("agent_orig_asset", "agent_orig_sha256", "agent_orig_size"):
+            with self.subTest(key=key):
+                self.f.man["platforms"]["linux-amd64"] = dict(platform)
+                self.f.man["platforms"]["linux-amd64"].pop(key)
+                self.f.write_manifest(); self.f.events.unlink(missing_ok=True)
+                self.before_stop(self.f.run(), before_code=True)
+
+    def test_skip_agent_retains_actual_file_without_extra_download(self):
+        self.f.agent.write_bytes(b"skip this installed agent")
+        self.ok(self.f.run(SKIP_AGENT="1"))
+        self.assertEqual(self.f.agent.read_bytes(), b"skip this installed agent")
+        self.assertNotIn("systemctl stop fixture-agent", self.f.log())
+        self.assertFalse((self.f.backup / "1panel-agent.orig").exists())
+        self.assert_downloads("amd64")
+
+    def test_agent_path_directory_does_not_trigger_download(self):
+        self.f.agent.mkdir()
+        self.ok(self.f.run())
+        self.assertTrue(self.f.agent.is_dir())
+        self.assert_downloads("amd64")
+
+    def test_local_artifact_install_agent_uses_verified_fresh_original_no_network(self):
+        self.f.agent.write_bytes(b"dirty installed agent")
+        self.ok(self.f.run(ARTIFACT_DIR=str(self.f.assets), FAIL_CURL="1"))
+        self.assertEqual(self.f.agent.read_bytes(), self.f.agent_originals["amd64"].replace(b"ORIG", b"KEEP"))
+        self.assertEqual(self.f.urls(), [])
+
+    def test_local_artifact_auto_version_mismatch_fails_before_code_and_stop(self):
+        self.f.installed_version("v2.3.4")
+        self.before_stop(self.f.run(VERSION="", ARTIFACT_DIR=str(self.f.assets)), before_code=True)
+        self.assertEqual(self.f.urls(), [])
+
+    def test_restore_skips_bad_first_backup_and_accepts_valid_hash_variant(self):
+        self.f.agent.write_bytes(b"dirty agent")
+        self.ok(self.f.run())
+        before = self.f.urls()
+        for name in ("core", "agent"):
+            (self.f.backup / ("1panel-"+name+".orig")).write_bytes(b"bad first backup")
+        self.ok(self.f.run("restore", VERSION="", FAIL_CURL="1"))
+        self.assertEqual(self.f.core.read_bytes(), self.f.originals["amd64"])
+        self.assertEqual(self.f.agent.read_bytes(), self.f.agent_originals["amd64"])
+        self.assertEqual(self.f.urls(), before)
+
+    def test_restore_skips_bad_candidates_and_accepts_legacy_backup_directory(self):
+        self.ok(self.f.run())
+        canonical = self.f.backup / "1panel-core.orig"
+        self.f.backup_file(canonical, self.f.originals["amd64"], checksum="0"*64)
+        self.f.backup_file(self.f.backup / "core.orig", b"nonofficial alias")
+        self.f.backup_file(self.f.panel / "backup/1panel-core.orig", self.f.originals["amd64"])
+        for variant in self.f.backup.glob("1panel-core.*.orig"): variant.unlink()
+        self.ok(self.f.run("restore", FAIL_CURL="1"))
+        self.assertEqual(self.f.core.read_bytes(), self.f.originals["amd64"])
 
     def test_legacy_url_patcher_and_corrupt_restore_fail(self):
         self.before_stop(self.f.run(LEGACY_PATCHER="1"))
         self.ok(self.f.run())
         (self.f.backup / "1panel-core.orig").write_bytes(self.f.originals["amd64"]+b"tampered")
+        for variant in self.f.backup.glob("1panel-core.*.orig"): variant.unlink()
         before = self.f.log().count("systemctl stop")
         result = self.f.run("restore", FAIL_CURL="1")
         self.assertNotEqual(result.returncode, 0)
@@ -608,8 +854,33 @@ class UnlockTests(unittest.TestCase):
                     c.execute("create table licenses(id integer primary key,created_at text,updated_at text,"+
                               ",".join('"%s" text' % name for name in fields.split())+")")
                 (f.panel / "db/.serial").write_text("fixture-device-not-live")
+                real_agent = None
+                if arch == "amd64":
+                    official_agent = ROOT / "build/release-v2.3.2/agent-linux-amd64.orig"
+                    self.assertTrue(official_agent.is_file(), "Fresh official agent release fixture is required")
+                    real_agent = official_agent.read_bytes()
+                    f.set_agent(arch, real_agent); f.write_manifest()
+                    agent_patch = subprocess.run([sys.executable, str(tools / "patch_agent.py"), "--patch",
+                                                  "--in", str(f.assets / "agent-linux-amd64.orig"),
+                                                  "--out", str(f.agent), "--orig", str(f.assets / "agent-linux-amd64.orig"),
+                                                  "--manifest", str(f.base / "local-agent-patch.json")],
+                                                 env=f.env, capture_output=True, text=True, timeout=120)
+                    self.ok(agent_patch)
+                    dirty_agent = f.agent.read_bytes()
+                    f.backup_file(f.backup / "1panel-agent.orig", dirty_agent)
                 self.ok(f.run(NODES="43", EXPIRES="2036-01-01"))
+                if real_agent is not None:
+                    self.assertEqual(sha((f.backup / "1panel-agent.orig").read_bytes()), sha(real_agent))
+                    self.assertEqual(sha((f.backup / ("1panel-agent.invalid."+sha(dirty_agent)+".orig")).read_bytes()),
+                                     sha(dirty_agent))
+                    self.assertEqual(sha(f.agent.read_bytes()), sha(dirty_agent))
+                    f.agent.write_bytes(b"unrecognized previous tool agent")
+                    f.backup_file(f.backup / "1panel-agent.orig", b"unrecognized previous tool backup")
                 self.ok(f.run(NODES="44", EXPIRES="2037-01-01"))
+                if real_agent is not None:
+                    self.assertEqual(sha(f.agent.read_bytes()), sha(dirty_agent))
+                    self.assertEqual(sha((f.backup / "1panel-agent.orig").read_bytes()), sha(real_agent))
+                    self.assertEqual(sum(url.endswith("/agent-linux-amd64.orig") for url in f.urls()), 2)
                 with sqlite3.connect(f.db) as c: license_id = c.execute("select id from licenses").fetchone()[0]
                 issued = f.last_license()
                 (f.state / "license.key").unlink()
@@ -653,6 +924,7 @@ else: raise AssertionError("Modified RSA signature accepted")
                 self.ok(f.run("restore", FAIL_CURL="1"))
                 self.assertEqual(f.urls(), before)
                 self.assertEqual(sha(f.core.read_bytes()), sha(original))
+                if real_agent is not None: self.assertEqual(sha(f.agent.read_bytes()), sha(real_agent))
 
 
 if __name__ == "__main__":

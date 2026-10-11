@@ -5,6 +5,7 @@ import argparse
 import datetime
 import gzip
 import hashlib
+import importlib.util
 import io
 import json
 import os
@@ -140,25 +141,57 @@ def cached_package(base, filename, expected, cache_dir):
             temporary.unlink(missing_ok=True)
 
 
-def extract_core(package, destination, arch):
-    """Copy only the unique regular core member; never extract archive paths."""
+def stage_package(package, destination, expected):
+    """Extract only from a private copy rehashed against current official checksums."""
+    if package.is_symlink() or not package.is_file():
+        raise ReleaseError("official package must be a regular file: " + str(package))
+    shutil.copyfile(package, destination)
+    if sha256(destination) != expected:
+        raise ReleaseError("staged official package SHA-256 mismatch: " + package.name)
+    return destination
+
+
+def extract_binary(package, destination, arch, binary):
+    """Copy only a unique regular binary member; never extract archive paths."""
     with tarfile.open(package, "r:gz") as archive:
         candidates = [member for member in archive.getmembers()
-                      if PurePosixPath(member.name).name == "1panel-core"]
+                      if PurePosixPath(member.name).name == binary]
         if len(candidates) != 1 or not candidates[0].isfile():
-            raise ReleaseError("official archive requires one regular 1panel-core")
+            raise ReleaseError("official archive requires one regular " + binary)
         member = candidates[0]
         name = PurePosixPath(member.name)
         if name.is_absolute() or ".." in name.parts or member.size <= 0:
-            raise ReleaseError("invalid core archive member")
+            raise ReleaseError("invalid " + binary + " archive member")
         with archive.extractfile(member) as source, destination.open("wb") as target:
             shutil.copyfileobj(source, target, length=1024 * 1024)
     with destination.open("rb") as source:
         header = source.read(20)
     if (len(header) != 20 or header[:6] != b"\x7fELF\x02\x01"
             or struct.unpack_from("<H", header, 18)[0] != ELF_MACHINES[arch]):
-        raise ReleaseError("official core ELF architecture mismatch: " + arch)
+        raise ReleaseError("official " + binary + " ELF architecture mismatch: " + arch)
     destination.chmod(0o755)
+
+
+def extract_core(package, destination, arch):
+    extract_binary(package, destination, arch, "1panel-core")
+
+
+def extract_agent(package, destination, arch):
+    extract_binary(package, destination, arch, "1panel-agent")
+
+
+def verify_agent_original(path, arch):
+    if arch != "amd64":
+        return
+    spec = importlib.util.spec_from_file_location("xpack_release_agent", ROOT / "tools/patch_agent.py")
+    agent = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(agent)
+    sites = agent.locate(path.read_bytes())
+    if len(sites) != 8 or len({name for name, _, _, _ in sites}) != 8:
+        raise ReleaseError("official amd64 agent requires exactly eight known original patch sites")
+    bad = [name + ":" + state for name, _, state, _ in sites if state != "original"]
+    if bad:
+        raise ReleaseError("official amd64 agent is not pristine: " + ", ".join(bad))
 
 
 def command(args, *, env=None, capture=False):
@@ -226,9 +259,12 @@ def verify_runtime(path, files):
 def build_platform(version, arch, package, work, assets):
     work.mkdir()
     original = work / "core.orig"
+    agent_original = work / "agent.orig"
     patched = work / "core"
     patch_manifest = work / "patches.json"
     extract_core(package, original, arch)
+    extract_agent(package, agent_original, arch)
+    verify_agent_original(agent_original, arch)
     environment = os.environ.copy()
     environment["SIGN_CRT"] = str(ROOT / "state/license.crt")
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
@@ -252,13 +288,18 @@ def build_platform(version, arch, package, work, assets):
         raise ReleaseError("unexpected fresh offline patch manifest for " + arch)
     core_asset = "core-linux-" + arch
     orig_asset = core_asset + ".orig"
+    agent_orig_asset = "agent-linux-" + arch + ".orig"
     shutil.copyfile(patched, assets / core_asset)
     shutil.copyfile(original, assets / orig_asset)
+    shutil.copyfile(agent_original, assets / agent_orig_asset)
     (assets / core_asset).chmod(0o755)
     (assets / orig_asset).chmod(0o755)
+    (assets / agent_orig_asset).chmod(0o755)
     return {"arch": arch, "os": "linux", "size": patched.stat().st_size,
             "sha256": sha256(patched), "orig_sha256": sha256(original),
-            "core_asset": core_asset, "orig_asset": orig_asset, "patches": len(patches)}
+            "core_asset": core_asset, "orig_asset": orig_asset, "patches": len(patches),
+            "agent_orig_asset": agent_orig_asset, "agent_orig_sha256": sha256(agent_original),
+            "agent_orig_size": agent_original.stat().st_size}
 
 
 def source_commit():
@@ -298,6 +339,7 @@ def build_release(args):
             print("Building {} / linux-{}".format(args.version, arch), flush=True)
             filename = "1panel-{}-linux-{}.tar.gz".format(args.version, arch)
             package = cached_package(base, filename, expected[arch], args.cache_dir)
+            package = stage_package(package, stage / filename, expected[arch])
             manifest["platforms"]["linux-" + arch] = build_platform(
                 args.version, arch, package, stage / arch, assets)
         manifest["runtime"] = build_runtime(assets / "runtime.tar.gz", files)
@@ -305,7 +347,8 @@ def build_release(args):
         output.mkdir(exist_ok=True)
         names = ["manifest.json", "runtime.tar.gz"]
         for arch in args.arches:
-            names.extend(["core-linux-" + arch, "core-linux-" + arch + ".orig"])
+            names.extend(["core-linux-" + arch, "core-linux-" + arch + ".orig",
+                          "agent-linux-" + arch + ".orig"])
         # Replace only our named assets after the entire release has built successfully.
         for name in names:
             target = output / name

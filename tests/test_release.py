@@ -20,6 +20,9 @@ ROOT = Path(__file__).resolve().parent.parent
 SPEC = importlib.util.spec_from_file_location("xpack_release", ROOT / "tools/release.py")
 release = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(release)
+AGENT_SPEC = importlib.util.spec_from_file_location("xpack_release_agent_test", ROOT / "tools/patch_agent.py")
+agent = importlib.util.module_from_spec(AGENT_SPEC)
+AGENT_SPEC.loader.exec_module(agent)
 
 
 def completed(returncode=0, stdout="", stderr=""):
@@ -95,10 +98,25 @@ class ReleaseTests(unittest.TestCase):
                 release.public_runtime()
 
     @staticmethod
-    def core_archive(path, names, arch="amd64"):
+    def elf_header(arch):
         header = bytearray(20)
         header[:6] = b"\x7fELF\x02\x01"
         struct.pack_into("<H", header, 18, release.ELF_MACHINES[arch])
+        return bytes(header)
+
+    @classmethod
+    def original_agent(cls, arch="amd64"):
+        if arch == "arm64":
+            return cls.elf_header(arch) + b"official arm64 agent"
+        data = bytearray(max(offset + len(original) for _, offset, original, _, _ in agent.PATCHES))
+        data[:20] = cls.elf_header(arch)
+        for _, offset, original, _, _ in agent.PATCHES:
+            data[offset:offset + len(original)] = original
+        return bytes(data)
+
+    @classmethod
+    def core_archive(cls, path, names, arch="amd64"):
+        header = cls.elf_header(arch)
         with tarfile.open(path, "w:gz") as archive:
             for name in names:
                 member = tarfile.TarInfo(name)
@@ -119,6 +137,77 @@ class ReleaseTests(unittest.TestCase):
             self.core_archive(archive, ("package/1panel-core",))
             release.extract_core(archive, root / "core", "amd64")
             self.assertEqual((root / "core").stat().st_size, 20)
+
+    def test_agent_archive_traversal_duplicate_and_wrong_arch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive = root / "official.tar.gz"
+            destination = root / "agent"
+            for names in (("../1panel-agent",), ("/1panel-agent",),
+                          ("package/../1panel-agent",), ("a/1panel-agent", "b/1panel-agent"),
+                          ("package/1panel-core",)):
+                self.core_archive(archive, names)
+                with self.assertRaises(release.ReleaseError):
+                    release.extract_agent(archive, destination, "amd64")
+            self.core_archive(archive, ("package/1panel-agent",), "arm64")
+            with self.assertRaises(release.ReleaseError):
+                release.extract_agent(archive, destination, "amd64")
+            for kind in (tarfile.SYMTYPE, tarfile.LNKTYPE, tarfile.DIRTYPE):
+                with tarfile.open(archive, "w:gz") as stream:
+                    member = tarfile.TarInfo("package/1panel-agent")
+                    member.type = kind
+                    member.linkname = "1panel-core"
+                    stream.addfile(member)
+                with self.assertRaises(release.ReleaseError):
+                    release.extract_agent(archive, destination, "amd64")
+            for header in (b"", b"not an ELF", b"\x7fELF\x01\x01" + b"\0" * 14,
+                           b"\x7fELF\x02\x02" + b"\0" * 14):
+                with tarfile.open(archive, "w:gz") as stream:
+                    member = tarfile.TarInfo("package/1panel-agent")
+                    member.size = len(header)
+                    stream.addfile(member, io.BytesIO(header))
+                with self.assertRaises(release.ReleaseError):
+                    release.extract_agent(archive, destination, "amd64")
+            self.core_archive(archive, ("package/1panel-agent",), "arm64")
+            release.extract_agent(archive, destination, "arm64")
+            self.assertEqual(destination.read_bytes(), self.elf_header("arm64"))
+            self.assertEqual(destination.stat().st_mode & 0o777, 0o755)
+
+    def test_amd64_agent_requires_all_eight_original_sites(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "agent"
+            original = self.original_agent()
+            path.write_bytes(original)
+            release.verify_agent_original(path, "amd64")
+            for name, offset, before, after, _ in agent.PATCHES:
+                for state, replacement in (("patched", after), ("unknown", b"\xff" * len(before))):
+                    with self.subTest(site=name, state=state):
+                        modified = bytearray(original)
+                        modified[offset:offset + len(before)] = replacement
+                        path.write_bytes(modified)
+                        with self.assertRaisesRegex(release.ReleaseError, name + ":" + state):
+                            release.verify_agent_original(path, "amd64")
+            path.write_bytes(self.original_agent("arm64"))
+            with mock.patch.object(release.importlib.util, "spec_from_file_location") as load:
+                release.verify_agent_original(path, "arm64")
+                load.assert_not_called()
+
+    def test_stage_package_rehashes_and_preserves_cache(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cached = root / "official.tar.gz"
+            cached.write_bytes(b"official cache bytes")
+            expected = release.sha256(cached)
+            staged = root / "staged.tar.gz"
+            self.assertEqual(release.stage_package(cached, staged, expected), staged)
+            self.assertEqual(staged.read_bytes(), cached.read_bytes())
+            with self.assertRaises(release.ReleaseError):
+                release.stage_package(cached, staged, "0" * 64)
+            self.assertEqual(cached.read_bytes(), b"official cache bytes")
+            link = root / "symlink.tar.gz"
+            link.symlink_to(cached)
+            with self.assertRaises(release.ReleaseError):
+                release.stage_package(link, staged, expected)
 
     def test_gh_existing_and_confirmed_404(self):
         with mock.patch.object(release.subprocess, "run", return_value=completed(stdout='{"tagName":"core-v2.3.2"}')) as run:
@@ -144,8 +233,12 @@ class ReleaseTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             manifest = root / "manifest.json"
-            manifest.write_text(json.dumps({"platforms": {"linux-amd64": {}}}))
-            assets = [manifest, root / "runtime.tar.gz", root / "core-linux-amd64", root / "core-linux-amd64.orig"]
+            manifest.write_text(json.dumps({"platforms": {"linux-amd64": {}, "linux-arm64": {}}}))
+            assets = [manifest, root / "runtime.tar.gz"]
+            for arch in release.SUPPORTED_ARCHES:
+                assets.extend(root / name for name in ("core-linux-" + arch,
+                              "core-linux-" + arch + ".orig", "agent-linux-" + arch + ".orig"))
+            self.assertEqual(len(assets), 8)
             with mock.patch.object(release.shutil, "which", return_value="/fixture/gh"), \
                     mock.patch.object(release, "github_release_exists", return_value=True), \
                     mock.patch.object(release, "command", return_value=completed()) as run:
@@ -159,7 +252,7 @@ class ReleaseTests(unittest.TestCase):
             self.assertNotIn("--clobber", commands[1])
             self.assertIn("--latest", commands[1])
             self.assertIn("linux-amd64", commands[1][commands[1].index("--notes") + 1])
-            self.assertNotIn("arm64", commands[1][commands[1].index("--notes") + 1])
+            self.assertIn("linux-arm64", commands[1][commands[1].index("--notes") + 1])
 
     def test_publish_only_after_successful_build(self):
         with mock.patch.object(release, "build_release", side_effect=release.ReleaseError("second arch failed")), \
@@ -173,16 +266,77 @@ class ReleaseTests(unittest.TestCase):
             self.assertEqual(release.main(["--version", "v2.3.2", "--publish", "--repo", "owner/repo"]), 0)
         self.assertEqual(order, ["all-built", "publish"])
 
+    def test_release_outputs_all_eight_assets_and_stages_official_packages(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cache = root / "cache"
+            cache.mkdir()
+            checksums = []
+            originals = {}
+            for arch in release.SUPPORTED_ARCHES:
+                filename = "1panel-v2.3.2-linux-" + arch + ".tar.gz"
+                path = cache / filename
+                path.write_bytes(("official archive " + arch).encode())
+                checksums.append(release.sha256(path) + "  " + filename)
+                originals[arch] = path
+            args = argparse.Namespace(version="v2.3.2", arches=release.SUPPORTED_ARCHES,
+                                      cache_dir=cache, output=root / "output")
+            stages = []
+
+            def platform(version, arch, package, work, assets):
+                self.assertNotEqual(package, originals[arch])
+                self.assertEqual(package.read_bytes(), originals[arch].read_bytes())
+                self.assertEqual(package.parent, work.parent)
+                stages.append(package)
+                core = "core-linux-" + arch
+                agent_orig = "agent-linux-" + arch + ".orig"
+                for name in (core, core + ".orig", agent_orig):
+                    (assets / name).write_bytes(name.encode())
+                return {"core_asset": core, "orig_asset": core + ".orig",
+                        "agent_orig_asset": agent_orig, "agent_orig_sha256": release.sha256(assets / agent_orig),
+                        "agent_orig_size": (assets / agent_orig).stat().st_size}
+
+            with mock.patch.object(release, "official_checksums", return_value=("https://example.invalid", "\n".join(checksums))), \
+                    mock.patch.object(release, "build_platform", side_effect=platform), \
+                    mock.patch.object(release.urllib.request, "urlopen") as network:
+                assets = release.build_release(args)
+                network.assert_not_called()
+            self.assertEqual(len(assets), 8)
+            self.assertEqual({path.name for path in assets}, {
+                "manifest.json", "runtime.tar.gz", "core-linux-amd64", "core-linux-amd64.orig",
+                "core-linux-arm64", "core-linux-arm64.orig", "agent-linux-amd64.orig", "agent-linux-arm64.orig"})
+            manifest = json.loads((args.output / "manifest.json").read_text())
+            self.assertEqual(manifest["schema_version"], 2)
+            self.assertEqual(set(manifest["platforms"]), {"linux-amd64", "linux-arm64"})
+            self.assertTrue(all(path.is_file() for path in assets))
+            self.assertTrue(all(not path.exists() for path in stages))
+            with mock.patch.object(release, "official_checksums", return_value=("https://example.invalid", "\n".join(checksums))), \
+                    mock.patch.object(release, "cached_package", return_value=originals["arm64"]), \
+                    mock.patch.object(release, "build_platform") as build:
+                with self.assertRaisesRegex(release.ReleaseError, "staged official package SHA-256 mismatch"):
+                    release.build_release(args)
+                build.assert_not_called()
+            self.assertEqual(json.loads((args.output / "manifest.json").read_text()), manifest)
+
     def test_platforms_have_independent_workdirs_and_names(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             assets = root / "assets"
             assets.mkdir()
             workdirs = []
+            extract_core = release.extract_core
+            for arch in release.SUPPORTED_ARCHES:
+                with tarfile.open(root / (arch + ".tar.gz"), "w:gz") as archive:
+                    binaries = {"1panel-core": self.elf_header(arch) + (arch + " original").encode(),
+                                "1panel-agent": self.original_agent(arch)}
+                    for name, data in binaries.items():
+                        member = tarfile.TarInfo("package/" + name)
+                        member.size = len(data)
+                        archive.addfile(member, io.BytesIO(data))
 
             def extract(package, destination, arch):
                 workdirs.append(destination.parent)
-                destination.write_bytes((arch + " original").encode())
+                extract_core(package, destination, arch)
 
             def patcher(args, **kwargs):
                 if "--patch" in args:
@@ -198,14 +352,19 @@ class ReleaseTests(unittest.TestCase):
 
             with mock.patch.object(release, "extract_core", side_effect=extract), \
                     mock.patch.object(release, "command", side_effect=patcher):
-                platforms = {arch: release.build_platform("v2.3.2", arch, root / "package", root / arch, assets)
+                platforms = {arch: release.build_platform("v2.3.2", arch, root / (arch + ".tar.gz"), root / arch, assets)
                              for arch in release.SUPPORTED_ARCHES}
             self.assertNotEqual(workdirs[0], workdirs[1])
             self.assertEqual({path.name for path in assets.iterdir()}, {
-                "core-linux-amd64", "core-linux-amd64.orig", "core-linux-arm64", "core-linux-arm64.orig"})
+                "core-linux-amd64", "core-linux-amd64.orig", "core-linux-arm64", "core-linux-arm64.orig",
+                "agent-linux-amd64.orig", "agent-linux-arm64.orig"})
             for arch, metadata in platforms.items():
                 self.assertEqual(metadata["core_asset"], "core-linux-" + arch)
                 self.assertEqual(metadata["orig_asset"], "core-linux-" + arch + ".orig")
+                self.assertEqual(metadata["agent_orig_asset"], "agent-linux-" + arch + ".orig")
+                self.assertEqual(metadata["agent_orig_sha256"], release.sha256(assets / metadata["agent_orig_asset"]))
+                self.assertEqual(metadata["agent_orig_size"], (assets / metadata["agent_orig_asset"]).stat().st_size)
+                self.assertEqual((assets / metadata["agent_orig_asset"]).read_bytes(), self.original_agent(arch))
                 self.assertEqual(metadata["patches"], 3)
 
 

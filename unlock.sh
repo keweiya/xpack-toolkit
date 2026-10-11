@@ -27,6 +27,57 @@ case "$(uname -m)" in
   *) die "Unknown architecture: $(uname -m)" ;;
 esac
 PLATFORM="linux-$ARCH"
+PANEL_CTL="${PANEL_CTL:-/usr/local/bin/1pctl}"
+if [[ "$MODE" = install || "$MODE" = deploy || "$MODE" = cert ]]; then
+  VERSION="$(python3 - "${VERSION:-}" "$PANEL_ROOT" "$CORE_BIN" "$PANEL_CTL" <<'PY'
+import pathlib, re, sqlite3, subprocess, sys
+requested, root, core, ctl = sys.argv[1:]
+pattern = r"v?\d+\.\d+\.\d+(?:-[A-Za-z0-9][A-Za-z0-9.-]*)?"
+def normalize(value):
+    value = value.strip()
+    return "v" + value.lstrip("v") if re.fullmatch(pattern, value) else None
+if requested:
+    version = normalize(requested)
+    if not version:
+        raise SystemExit("Invalid VERSION; expected vMAJOR.MINOR.PATCH")
+else:
+    version = None
+    db = pathlib.Path(root) / "db/core.db"
+    if db.is_file():
+        try:
+            with sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True) as con:
+                rows = con.execute("select value from settings where key='SystemVersion'").fetchall()
+            if len(rows) == 1:
+                version = normalize(rows[0][0])
+        except sqlite3.Error:
+            pass
+    if not version and pathlib.Path(core).is_file():
+        try:
+            result = subprocess.run([core, "version"], stdin=subprocess.DEVNULL,
+                                    capture_output=True, text=True, timeout=10)
+            if result.returncode == 0:
+                found = re.findall(r"(?<![\w.])(" + pattern + r")(?![\w.])", result.stdout)
+                versions = {normalize(item) for item in found}
+                if len(versions) == 1:
+                    version = versions.pop()
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    if not version and pathlib.Path(ctl).is_file():
+        text = pathlib.Path(ctl).read_text(errors="replace")
+        matches = re.findall(r"(?m)^\s*ORIGINAL_VERSION\s*=\s*['\"]?(" + pattern + r")[ '\"\t]*$", text)
+        versions = {normalize(item) for item in matches}
+        if len(versions) == 1:
+            version = versions.pop()
+    if not version:
+        raise SystemExit("Installed panel version was not detected; set VERSION=vMAJOR.MINOR.PATCH")
+print(version)
+PY
+)"
+  export VERSION
+  log "Panel $VERSION / $PLATFORM; existing panel data and signed license are retained"
+fi
+NEED_AGENT=0
+if [ "$ARCH" = amd64 ] && [ "${SKIP_AGENT:-0}" != 1 ] && [ -f "$AGENT_BIN" ]; then NEED_AGENT=1; fi
 mkdir -p "$PERSIST" "$BACKUP"
 fetch() { curl --proto '=https' --tlsv1.2 -fsSL --retry 2 -o "$2" "$1"; }
 WORK=""
@@ -41,9 +92,9 @@ if [ -z "$WORK" ]; then
     install -m 0600 "$ARTIFACT_DIR/runtime.tar.gz" "$RUN/runtime.tar.gz"
   else
     fetch "https://api.github.com/repos/$REPO/releases?per_page=100" "$RUN/releases.json"
-    python3 - "$RUN" "${VERSION:-}" "$PLATFORM" <<'PY'
+    python3 - "$RUN" "${VERSION:-}" "$PLATFORM" "$NEED_AGENT" <<'PY'
 import json, pathlib, re, sys
-run, requested, platform = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+run, requested, platform, agent = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4] == "1"
 wanted = "core-v" + requested.lstrip("v") if requested else None
 for release in json.loads((run / "releases.json").read_text()):
     tag = release.get("tag_name", "")
@@ -53,6 +104,8 @@ for release in json.loads((run / "releases.json").read_text()):
         continue
     assets = {a["name"]: a["browser_download_url"] for a in release.get("assets", [])}
     needed = ("manifest.json", "runtime.tar.gz", "core-" + platform, "core-" + platform + ".orig")
+    if agent:
+        needed += ("agent-" + platform + ".orig",)
     if not all(name in assets for name in needed):
         if wanted:
             raise SystemExit("Release " + tag + " has no verified core for " + platform)
@@ -61,6 +114,8 @@ for release in json.loads((run / "releases.json").read_text()):
     (run / "runtime.url").write_text(assets["runtime.tar.gz"])
     (run / "core.url").write_text(assets["core-" + platform])
     (run / "orig.url").write_text(assets["core-" + platform + ".orig"])
+    if agent:
+        (run / "agent.url").write_text(assets["agent-" + platform + ".orig"])
     (run / "release.tag").write_text(tag)
     break
 else:
@@ -71,7 +126,7 @@ PY
     fetch "$(<"$RUN/runtime.url")" "$RUN/runtime.tar.gz"
   fi
   WORK="$(mktemp -d "$PERSIST/runtime.XXXXXX")"
-  python3 - "$RUN" "$WORK" "$PLATFORM" <<'PY'
+  python3 - "$RUN" "$WORK" "$PLATFORM" "$NEED_AGENT" "${VERSION:-}" <<'PY'
 import hashlib, json, pathlib, ssl, tarfile, sys
 run, work, platform = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), sys.argv[3]
 m = json.loads((run / "manifest.json").read_text())
@@ -81,11 +136,16 @@ if platform not in m.get("platforms", {}):
     raise SystemExit("Release has no verified core for " + platform)
 if (run / "release.tag").exists() and (run / "release.tag").read_text() != "core-" + m.get("version", ""):
     raise SystemExit("Release tag/version mismatch")
+if sys.argv[5] and m.get("version") != sys.argv[5]:
+    raise SystemExit("Manifest does not match the requested installed panel version")
 p = m["platforms"][platform]
 if p.get("os") != "linux" or p.get("arch") != platform[6:] or p.get("patches") != 3:
     raise SystemExit("Invalid platform declaration")
 if p.get("core_asset") != "core-" + platform or p.get("orig_asset") != "core-" + platform + ".orig":
     raise SystemExit("Unexpected platform asset names")
+if sys.argv[4] == "1" and (p.get("agent_orig_asset") != "agent-" + platform + ".orig"
+                           or not p.get("agent_orig_sha256") or not p.get("agent_orig_size")):
+    raise SystemExit("Release has no verified original agent for " + platform)
 meta = m["runtime"]
 archive = run / "runtime.tar.gz"
 data = archive.read_bytes()
@@ -175,25 +235,41 @@ else:
 PY
 }
 backup_orig() {
-  local SRC="$1" NAME="$2" SUM DEST
+  local SRC="$1" NAME="$2" SUM DEST INVALID
   official "$SRC" "$NAME"
   SUM="$(sha256sum "$SRC")"; SUM="${SUM%% *}"
   DEST="$BACKUP/1panel-$NAME.orig"
-  # Retain first official rollback image and each newer verified original.
+  # Quarantine mislabeled historical backups; never reuse a modified rollback image.
   if [ -f "$DEST" ]; then
-    official "$DEST" "$NAME"
-    if [ -f "$DEST.sha256" ]; then sha256sum -c "$DEST.sha256"; fi
-  else install -m 0755 "$SRC" "$DEST"; fi
+    if ! official "$DEST" "$NAME" >/dev/null 2>&1 \
+       || { [ -f "$DEST.sha256" ] && ! sha256sum -c "$DEST.sha256" >/dev/null 2>&1; } \
+       || { [ ! -f "$DEST.sha256" ] && ! cmp -s "$SRC" "$DEST"; }; then
+      INVALID="$(sha256sum "$DEST")"; INVALID="${INVALID%% *}"
+      INVALID="$BACKUP/1panel-$NAME.invalid.$INVALID.orig"
+      install -m 0600 "$DEST" "$INVALID"
+      [ ! -f "$DEST.sha256" ] || install -m 0600 "$DEST.sha256" "$INVALID.sha256"
+      install -m 0755 "$SRC" "$DEST"
+      log "Archived stale $NAME backup; saved verified official replacement"
+    fi
+  else
+    install -m 0755 "$SRC" "$DEST"
+  fi
   sha256sum "$DEST" > "$DEST.sha256"
   install -m 0755 "$SRC" "$BACKUP/1panel-$NAME.$SUM.orig"
 }
 restore_source() {
-  local NAME="$1" FILE
+  local NAME="$1" FILE SUM
   for FILE in "$BACKUP/1panel-$NAME.orig" "$BACKUP/$NAME.orig" \
-              "$PANEL_ROOT/backup/1panel-$NAME.orig" "$PANEL_ROOT/backup/$NAME.orig"; do
+              "$PANEL_ROOT/backup/1panel-$NAME.orig" "$PANEL_ROOT/backup/$NAME.orig" \
+              "$BACKUP/1panel-$NAME."*.orig; do
     if [ -f "$FILE" ]; then
-      official "$FILE" "$NAME" || return 1
-      if [ -f "$FILE.sha256" ]; then sha256sum -c "$FILE.sha256" >&2 || return 1; fi
+      case "$FILE" in *.invalid.*) continue ;; esac
+      if ! official "$FILE" "$NAME" >/dev/null 2>&1; then continue; fi
+      if [ -f "$FILE.sha256" ] && ! sha256sum -c "$FILE.sha256" >/dev/null 2>&1; then continue; fi
+      if [ ! -f "$FILE.sha256" ]; then
+        SUM="$(sha256sum "$FILE")"; SUM="${SUM%% *}"
+        case "$FILE" in *".$SUM.orig") ;; *) continue ;; esac
+      fi
       printf '%s\n' "$FILE"
       return
     fi
@@ -324,10 +400,28 @@ if [ "$ARCH" != amd64 ] && [ "${SKIP_AGENT:-0}" != 1 ]; then
   log "Agent byte patches are validated for amd64 only; preserving the installed $ARCH agent"
   SKIP_AGENT=1
 fi
-if [ "${SKIP_AGENT:-0}" != 1 ] && [ -f "$AGENT_BIN" ]; then
-  if official "$AGENT_BIN" agent; then AGENT_SOURCE="$AGENT_BIN"
-  else AGENT_SOURCE="$(restore_source agent)"; fi
-  install -m 0755 "$AGENT_SOURCE" "$RUN/agent.orig"
+if [ "$NEED_AGENT" = 1 ]; then
+  if [ -n "${ARTIFACT_DIR:-}" ]; then
+    install -m 0755 "$ARTIFACT_DIR/agent-$PLATFORM.orig" "$RUN/agent.orig"
+  else
+    fetch "$(<"$RUN/agent.url")" "$RUN/agent.orig"
+  fi
+  python3 - "$RUN" "$ARCH" <<'PY'
+import hashlib, json, pathlib, struct, sys
+run, arch = pathlib.Path(sys.argv[1]), sys.argv[2]
+m = json.loads((run / "manifest.json").read_text())["platforms"]["linux-" + arch]
+data = (run / "agent.orig").read_bytes()
+if m.get("agent_orig_asset") != "agent-linux-" + arch + ".orig" or m.get("agent_orig_size") != len(data):
+    raise SystemExit("Original agent manifest size/name mismatch")
+if hashlib.sha256(data).hexdigest() != m.get("agent_orig_sha256"):
+    raise SystemExit("Original agent SHA-256 mismatch")
+if len(data) < 20 or data[:6] != b"\x7fELF\x02\x01" or struct.unpack_from("<H", data, 18)[0] != {"amd64": 62, "arm64": 183}[arch]:
+    raise SystemExit("Original agent ELF architecture mismatch")
+print("Verified matching official agent source: " + arch)
+PY
+  official "$RUN/agent.orig" agent
+  AGENT_SOURCE="$RUN/agent.orig"
+  log "Replacing existing agent using a freshly verified official source"
   python3 "$PATCH_AGENT" --patch --in "$RUN/agent.orig" --out "$RUN/agent" \
     --orig "$RUN/agent.orig" --manifest "$RUN/agent.manifest.json"
   python3 "$PATCH_AGENT" --verify --in "$RUN/agent"
