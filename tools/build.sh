@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
-# 本机一键构建补丁内核并发布 Release —— 不需要在 CI 里猜站点域名。
+# 本机构建补丁内核并发布 Release，默认离线模式。
 #
 #   sudo ./tools/build.sh                         # 默认构建全部架构：amd64 + arm64
 #   sudo ./tools/build.sh --arch amd64            # 只构建 amd64
 #   sudo ./tools/build.sh --arch arm64            # 只构建 arm64
 #   sudo ./tools/build.sh --version 2.3.2         # 指定版本（默认取官方最新稳定版）
-#   sudo ./tools/build.sh --remote-base https://abc.com/api/v1/   # 换域名时覆盖写死的 1p-cert.0rz.li
+#   sudo ./tools/build.sh --remote-base https://abc.com/api/v1/   # 显式启用远端地址改写
 #   sudo ./tools/build.sh --no-publish            # 只构建，产物留在 build/
 #
-# 线上授权：内核里写死授权服务器基地址（默认 https://1p-cert.0rz.li/api/v1/，
-# --remote-base 覆盖）。证书 offline=false 的期限（月/季/年）定期回连校验，
-# 永久版 offline=true 不回连。发布会用同 tag --clobber 覆盖已发布的 Release。
+# 默认只改 P1/P2/C7，保留真实验签，不改官方 HK/CN 地址。
+# 只有非空 --remote-base（或显式 REMOTE_BASE）才启用 P3/P4。
+# 发布会用同 tag --clobber 覆盖已发布的 Release。
 #
 # 做的事（对每个架构各来一遍）：
 #   1) 从官方源下载 <product>-<版本>-linux-<架构>.tar.gz，用官方 checksums.txt 校验
-#   2) 解包出官方 core → 打 5 处补丁（换根证书指纹 + 写死签发站地址 + 保住根证书行）
-#   3) 生成 manifest.json（sha256 / orig_sha256 / root_fingerprint / remote_base）
+#   2) 解包出官方 core → 默认 P1/P2/C7 三处补丁（根证书指纹 + 保住根证书行）
+#   3) 生成 manifest.json（sha256 / orig_sha256 / root_fingerprint / patches / mode）
 #   4) 发布 Release：core-<版本>-<架构>，资产 core / manifest.json / core.orig
 set -euo pipefail
 
@@ -28,10 +28,11 @@ _P="1pa""nel"
 VERSION="${PANEL_VERSION:-}"
 ARCH="all"
 PUBLISH=1
-REMOTE_BASE="${REMOTE_BASE:-https://1p-cert.0rz.li/api/v1/}"
+REMOTE_BASE="${REMOTE_BASE:-}"
 REPO="${ARTIFACT_REPO:-}"
 WORK="$ROOT/build"
 CERT="$ROOT/state/license.crt"
+export SIGN_CRT="$CERT"
 
 die() { echo "!! $*" >&2; exit 1; }
 note() { echo "== $*"; }
@@ -41,7 +42,7 @@ while [ $# -gt 0 ]; do
     --version) VERSION="${2:?}"; shift 2 ;;
     --arch)    ARCH="${2:?}"; shift 2 ;;
     --repo)    REPO="${2:?}"; shift 2 ;;
-    --remote-base) REMOTE_BASE="${2:?}"; shift 2 ;;
+    --remote-base) [ $# -ge 2 ] || die "--remote-base 缺少参数"; REMOTE_BASE="$2"; shift 2 ;;
     --no-publish) PUBLISH=0; shift ;;
     -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
     *) die "未知参数 $1（--version / --arch / --repo / --remote-base / --no-publish）" ;;
@@ -71,10 +72,14 @@ case "$VERSION" in
 esac
 
 note "版本 $VERSION / 架构 ${ARCHES[*]}"
-echo "   授权服务器基地址: $REMOTE_BASE（写进内核 P3/P4；永久版 offline=true 不回连）"
+if [ -n "$REMOTE_BASE" ]; then
+  echo "   远端模式（显式 P3/P4）: $REMOTE_BASE"
+else
+  echo "   离线模式: P1/P2/C7；HK/CN 地址保留官方原值"
+fi
 
 # ---- 0) 根证书必须在（补丁里的 P1/P2 = 它的指纹）----
-[ -s "$CERT" ] || die "缺少根证书 $CERT（先跑 tools/make_ca.sh 生成）"
+[ -s "$CERT" ] || die "缺少根证书 $CERT（构建只需公钥证书）"
 FINGERPRINT="$(openssl x509 -in "$CERT" -noout -fingerprint -sha256 | cut -d= -f2 | tr -d ':' | tr 'A-Z' 'a-z')"
 echo "   根证书指纹: $FINGERPRINT"
 
@@ -91,14 +96,18 @@ for ARCH in "${ARCHES[@]}"; do
     curl -fL --progress-bar -o "$WORK/dl/$TARBALL" "$SRC_BASE/$TARBALL" \
       || die "下载失败：$SRC_BASE/$TARBALL"
   fi
-  if curl -fsSL -o "$WORK/dl/checksums-${ARCH}.txt" "$SRC_BASE/checksums.txt"; then
-    EXPECT="$(awk -v t="$TARBALL" '$2==t {print $1}' "$WORK/dl/checksums-${ARCH}.txt" | head -1)"
-    ACTUAL="$(sha256sum "$WORK/dl/$TARBALL" | awk '{print $1}')"
-    if [ -n "$EXPECT" ]; then
-      [ "$EXPECT" = "$ACTUAL" ] || die "官方 checksums 校验失败（期望 $EXPECT 实得 $ACTUAL）"
-      echo "   官方包校验通过: $ACTUAL"
-    fi
-  fi
+  curl -fsSL -o "$WORK/dl/checksums-${ARCH}.txt" "$SRC_BASE/checksums.txt" \
+    || die "下载官方 checksums.txt 失败"
+  EXPECT="$(awk -v t="$TARBALL" '
+    { name=$2; sub(/^\*/, "", name); sub(/^\.\//, "", name) }
+    name==t { count++; hash=$1 }
+    END { if (count!=1 || length(hash)!=64 || hash~/[^[:xdigit:]]/) exit 1;
+          print tolower(hash) }
+  ' "$WORK/dl/checksums-${ARCH}.txt")" \
+    || die "官方 checksums 缺少唯一有效 SHA-256：$TARBALL"
+  ACTUAL="$(sha256sum "$WORK/dl/$TARBALL" | awk '{print $1}')"
+  [ "$EXPECT" = "$ACTUAL" ] || die "官方 checksums 校验失败（期望 $EXPECT 实得 $ACTUAL）"
+  echo "   官方包校验通过: $ACTUAL"
 
   note "解包"
   rm -rf "$WORK/x" && mkdir -p "$WORK/x"
@@ -111,17 +120,19 @@ for ARCH in "${ARCHES[@]}"; do
   ORIG_SHA="$(sha256sum "$WORK/orig/core.orig" | awk '{print $1}')"
   echo "   官方内核 sha256: $ORIG_SHA"
 
-  # ---- 2) 打补丁（只换授权方：根证书指纹 + 授权服务器地址）----
+  # ---- 2) 默认离线补丁；非空参数才增加 P3/P4 ----
   note "打补丁"
-  SIGN_CRT="$CERT" \
-    python3 tools/patch_core.py \
+  PATCH_ARGS=()
+  if [ -n "$REMOTE_BASE" ]; then PATCH_ARGS+=(--remote-base "$REMOTE_BASE"); fi
+  python3 tools/patch_core.py \
       --in "$WORK/orig/core.orig" \
       --out "$WORK/core" \
       --patch \
+      --orig "$WORK/orig/core.orig" \
       --manifest "$WORK/core.manifest.json" \
-      ${REMOTE_BASE:+--remote-base "$REMOTE_BASE"}
+      "${PATCH_ARGS[@]}"
   chmod 0755 "$WORK/core"
-  python3 tools/patch_core.py --in "$WORK/core" --verify
+  python3 tools/patch_core.py --in "$WORK/core" --verify "${PATCH_ARGS[@]}"
   SHA="$(sha256sum "$WORK/core" | awk '{print $1}')"
   echo "   补丁内核 sha256: $SHA"
 
@@ -133,6 +144,13 @@ for ARCH in "${ARCHES[@]}"; do
 import datetime, hashlib, json, os, pathlib, ssl
 core = pathlib.Path(os.environ["CORE_OUT"]).read_bytes()
 cert = pathlib.Path(os.environ["SIGN_CRT"])
+patch_manifest = json.loads(pathlib.Path(os.environ["CORE_MANIFEST"]).read_text())
+patches = patch_manifest["patches"]
+mode = "remote" if os.environ["REMOTE_BASE"] else "offline"
+if not isinstance(patches, list) or len(patches) != (5 if mode == "remote" else 3):
+    raise SystemExit("Unexpected patch manifest; expected P1/P2/C7 (+P3/P4 in remote mode)")
+if patch_manifest.get("mode") != mode:
+    raise SystemExit("Patcher mode does not match the requested build mode")
 man = {
     "name": "core",
     "version": os.environ["VERSION"],
@@ -141,8 +159,8 @@ man = {
     "sha256": hashlib.sha256(core).hexdigest(),
     "orig_sha256": os.environ["ORIG_SHA"],
     # 实际应用的补丁条数，从 patch_core.py 的清单里数，避免写死
-    "patches": len(json.loads(
-        pathlib.Path(os.environ["CORE_MANIFEST"]).read_text())["applied"]),
+    "patches": len(patches),
+    "mode": mode,
     "remote_base": os.environ["REMOTE_BASE"],
     "root_fingerprint": hashlib.sha256(
         ssl.PEM_cert_to_DER_cert(cert.read_text())).hexdigest(),
@@ -174,7 +192,7 @@ PY
   gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1 \
     || gh release create "$TAG" --repo "$REPO" \
          --title "补丁内核 ${VERSION} ${ARCH}" \
-         --notes "本站本地构建。下载后按 README 一键安装。" \
+         --notes "本地构建。资产 core / manifest.json / core.orig；安装需签名输入，详见 README。" \
          --latest=false
   gh release upload "$TAG" --repo "$REPO" --clobber \
      "$WORK/core" \

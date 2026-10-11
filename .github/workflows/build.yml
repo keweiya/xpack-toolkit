@@ -1,9 +1,9 @@
 name: build
 
 # 在 GitHub Actions 里手动生成「补丁内核」并发布到 Release。
-# 线上授权：内核里写死授权服务器基地址（默认 https://1p-cert.0rz.li/api/v1/，inputs.base 覆盖）。
-# 证书 offline=false 的期限（月/季/年）定期回连校验，永久版 offline=true 不回连。
-# 只靠 workflow_dispatch 手动触发，触发时指定版本 + 域名，同 tag --clobber 覆盖已发布 Release。
+# 默认 P1/P2/C7 三处离线补丁；保留真实验签与官方 HK/CN 地址。
+# inputs.base 只有显式非空才添加 P3/P4，构建不会用默认远端站点。
+# 只靠 workflow_dispatch 手动触发，同 tag --clobber 覆盖已发布 Release。
 # Release 默认总是发布；Cloudflare R2 为可选（配置了 secrets.R2_* 才上传）。
 #
 # 需要配置的 Secrets / Variables：
@@ -23,12 +23,14 @@ on:
         default: ""
       arch:
         description: "架构：all / amd64 / arm64"
+        type: choice
+        options: [all, amd64, arm64]
         required: false
         default: "all"
       base:
-        description: "授权服务器基地址（写死进内核；换域名时改这里）"
+        description: "远端授权基地址（默认留空为离线；非空才启用 P3/P4）"
         required: false
-        default: "https://1p-cert.0rz.li/api/v1/"
+        default: ""
 
 permissions:
   contents: write    # 发布到 Release 需要写权限
@@ -43,11 +45,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arch: [amd64, arm64]
+        arch: ${{ fromJSON(inputs.arch == 'amd64' && '["amd64"]' || inputs.arch == 'arm64' && '["arm64"]' || '["amd64","arm64"]') }}
     env:
       VERSION: ${{ inputs.version != '' && inputs.version || vars.PANEL_VERSION }}
       ARCH: ${{ matrix.arch }}
-      BASE: ${{ inputs.base != '' && inputs.base || 'https://1p-cert.0rz.li/api/v1/' }}
+      BASE: ${{ inputs.base }}
+      SIGN_CRT: state/license.crt
       R2_BUCKET: ${{ vars.R2_BUCKET }}
     steps:
       - name: 取源码
@@ -62,6 +65,8 @@ jobs:
         run: |
           set -euo pipefail
           [ -n "${VERSION:-}" ] || { echo "::error::缺少版本号（inputs.version 或 vars.PANEL_VERSION）"; exit 1; }
+          VERSION="v${VERSION#v}"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           echo "目标版本: $VERSION / 架构: $ARCH"
 
       - name: 写入根证书
@@ -71,13 +76,13 @@ jobs:
           set -euo pipefail
           if [ -n "${CRT_PEM:-}" ]; then
             mkdir -p state
-            printf '%s\n' "$CRT_PEM" > state/license.crt
+            printf '%s\n' "$CRT_PEM" > "$SIGN_CRT"
           fi
-          if [ ! -s state/license.crt ]; then
+          if [ ! -s "$SIGN_CRT" ]; then
             echo "::error::既没有 secrets.ROOT_CERT_PEM，仓库里也没有 state/license.crt"
             exit 1
           fi
-          openssl x509 -in state/license.crt -noout -subject -fingerprint -sha256
+          openssl x509 -in "$SIGN_CRT" -noout -subject -fingerprint -sha256
 
       - name: 下载官方二进制并校验官方哈希
         run: |
@@ -87,15 +92,16 @@ jobs:
           SRC_BASE="https://resource.fit2cloud.com/${_P}/package/v2/stable/${VERSION}/release"
           mkdir -p build/orig work
           curl -fsSL -o "work/$TARBALL" "$SRC_BASE/$TARBALL"
-          curl -fsSL -o work/checksums.txt "$SRC_BASE/checksums.txt" || true
-          EXPECT=$(awk -v t="$TARBALL" '$2==t {print $1}' work/checksums.txt | head -1)
+          curl -fsSL -o work/checksums.txt "$SRC_BASE/checksums.txt"
+          EXPECT=$(awk -v t="$TARBALL" '
+            { name=$2; sub(/^\*/, "", name); sub(/^\.\//, "", name) }
+            name==t { count++; hash=$1 }
+            END { if (count!=1 || length(hash)!=64 || hash~/[^[:xdigit:]]/) exit 1;
+                  print tolower(hash) }
+          ' work/checksums.txt) || { echo "::error::官方 checksums 缺少唯一有效 SHA-256：$TARBALL"; exit 1; }
           ACTUAL=$(sha256sum "work/$TARBALL" | awk '{print $1}')
-          if [ -n "$EXPECT" ]; then
-            [ "$EXPECT" = "$ACTUAL" ] || { echo "::error::官方 checksums 校验失败"; exit 1; }
-            echo "官方哈希校验通过: $ACTUAL"
-          else
-            echo "::warning::官方 checksums.txt 未提供该文件哈希，仅记录本地哈希 $ACTUAL"
-          fi
+          [ "$EXPECT" = "$ACTUAL" ] || { echo "::error::官方 checksums 校验失败"; exit 1; }
+          echo "官方哈希校验通过: $ACTUAL"
           tar -xzf "work/$TARBALL" -C work
           CORE=$(find work -type f -name "${_P}-core" -print -quit)
           AGENT=$(find work -type f -name "${_P}-agent" -print -quit)
@@ -104,21 +110,22 @@ jobs:
           [ -n "$AGENT" ] && cp -f "$AGENT" build/orig/agent.orig || true
           echo "官方 core sha256: $(sha256sum build/orig/core.orig | awk '{print $1}')"
 
-      - name: 打补丁（换授权方：根证书指纹 + 写死签发站地址 + 保住根证书行）
-        env:
-          SIGN_CRT: state/license.crt
+      - name: 打补丁（默认 P1/P2/C7；远端地址仅显式启用）
         run: |
           set -euo pipefail
-          echo "授权服务器基地址: $BASE"
-          python3 tools/patch_core.py --list
+          PATCH_ARGS=()
+          if [ -n "$BASE" ]; then PATCH_ARGS+=(--remote-base "$BASE"); fi
+          echo "授权服务器基地址: ${BASE:-<离线默认>}"
+          python3 tools/patch_core.py --list "${PATCH_ARGS[@]}"
           python3 tools/patch_core.py \
             --in build/orig/core.orig \
             --out build/core \
             --patch \
-            --remote-base "$BASE" \
-            --manifest build/core.manifest.json
+            --orig build/orig/core.orig \
+            --manifest build/core.manifest.json \
+            "${PATCH_ARGS[@]}"
           chmod 0755 build/core
-          python3 tools/patch_core.py --in build/core --verify
+          python3 tools/patch_core.py --in build/core --verify "${PATCH_ARGS[@]}"
           echo "补丁内核 sha256: $(sha256sum build/core | awk '{print $1}')"
 
       - name: 生成清单
@@ -130,9 +137,15 @@ jobs:
           orig = pathlib.Path("build/orig/core.orig")
           data = core.read_bytes()
           # 根证书指纹：站点用它判断「这份 CI 产物是不是我这一套 CA 打的」
-          cert = pathlib.Path(os.environ.get("SIGN_CRT", "state/license.crt"))
-          root_fp = hashlib.sha256(
-              ssl.PEM_cert_to_DER_cert(cert.read_text())).hexdigest() if cert.exists() else ""
+          cert = pathlib.Path(os.environ["SIGN_CRT"])
+          root_fp = hashlib.sha256(ssl.PEM_cert_to_DER_cert(cert.read_text())).hexdigest()
+          patch_manifest = json.loads(pathlib.Path("build/core.manifest.json").read_text())
+          patches = patch_manifest["patches"]
+          mode = "remote" if os.environ.get("BASE") else "offline"
+          if not isinstance(patches, list) or len(patches) != (5 if mode == "remote" else 3):
+              raise SystemExit("Unexpected patch manifest; expected P1/P2/C7 (+P3/P4 in remote mode)")
+          if patch_manifest.get("mode") != mode:
+              raise SystemExit("Patcher mode does not match the requested build mode")
           manifest = {
               "name": "core",
               "version": os.environ["VERSION"],
@@ -140,7 +153,8 @@ jobs:
               "size": len(data),
               "sha256": hashlib.sha256(data).hexdigest(),
               "orig_sha256": hashlib.sha256(orig.read_bytes()).hexdigest(),
-              "patches": 5,
+              "patches": len(patches),
+              "mode": mode,
               "remote_base": os.environ.get("BASE", ""),
               "root_fingerprint": root_fp,
               "built_at": datetime.datetime.now(datetime.timezone.utc)
@@ -148,7 +162,7 @@ jobs:
               "run": "%s/%s" % (os.environ.get("GITHUB_REPOSITORY", ""),
                                 os.environ.get("GITHUB_RUN_ID", "")),
           }
-          pathlib.Path("build/core.manifest.json").write_text(
+          pathlib.Path("build/manifest.json").write_text(
               json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
           print(json.dumps(manifest, ensure_ascii=False, indent=2))
           PY
@@ -164,25 +178,40 @@ jobs:
                  --notes "CI 构建的补丁内核。资产：core / manifest.json / core.orig" \
                  --latest=false
           # 资产名固定：core / manifest.json，另带一份官方原件 core.orig（--restore 回滚用）
-          cp -f build/core.manifest.json build/manifest.json
           gh release upload "$TAG" build/core build/manifest.json \
                              build/orig/core.orig --clobber
-          echo "已发布 Release: $TAG（资产：core / manifest.json）"
+          echo "已发布 Release: $TAG（资产：core / manifest.json / core.orig）"
 
-      - name: 装 rclone
-        run: curl -fsSL https://rclone.org/install.sh | sudo bash
-
-      - name: 上传到 Cloudflare R2
+      - name: 检查可选 R2 配置
+        id: r2
         env:
           R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
         run: |
           set -euo pipefail
-          if [ -z "${R2_ACCOUNT_ID:-}" ] || [ -z "${R2_BUCKET:-}" ]; then
-            echo "::warning::未配置 R2（secrets.R2_ACCOUNT_ID / vars.R2_BUCKET），跳过上传"
+          if [ -z "${R2_ACCOUNT_ID:-}${R2_ACCESS_KEY_ID:-}${R2_SECRET_ACCESS_KEY:-}${R2_BUCKET:-}" ]; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "R2 未配置，仅发布 GitHub Release"
             exit 0
           fi
+          for NAME in R2_ACCOUNT_ID R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_BUCKET; do
+            [ -n "${!NAME:-}" ] || { echo "::error::R2 配置不完整：$NAME"; exit 1; }
+          done
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+
+      - name: 装 rclone
+        if: steps.r2.outputs.enabled == 'true'
+        run: curl -fsSL https://rclone.org/install.sh | sudo bash
+
+      - name: 上传到 Cloudflare R2
+        if: steps.r2.outputs.enabled == 'true'
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
           export RCLONE_CONFIG_R2_TYPE=s3
           export RCLONE_CONFIG_R2_PROVIDER=Cloudflare
           export RCLONE_CONFIG_R2_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
@@ -196,11 +225,11 @@ jobs:
             "${DEST}/core/${VERSION}/${ARCH}/core.orig" --s3-no-check-bucket
           rclone copyto build/core \
             "${DEST}/core/${VERSION}/${ARCH}/core" --s3-no-check-bucket
-          rclone copyto build/core.manifest.json \
+          rclone copyto build/manifest.json \
             "${DEST}/core/${VERSION}/${ARCH}/manifest.json" --s3-no-check-bucket
           rclone copyto build/core \
             "${DEST}/core/${ARCH}/core" --s3-no-check-bucket
-          rclone copyto build/core.manifest.json \
+          rclone copyto build/manifest.json \
             "${DEST}/core/${ARCH}/manifest.json" --s3-no-check-bucket
           echo "已上传到 ${DEST}/core/${VERSION}/${ARCH}/"
 

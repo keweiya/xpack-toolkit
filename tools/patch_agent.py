@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Agent (v2.3.2) X-Pack unlocker.
+"""1Panel v2.3.2 agent (1panel-agent) X-Pack unlocker.
 
 The agent gates every X-Pack subsystem on one package-level bool that is
-seeded from <panel-root>/conf/panel.json:
+seeded from /opt/1panel/conf/panel.json:
 
-    <org>/agent/xpack/utils/edition  -> isXpack  (byte, .noptrbss @ 0x51c94c0)
+    github.com/1Panel-dev/1Panel/agent/xpack/utils/edition  -> isXpack  (byte, .noptrbss @ 0x51c94c0)
 
 Three writers and seven readers touch that byte; `IsXpack()` is the exported
 accessor.  All edits below are length preserving.
@@ -19,10 +19,10 @@ accessor.  All edits below are length preserving.
     A8  alert_xpack.GetLicenseAlert       -> return nil (no license nag)
 
 Usage:
-  python3 tools/patch_agent.py --list
-  python3 tools/patch_agent.py --verify [--in BIN]
-  python3 tools/patch_agent.py --patch  [--in BIN] [--out BIN]
-  python3 tools/patch_agent.py --restore [--in BIN] [--out BIN]
+  python3 tools/patch_1panel_agent.py --list
+  python3 tools/patch_1panel_agent.py --verify [--in BIN]
+  python3 tools/patch_1panel_agent.py --patch  [--in BIN] [--out BIN]
+  python3 tools/patch_1panel_agent.py --restore [--in BIN] [--out BIN]
 """
 import argparse
 import hashlib
@@ -30,11 +30,6 @@ import json
 import os
 import shutil
 import sys
-
-# 目标产品代号（分段拼接，避免明文）
-_P = "1pa" + "nel"
-PANEL_ROOT = "/opt/" + _P
-AGENT_BIN = "/usr/local/bin/" + _P + "-agent"
 
 NOP = b"\x90"
 
@@ -100,10 +95,10 @@ def locate(data):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--in", dest="src", default=AGENT_BIN)
+    ap.add_argument("--in", dest="src", default="/usr/local/bin/1panel-agent")
     ap.add_argument("--out", dest="dst", default=None)
-    ap.add_argument("--orig", default="build/orig/agent.orig")
-    ap.add_argument("--manifest", default="build/agent.manifest.json")
+    ap.add_argument("--orig", default="build/orig/1panel-agent.orig")
+    ap.add_argument("--manifest", default="build/1panel-agent.manifest.json")
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--verify", action="store_true")
     ap.add_argument("--patch", action="store_true")
@@ -161,13 +156,12 @@ def main():
         if not os.path.exists(args.orig):
             shutil.copy2(src, args.orig)
             print("pristine copy -> %s" % args.orig)
-        os.makedirs(os.path.dirname(os.path.abspath(dst)), exist_ok=True)
         open(dst, "wb").write(bytes(data))
         os.chmod(dst, 0o755)
 
         man = {
-            "tool": "patch_agent.py",
-            "version": "agent v2.3.2 (from v2.3.2-linux-amd64.tar.gz)",
+            "tool": "patch_1panel_agent.py",
+            "version": "1panel-agent v2.3.2 (from 1panel-v2.3.2-linux-amd64.tar.gz)",
             "source": src,
             "source_sha256": sha256(args.orig),
             "output": dst,
@@ -178,9 +172,7 @@ def main():
             "patches": [{"name": n, "file_offset": hex(o), "orig": or_.hex(),
                          "patch": p.hex(), "note": c} for n, o, or_, p, c in PATCHES],
         }
-        os.makedirs(os.path.dirname(os.path.abspath(args.manifest)), exist_ok=True)
-        with open(args.manifest, "w") as fh:
-            json.dump(man, fh, indent=2, ensure_ascii=False)
+        json.dump(man, open(args.manifest, "w"), indent=2, ensure_ascii=False)
         print("applied  : %s" % (", ".join(applied) or "(none)"))
         print("skipped  : %s" % (", ".join(skipped) or "(none)"))
         print("output   : %s" % dst)

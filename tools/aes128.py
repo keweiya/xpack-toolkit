@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Pure-python AES-128 (ECB core + CBC mode) - no third-party deps.
 
-Only used for the small licence / panel-info blobs, so clarity beats
+Only used for the small 1Panel licence / panel-info blobs, so clarity beats
 speed. Verified against the FIPS-197 AES-128 test vector (see self_test()).
 """
 

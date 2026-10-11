@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """把「本站根证书」写进面板的 core_settings，让官方校验真实通过。
 
-背景（逆向自 core v2.3.2）
+背景（逆向自 1panel-core v2.3.2）
 --------------------------------
 面板导入许可证时走 license_helper.CheckInLocal：
 
@@ -19,10 +19,10 @@
 
 用法
 ----
-  python3 tools/cert_store.py --cert state/ca.crt --db /opt/<P>/db/xpack.db
-  python3 tools/cert_store.py --cert ... --db ... --show      # 只打印当前 4 行
-  python3 tools/cert_store.py --db ... --backup               # 备份官方原值
-  python3 tools/cert_store.py --db ... --restore              # 还原官方原值
+  python3 tools/rootcert_store.py --cert web/state/license.crt --db /opt/1panel/db/xpack.db
+  python3 tools/rootcert_store.py --cert ... --db ... --show      # 只打印当前 4 行
+  python3 tools/rootcert_store.py --db ... --backup               # 备份官方原值
+  python3 tools/rootcert_store.py --db ... --restore              # 还原官方原值
 """
 import argparse
 import base64
@@ -37,14 +37,10 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from aes128 import cbc_encrypt, cbc_decrypt, pkcs7_pad  # noqa: E402
 
-# 目标产品代号（分段拼接，避免明文）
-_P = "1pa" + "nel"
-PANEL_ROOT = "/opt/" + _P
-
 # encrypt_xpack.StringEncrypt / decryptRootCertStoreValue 用的固定盐（16 字节）
 STORE_KEY = b"nel1Pa2520pack@x"
 
-# 官方内置根证书指纹（= 未打补丁二进制的 P1/P2 常量），用来判断库里这 4 行
+# 官方内置根证书指纹（= 破解前二进制的 P1/P2 常量），用来判断库里这 4 行
 # 到底是「官方原值」还是「本站已写入」。官方原值备份在 tools/official_rootcert.json。
 OFFICIAL_FP = {
     "hk": "cf7b264f820aba6e8ec1d46cc58af4f53b06e583b9619796855365044475b945",
@@ -183,14 +179,17 @@ def restore(db: str, path: str):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--cert", default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                                   "..", "state", "license.crt"))
-    ap.add_argument("--db", default=PANEL_ROOT + "/db/xpack.db")
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    certs = (os.path.join(root, "web", "state", "license.crt"),
+             os.path.join(root, "state", "license.crt"))
+    ap.add_argument("--cert", default=os.environ.get("SIGN_CRT") or
+                    next((p for p in certs if os.path.isfile(p)), certs[0]))
+    ap.add_argument("--db", default="/opt/1panel/db/xpack.db")
     ap.add_argument("--show", action="store_true", help="只打印当前设置")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--backup", action="store_true", help="备份官方原值到 --bak")
     ap.add_argument("--restore", action="store_true", help="从 --bak 还原官方原值")
-    ap.add_argument("--bak", default=PANEL_ROOT + "/backup/"
+    ap.add_argument("--bak", default="/opt/1panel/crack/backup/"
                                      "core_settings_license_rootcert.json")
     args = ap.parse_args()
 

@@ -11,6 +11,6 @@ __pycache__/
 *.pre-expiry
 *.bak
 
-# 注意：state/ 故意不忽略 —— 一键脚本要自带根证书与私钥才能在本机签发授权。
-# 如果这份 kit 的根证书要保密，请把 state/ 改成走 secret 注入，并在 CI 里用
-# secrets.ROOT_CERT_PEM / secrets.ROOT_KEY_PEM 覆盖。
+# Public root certificates are versioned; local signing keys remain local.
+state/*.key
+web/state/*.key

@@ -1,231 +1,349 @@
 #!/usr/bin/env bash
-# 一键安装：下载预构建补丁内核 → 安装 → 写入根证书 → 放行 agent → 生成并应用永久离线授权
-#
-# 一行用法（公开仓库，免 token）：
-#   curl -fsSL https://raw.githubusercontent.com/OWNER/xpack-toolkit/main/unlock.sh | sudo bash
-#
-# 本地用法（已克隆本仓库）：
-#   sudo bash unlock.sh
-#
-# 可选环境变量：
-#   REPO=OWNER/xpack-toolkit   仓库（默认见下）
-#   VERSION=v2.3.2             指定版本（默认取该架构最新 Release）
-#   BRANCH=main                下载仓库用的分支
-#   NODES=999                  子节点数
-#   EXPIRES=2099-12-31         到期日
-#   ASSIGNEE=YG                被授权人
-#   SKIP_AGENT=1               不处理 agent
-#   NO_APPLY=1                 只装内核与证书，不写授权（自己手动导入）
+# Verified offline reinstall. Only use local signing keys; never download keys.
+# STATE/SIGN_KEY: local material. LICENSE_FILE: pre-issued signed license.
+# ARTIFACT_DIR: local Release. NO_APPLY: persist license for manual import.
 set -euo pipefail
-
+umask 077
 REPO="${REPO:-keweiya/xpack-toolkit}"
 BRANCH="${BRANCH:-main}"
-VERSION="${VERSION:-}"
-NODES="${NODES:-999}"
-EXPIRES="${EXPIRES:-2099-12-31}"
-ASSIGNEE="${ASSIGNEE:-YG}"
-
-# 目标产品代号（分段拼接，避免明文）
-_P="1pa""nel"
-CORE_SVC="$_P-core"
-AGENT_SVC="$_P-agent"
-PANEL_ROOT="/opt/$_P"
-CORE_BIN="/usr/local/bin/$_P-core"
-AGENT_BIN="/usr/local/bin/$_P-agent"
-XPACK_DB="$PANEL_ROOT/db/xpack.db"
-BACKUP="$PANEL_ROOT/backup"
-
-log() { echo "== $*"; }
-die() { echo "!! $*" >&2; exit 1; }
-
-[ "$(id -u)" -eq 0 ] || die "请用 root 运行：curl -fsSL ... | sudo bash"
-
-case "$(uname -m)" in
-  x86_64|amd64)  ARCH=amd64 ;;
-  aarch64|arm64) ARCH=arm64 ;;
-  *) die "不支持的架构 $(uname -m)" ;;
-esac
-log "架构 $ARCH"
-
-# ---- 1) 准备工具 + 根证书（优先用本地仓库，否则下载公开仓库归档）----
+PANEL_ROOT="${PANEL_ROOT:-/opt/1panel}"
+CORE_BIN="${CORE_BIN:-/usr/local/bin/1panel-core}"
+AGENT_BIN="${AGENT_BIN:-/usr/local/bin/1panel-agent}"
+CORE_SVC="${CORE_SVC:-1panel-core}"
+AGENT_SVC="${AGENT_SVC:-1panel-agent}"
+XPACK_DB="${XPACK_DB:-$PANEL_ROOT/db/xpack.db}"
+BACKUP="${BACKUP:-$PANEL_ROOT/crack/backup}"
+PERSIST="${UNLOCK_WORK:-$PANEL_ROOT/unlock}"
+MODE="${1:-install}"
+log() { printf '== %s\n' "$*"; }
+die() { printf '!! %s\n' "$*" >&2; exit 1; }
+trap 'printf "!! Failed; artifacts/backups retained: %s / %s\n" "$PERSIST" "$BACKUP" >&2' ERR
+case "$MODE" in install|deploy|restore|verify|cert) ;; *) die "usage: $0 {install|restore|verify|cert}" ;; esac
+[ "$(id -u)" -eq 0 ] || die "Run as root"
+case "$(uname -m)" in x86_64|amd64) ARCH=amd64 ;; aarch64|arm64) ARCH=arm64 ;; *) die "Unknown architecture" ;; esac
+mkdir -p "$PERSIST" "$BACKUP"
+fetch() { curl --proto '=https' --tlsv1.2 -fsSL --retry 2 -o "$2" "$1"; }
 SELF="${BASH_SOURCE[0]:-}"
-LOCAL_DIR=""
+WORK=""
 if [ -n "$SELF" ] && [ -f "$SELF" ]; then
-  LOCAL_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+  CANDIDATE="$(cd "$(dirname "$SELF")" && pwd)"
+  [ ! -f "$CANDIDATE/tools/gen_license.py" ] || WORK="$CANDIDATE"
 fi
-if [ -n "$LOCAL_DIR" ] && [ -f "$LOCAL_DIR/tools/gen_license.py" ] \
-   && [ -f "$LOCAL_DIR/state/license.key" ]; then
-  WORK="$LOCAL_DIR"
-  log "使用本地仓库 $WORK"
-else
-  WORK="$(mktemp -d)"
-  trap 'rm -rf "$WORK"' EXIT
-  log "下载仓库 $REPO@$BRANCH"
-  curl -fsSL "https://github.com/$REPO/archive/refs/heads/$BRANCH.tar.gz" \
-    | tar -xz -C "$WORK" --strip-components=1
+if [ -z "$WORK" ] && [ "$MODE" = restore ] && [ -f "$PERSIST/runtime.path" ]; then
+  IFS= read -r WORK < "$PERSIST/runtime.path"
+  [ -f "$WORK/tools/gen_license.py" ] || WORK=""
 fi
-[ -f "$WORK/tools/gen_license.py" ] || die "仓库里缺少 tools/gen_license.py"
-[ -f "$WORK/state/license.key" ]    || die "仓库里缺少 state/license.key"
-[ -f "$WORK/state/license.crt" ]    || die "仓库里缺少 state/license.crt"
-# 固定签名材料目录，避免默认路径猜错（否则会产出未签名授权）
-export STATE="$WORK/state"
-
-# ---- 回滚模式：unlock.sh restore ----
-if [ "${1:-install}" = "restore" ]; then
-  log "回滚到官方内核 / 官方根证书行"
-  systemctl stop "$CORE_SVC" 2>/dev/null || true
-  if [ -f "$BACKUP/core.orig" ]; then
-    install -m 0755 "$BACKUP/core.orig" "$CORE_BIN"
-    log "内核 -> 官方原件"
-  else
-    echo "!! 没有备份 $BACKUP/core.orig"
+if [ -z "$WORK" ]; then
+  WORK="$(mktemp -d "$PERSIST/runtime.XXXXXX")"
+  mkdir -p "$WORK/tools" "$WORK/web/state"
+  RAW="https://raw.githubusercontent.com/$REPO/$BRANCH"
+  # Whitelist public code/certificates: no repository archive/private state.
+  for PAIR in 'patch_1panel_core.py patch_core.py' 'patch_1panel_agent.py patch_agent.py' \
+              'rootcert_store.py cert_store.py' 'gen_license.py gen_license.py' \
+              'aes128.py aes128.py' 'gosym.py gosym.py'; do
+    read -r LONG SHORT <<< "$PAIR"
+    if ! fetch "$RAW/tools/$LONG" "$WORK/tools/$LONG"; then
+      fetch "$RAW/tools/$SHORT" "$WORK/tools/$LONG" || die "Missing public tool: $LONG / $SHORT"
+    fi
+  done
+  if [ "$MODE" != restore ]; then
+    fetch "$RAW/web/state/license.crt" "$WORK/web/state/license.crt" \
+      || fetch "$RAW/state/license.crt" "$WORK/web/state/license.crt"
   fi
-  if [ -f "$XPACK_DB" ]; then
-    python3 "$WORK/tools/cert_store.py" --db "$XPACK_DB" --restore || true
-  fi
-  if [ -f "$BACKUP/agent.orig" ]; then
-    systemctl stop "$AGENT_SVC" 2>/dev/null || true
-    install -m 0755 "$BACKUP/agent.orig" "$AGENT_BIN"
-    systemctl start "$AGENT_SVC" 2>/dev/null || true
-    log "agent -> 官方原件"
-  fi
-  systemctl start "$CORE_SVC" 2>/dev/null || true
-  log "回滚完成"
-  exit 0
+  fetch "$RAW/tools/official_rootcert.json" "$WORK/tools/official_rootcert.json" || true
+  printf '%s\n' "$WORK" > "$PERSIST/runtime.path"
 fi
-
-# ---- 2) 取该架构的 Release ----
-if [ -n "$VERSION" ]; then
-  TAG="core-${VERSION}-${ARCH}"
-else
-  log "查询 $ARCH 的最新 Release"
-  TAG="$(curl -fsSL "https://api.github.com/repos/$REPO/releases?per_page=100" \
-    | python3 -c '
-import json, sys
-arch = sys.argv[1]
-for r in json.load(sys.stdin):
-    t = r.get("tag_name", "")
-    if t.endswith("-" + arch):
-        print(t)
-        break
-' "$ARCH")"
+tool() {
+  if [ -f "$WORK/tools/$1" ]; then printf '%s\n' "$WORK/tools/$1"
+  elif [ -f "$WORK/tools/$2" ]; then printf '%s\n' "$WORK/tools/$2"
+  else die "Missing tool: $1 / $2"; fi
+}
+PATCH_CORE="$(tool patch_1panel_core.py patch_core.py)"
+PATCH_AGENT="$(tool patch_1panel_agent.py patch_agent.py)"
+CERT_STORE="$(tool rootcert_store.py cert_store.py)"
+GEN_LICENSE="$(tool gen_license.py gen_license.py)"
+export STATE="${STATE:-}"
+if [ -z "$STATE" ]; then
+  if [ -f "$WORK/web/state/license.crt" ]; then STATE="$WORK/web/state"
+  else STATE="$WORK/state"; fi
 fi
-[ -n "$TAG" ] || die "找不到 $ARCH 的 Release，请用 VERSION=v2.3.2 指定"
-BASE="https://github.com/$REPO/releases/download/$TAG"
-log "Release $TAG"
-
-DL="$WORK/dl"
-mkdir -p "$DL"
-curl -fL --progress-bar -o "$DL/core" "$BASE/core"
-curl -fsSL -o "$DL/core.orig"   "$BASE/core.orig"   || true
-curl -fsSL -o "$DL/manifest.json" "$BASE/manifest.json" || true
-chmod 0755 "$DL/core"
-
-# ---- 3) 校验：内核 sha256 与 manifest 一致，且是本仓库根证书打的 ----
-DL="$DL" CRT="$WORK/state/license.crt" python3 - <<'PY'
-import hashlib, json, os, pathlib, ssl
-dl, crt = pathlib.Path(os.environ["DL"]), pathlib.Path(os.environ["CRT"])
-core = (dl / "core").read_bytes()
-fp = hashlib.sha256(ssl.PEM_cert_to_DER_cert(crt.read_text())).hexdigest()
-mpath = dl / "manifest.json"
-if mpath.exists():
-    man = json.loads(mpath.read_text())
-    assert man.get("sha256") == hashlib.sha256(core).hexdigest(), \
-        "内核 sha256 与 manifest.json 不符"
-    assert man.get("root_fingerprint") == fp, \
-        "内核不是用本仓库根证书打的（root_fingerprint 不符）"
-    print("清单校验通过: %s %s" % (man.get("version"), man.get("arch")))
+export SIGN_CRT="${SIGN_CRT:-$STATE/license.crt}"
+export SIGN_KEY="${SIGN_KEY:-$STATE/license.key}"
+export REMOTE_BASE=""
+check_root() {
+  python3 - "$CERT_STORE" "$XPACK_DB" "$SIGN_CRT" <<'PY'
+import importlib.util, pathlib, sqlite3, ssl, sys
+sys.path.insert(0, str(pathlib.Path(sys.argv[1]).parent))
+spec = importlib.util.spec_from_file_location("root_check", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+pem = pathlib.Path(sys.argv[3]).read_text()
+fp = m.fingerprint(pem)
+with sqlite3.connect("file:" + sys.argv[2] + "?mode=ro", uri=True) as con:
+    for key in ("LicenseRootCertHK", "LicenseRootCertCN", "LicenseRootCertHKFingerprint", "LicenseRootCertCNFingerprint"):
+        rows = con.execute("select value from core_settings where key=?", (key,)).fetchall()
+        if len(rows) != 1:
+            raise SystemExit("Missing/duplicate root certificate row: " + key)
+        value = m.decrypt(rows[0][0])
+        if key.endswith("Fingerprint"):
+            valid = value == fp
+        else:
+            valid = ssl.PEM_cert_to_DER_cert(value) == ssl.PEM_cert_to_DER_cert(pem)
+        if not valid:
+            raise SystemExit("Root certificate readback mismatch: " + key)
+print("Root certificate readback: all four rows match " + fp)
+PY
+}
+official() {
+  python3 - "$1" "$2" "$PATCH_CORE" "$PATCH_AGENT" <<'PY'
+import contextlib, importlib.util, pathlib, sys
+path, kind, core_tool, agent_tool = sys.argv[1:]
+sys.path.insert(0, str(pathlib.Path(core_tool).parent))
+spec = importlib.util.spec_from_file_location("patch_check", core_tool if kind == "core" else agent_tool)
+m = importlib.util.module_from_spec(spec)
+with contextlib.redirect_stdout(sys.stderr):
+    spec.loader.exec_module(m)
+data = pathlib.Path(path).read_bytes()
+if kind == "core":
+    # Restoration must work without the current site's certificate/private key.
+    m.root_fingerprint = lambda *args, **kwargs: m.ROOT_FP_HK_ORIG
+    sites = [s for s in m.build_table(data, remote_base="", verbose=False) if s[0].startswith(("P1.", "P2.", "C7."))]
+    if len(sites) != 3 or any(orig is None or data[off:off + len(orig)] != orig
+                              for _, off, orig, _, _ in sites):
+        raise SystemExit("Not an official original core: " + path)
+    for host in ("hk", "cn"):
+        if data.count(("https://license.lxware.%s/api/v1/" % host).encode()) != 1:
+            raise SystemExit("Original core contains modified license addresses: " + path)
 else:
-    print("!! 无 manifest.json，跳过校验")
-print("根证书指纹: %s" % fp)
+    sites = m.locate(data)
+    if not sites or any(s[2] != "original" for s in sites):
+        raise SystemExit("Not an official original agent: " + path)
 PY
-
-# ---- 4) 安装内核 ----
-mkdir -p "$BACKUP"
-if [ ! -f "$BACKUP/core.orig" ] && [ -f "$CORE_BIN" ]; then
-  cp -f "$CORE_BIN" "$BACKUP/core.orig"
-  log "备份原内核 -> $BACKUP/core.orig"
-fi
-mkdir -p "$WORK/build/orig"
-[ -f "$WORK/build/orig/core.orig" ] || cp -f "$DL/core.orig" "$WORK/build/orig/core.orig" 2>/dev/null || true
-
-systemctl stop "$CORE_SVC" 2>/dev/null || true
-install -m 0755 "$DL/core" "$CORE_BIN"
-log "内核已安装 -> $CORE_BIN"
-
-# ---- 5) 写入根证书（core_settings 的 4 行；写之前会自动备份官方原值）----
-if [ -f "$XPACK_DB" ]; then
-  python3 "$WORK/tools/cert_store.py" --cert "$WORK/state/license.crt" --db "$XPACK_DB"
-else
-  die "未找到 $XPACK_DB —— 面板还没初始化过。请先启动一次面板再重跑本脚本。"
-fi
-
-systemctl start "$CORE_SVC" 2>/dev/null || true
-sleep 8
-systemctl is-active "$CORE_SVC" || echo "!! 服务未 active，请查 journalctl -u $CORE_SVC"
-
-# ---- 6) agent 放行（多节点需要；不存在就跳过）----
-if [ "${SKIP_AGENT:-0}" != "1" ] && [ -f "$AGENT_BIN" ]; then
-  [ -f "$BACKUP/agent.orig" ] || cp -f "$AGENT_BIN" "$BACKUP/agent.orig"
-  systemctl stop "$AGENT_SVC" 2>/dev/null || true
-  if python3 "$WORK/tools/patch_agent.py" --patch --in "$AGENT_BIN" \
-       --out "$AGENT_BIN" --orig "$BACKUP/agent.orig"; then
-    log "agent 已放行 xpack 门"
-  else
-    echo "!! agent 补丁失败（版本/架构不匹配则忽略；单机版不影响）"
+}
+backup_orig() {
+  local SRC="$1" NAME="$2" SUM DEST
+  official "$SRC" "$NAME"
+  SUM="$(sha256sum "$SRC")"; SUM="${SUM%% *}"
+  DEST="$BACKUP/1panel-$NAME.orig"
+  # Retain first official rollback image and each newer verified original.
+  if [ -f "$DEST" ]; then
+    official "$DEST" "$NAME"
+    if [ -f "$DEST.sha256" ]; then sha256sum -c "$DEST.sha256"; fi
+  else install -m 0755 "$SRC" "$DEST"; fi
+  sha256sum "$DEST" > "$DEST.sha256"
+  install -m 0755 "$SRC" "$BACKUP/1panel-$NAME.$SUM.orig"
+}
+restore_source() {
+  local NAME="$1" FILE
+  for FILE in "$BACKUP/1panel-$NAME.orig" "$BACKUP/$NAME.orig"; do
+    if [ -f "$FILE" ]; then
+      official "$FILE" "$NAME" || return 1
+      if [ -f "$FILE.sha256" ]; then sha256sum -c "$FILE.sha256" >&2 || return 1; fi
+      printf '%s\n' "$FILE"
+      return
+    fi
+  done
+  die "Missing official $NAME rollback image"
+}
+if [ "$MODE" = restore ]; then
+  CORE_ORIG="$(restore_source core)"
+  AGENT_ORIG=""
+  if [ -f "$BACKUP/1panel-agent.orig" ] || [ -f "$BACKUP/agent.orig" ]; then AGENT_ORIG="$(restore_source agent)"; fi
+  [ -f "$XPACK_DB" ] || die "Missing initialized database: $XPACK_DB"
+  systemctl stop "$CORE_SVC"
+  [ -z "$AGENT_ORIG" ] || systemctl stop "$AGENT_SVC"
+  install -m 0755 "$CORE_ORIG" "$CORE_BIN"
+  python3 "$CERT_STORE" --db "$XPACK_DB" --bak "$BACKUP/core_settings_license_rootcert.json" --restore
+  if [ -n "$AGENT_ORIG" ]; then
+    install -m 0755 "$AGENT_ORIG" "$AGENT_BIN"
+    systemctl start "$AGENT_SVC"
+    systemctl is-active --quiet "$AGENT_SVC"
   fi
-  systemctl start "$AGENT_SVC" 2>/dev/null || true
-else
-  log "跳过 agent（不存在或 SKIP_AGENT=1）"
-fi
-
-# ---- 7) 生成并应用授权（企业版 + N 节点 + 永久离线）----
-if [ "${NO_APPLY:-0}" = "1" ]; then
-  python3 "$WORK/tools/gen_license.py" --edition enterprise --expires "$EXPIRES" \
-      --nodes "$NODES" --assignee "$ASSIGNEE" --offline \
-      --out "$WORK/license.txt"
-  log "授权文件：$WORK/license.txt（自行在面板 → 许可证 → 导入）"
+  systemctl start "$CORE_SVC"
+  systemctl is-active --quiet "$CORE_SVC"
+  log "Restored official binaries and root certificate rows"
   exit 0
 fi
-
-[ -f "$XPACK_DB" ] || die "缺少 $XPACK_DB，无法写入授权"
-python3 "$WORK/tools/gen_license.py" --edition enterprise --expires "$EXPIRES" \
-    --nodes "$NODES" --assignee "$ASSIGNEE" --offline \
-    --out "$WORK/license.txt" --apply
-
-# ---- 8) 自检：内核补丁 / 根证书行 / 授权签名，任一不过就报错退出 ----
-echo
-log "自检"
-python3 "$WORK/tools/patch_core.py" --verify --in "$CORE_BIN" | tail -n 4
-python3 "$WORK/tools/cert_store.py" --db "$XPACK_DB" --show | tail -n 4
-python3 - "$WORK/license.txt" <<'PY'
-import base64, json, pathlib, ssl, subprocess, sys, tempfile
-segs = pathlib.Path(sys.argv[1]).read_text().strip().split("-")
-if len(segs) < 3:
-    raise SystemExit("!! 授权段数不足 3（内容-签名-证书）")
-raw, sig, der = (base64.b64decode(s) for s in segs[:3])
-if sig == b"license-unsigned":
-    raise SystemExit("!! 授权未签名（第 2 段是占位符）—— 面板会判无效")
-tmp = tempfile.mkdtemp()
-for name, data in (("raw", raw), ("sig", sig), ("crt.pem", ssl.DER_cert_to_PEM_cert(der).encode())):
-    open(tmp + "/" + name, "wb").write(data)
-pub = subprocess.run(["openssl", "x509", "-in", tmp + "/crt.pem", "-pubkey", "-noout"],
-                     capture_output=True, check=True).stdout
-open(tmp + "/pub.pem", "wb").write(pub)
-r = subprocess.run(["openssl", "dgst", "-sha256", "-verify", tmp + "/pub.pem",
-                    "-signature", tmp + "/sig", tmp + "/raw"], capture_output=True)
-if r.returncode != 0:
-    raise SystemExit("!! 签名校验失败: %s" % r.stderr.decode().strip())
-d = json.loads(raw)
-print("   授权解析  : %s / %s / 到期 %s / 节点 %s" % (
-    d.get("licenseName"), (d.get("annotations") or {}).get("lxware.cn/edition"),
-    d["products"][0]["expiresAt"], d["products"][0]["maxNodeCount"]))
-print("   签名校验  : RSA-SHA256 通过")
+[ -s "$SIGN_CRT" ] || die "Missing public root certificate: $SIGN_CRT"
+if [ "$MODE" = verify ]; then
+  python3 "$PATCH_CORE" --verify --in "$CORE_BIN"
+  python3 "$CERT_STORE" --db "$XPACK_DB" --show
+  check_root
+  python3 "$GEN_LICENSE" --verify-db --db "$XPACK_DB" --serial-path "$PANEL_ROOT/db/.serial"
+  systemctl is-active --quiet "$CORE_SVC"
+  exit 0
+fi
+RUN="$(mktemp -d "$PERSIST/run.XXXXXX")"
+LICENSE_OUT="$RUN/license.txt"
+if [ -n "${LICENSE_FILE:-}" ]; then
+  install -m 0600 "$LICENSE_FILE" "$LICENSE_OUT"
+elif [ -s "$SIGN_KEY" ]; then
+  python3 "$GEN_LICENSE" --edition enterprise --expires "${EXPIRES:-2099-12-31}" \
+    --nodes "${NODES:-999}" --assignee "${ASSIGNEE:-YG}" --offline --out "$LICENSE_OUT" \
+    --db "$XPACK_DB" --serial-path "$PANEL_ROOT/db/.serial"
+else
+  python3 "$GEN_LICENSE" --export-existing "$LICENSE_OUT" --db "$XPACK_DB"
+  log "Reusing verified existing certificate; expiry and node allowance remain signed values"
+fi
+# Shared generator owns encrypted three-segment decoding/signature verification.
+python3 - "$GEN_LICENSE" "$LICENSE_OUT" "$PANEL_ROOT/db/.serial" <<'PY'
+import datetime as dt, importlib.util, pathlib, sys
+sys.path.insert(0, str(pathlib.Path(sys.argv[1]).parent))
+spec = importlib.util.spec_from_file_location("license_check", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+content = m.verify_license(pathlib.Path(sys.argv[2]).read_text())
+if content.get("offline") is not True:
+    raise SystemExit("An offline signed license is required")
+products = content.get("products") or []
+if not products or not content.get("deviceID") or int(products[0].get("maxNodeCount", 0)) < 1:
+    raise SystemExit("Missing device ID or invalid node allowance")
+for product in products:
+    expiry = dt.datetime.fromisoformat(product["expiresAt"].replace("Z", "+00:00"))
+    if expiry.tzinfo is None:
+        raise SystemExit("License expiry must include its timezone")
+    if expiry <= dt.datetime.now(dt.timezone.utc):
+        raise SystemExit("The signed license has expired")
+serial = pathlib.Path(sys.argv[3])
+if serial.is_file() and serial.read_text().strip() != content["deviceID"]:
+    raise SystemExit("License device ID differs from panel serial")
+print("License: %s / expiry %s / nodes %s" % (
+    content.get("licenseName"), content["products"][0]["expiresAt"], content["products"][0]["maxNodeCount"]))
 PY
-
-echo
-log "全部完成"
-echo "   内核      : $CORE_BIN"
-echo "   根证书行  : $XPACK_DB core_settings"
-echo "   授权      : 企业版 / ${NODES} 节点 / 永久离线 / 到期 $EXPIRES"
-echo "   回滚      : 见 README「回滚」一节（备份在 $BACKUP）"
+if [ "$MODE" = cert ]; then log "Signed offline license retained: $LICENSE_OUT"; exit 0; fi
+[ -f "$XPACK_DB" ] || die "Missing initialized database: $XPACK_DB"
+if [ "${NO_APPLY:-0}" != 1 ]; then
+  HELP="$(python3 "$GEN_LICENSE" --help)"
+  for FLAG in --db --serial-path --no-restart --replace-root-fingerprint --verify-db; do
+    [[ "$HELP" == *"$FLAG"* ]] || die "Update gen_license.py: missing $FLAG (legacy expiry patching is not used)"
+  done
+fi
+if [ -n "${ARTIFACT_DIR:-}" ]; then
+  install -m 0600 "$ARTIFACT_DIR/manifest.json" "$RUN/manifest.json"
+  for NAME in 1panel-core core; do
+    if [ -f "$ARTIFACT_DIR/$NAME" ]; then install -m 0755 "$ARTIFACT_DIR/$NAME" "$RUN/core"; break; fi
+  done
+  for NAME in 1panel-core.orig core.orig orig/1panel-core.orig orig/core.orig; do
+    if [ -f "$ARTIFACT_DIR/$NAME" ]; then install -m 0755 "$ARTIFACT_DIR/$NAME" "$RUN/core.orig"; break; fi
+  done
+else
+  if [ -n "${ARTIFACT_URL:-}" ]; then BASE="${ARTIFACT_URL%/}"
+  else
+    if [ -n "${VERSION:-}" ]; then TAG="core-v${VERSION#v}-${ARCH}"
+    else
+      fetch "https://api.github.com/repos/$REPO/releases?per_page=100" "$RUN/releases.json"
+      TAG="$(python3 - "$RUN/releases.json" "$ARCH" <<'PY'
+import json, re, sys
+for release in json.load(open(sys.argv[1])):
+    tag = release.get("tag_name", "")
+    if not release.get("draft") and not release.get("prerelease") and re.fullmatch(r"core-v?\d[^/]*-" + sys.argv[2], tag):
+        print(tag)
+        break
+PY
+)"
+    fi
+    [ -n "$TAG" ] || die "No Release for $ARCH"
+    BASE="https://github.com/$REPO/releases/download/$TAG"
+  fi
+  fetch "$BASE/manifest.json" "$RUN/manifest.json"
+  fetch "$BASE/1panel-core" "$RUN/core" || fetch "$BASE/core" "$RUN/core"
+  fetch "$BASE/1panel-core.orig" "$RUN/core.orig" || fetch "$BASE/core.orig" "$RUN/core.orig"
+fi
+python3 - "$RUN" "$SIGN_CRT" "$ARCH" <<'PY'
+import hashlib, json, pathlib, ssl, struct, sys
+dl, cert, arch = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), sys.argv[3]
+man = json.loads((dl / "manifest.json").read_text())
+fp = hashlib.sha256(ssl.PEM_cert_to_DER_cert(cert.read_text())).hexdigest()
+if man.get("name", "core") not in ("core", "1panel-core"):
+    raise SystemExit("Wrong artifact name")
+if man.get("arch") != arch or man.get("root_fingerprint") != fp:
+    raise SystemExit("Manifest arch/root_fingerprint mismatch")
+for name, key, alias in (("core", "sha256", "output_sha256"), ("core.orig", "orig_sha256", "source_sha256")):
+    data = (dl / name).read_bytes()
+    want = man.get(key) or man.get(alias)
+    if not want or hashlib.sha256(data).hexdigest() != want:
+        raise SystemExit("Missing/mismatched " + key)
+    if len(data) < 20 or data[:6] != b"\x7fELF\x02\x01" or struct.unpack_from("<H", data, 18)[0] != {"amd64": 62, "arm64": 183}[arch]:
+        raise SystemExit("ELF architecture mismatch: " + name)
+    if name == "core" and data.count(fp.encode()) < 2:
+        raise SystemExit("Artifact does not contain declared root fingerprint")
+print("Verified Release sha256 + orig sha256 + arch + rootFP: " + fp)
+PY
+official "$RUN/core.orig" core
+# Rebuild every run (including old online Releases) from the verified original.
+python3 "$PATCH_CORE" --patch --in "$RUN/core.orig" --out "$RUN/core.offline" \
+  --orig "$RUN/core.orig" --manifest "$RUN/offline.manifest.json" --remote-base ''
+python3 "$PATCH_CORE" --verify --in "$RUN/core.offline"
+python3 - "$RUN/core.orig" "$RUN/core.offline" <<'PY'
+import pathlib, sys
+orig, out = (pathlib.Path(p).read_bytes() for p in sys.argv[1:])
+for host in ("hk", "cn"):
+    url = ("https://license.lxware.%s/api/v1/" % host).encode()
+    pos = orig.find(url)
+    if pos < 0 or orig.find(url, pos + 1) >= 0 or out[pos:pos + len(url)] != url:
+        raise SystemExit("P3/P4 not cleared; update local patch_core tool")
+PY
+AGENT_SOURCE=""
+if [ "${SKIP_AGENT:-0}" != 1 ] && [ -f "$AGENT_BIN" ]; then
+  if official "$AGENT_BIN" agent; then AGENT_SOURCE="$AGENT_BIN"
+  else AGENT_SOURCE="$(restore_source agent)"; fi
+  install -m 0755 "$AGENT_SOURCE" "$RUN/agent.orig"
+  python3 "$PATCH_AGENT" --patch --in "$RUN/agent.orig" --out "$RUN/agent" \
+    --orig "$RUN/agent.orig" --manifest "$RUN/agent.manifest.json"
+  python3 "$PATCH_AGENT" --verify --in "$RUN/agent"
+fi
+backup_orig "$RUN/core.orig" core
+[ -z "$AGENT_SOURCE" ] || backup_orig "$RUN/agent.orig" agent
+systemctl stop "$CORE_SVC"
+[ -z "$AGENT_SOURCE" ] || systemctl stop "$AGENT_SVC"
+install -m 0755 "$RUN/core.offline" "$CORE_BIN"
+[ -z "$AGENT_SOURCE" ] || install -m 0755 "$RUN/agent" "$AGENT_BIN"
+# Read old site fingerprints before root rotation, excluding official roots.
+python3 - "$CERT_STORE" "$XPACK_DB" "$BACKUP/script_root_fingerprints" > "$RUN/old-root-fingerprints" <<'PY'
+import importlib.util, pathlib, re, sqlite3, sys
+sys.path.insert(0, str(pathlib.Path(sys.argv[1]).parent))
+spec = importlib.util.spec_from_file_location("old_store", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+history = pathlib.Path(sys.argv[3])
+fps = set(history.read_text().splitlines()) if history.is_file() else set()
+with sqlite3.connect("file:" + sys.argv[2] + "?mode=ro", uri=True) as con:
+    for key in ("LicenseRootCertHKFingerprint", "LicenseRootCertCNFingerprint"):
+        row = con.execute("select value from core_settings where key=?", (key,)).fetchone()
+        if row:
+            try:
+                fp = m.decrypt(row[0])
+            except Exception:
+                continue
+            if re.fullmatch(r"[0-9a-f]{64}", fp) and fp not in m.OFFICIAL_FP.values():
+                fps.add(fp)
+for fp in sorted(fps):
+    if re.fullmatch(r"[0-9a-f]{64}", fp) and fp not in m.OFFICIAL_FP.values():
+        print(fp)
+PY
+# Retain previous roots across NO_APPLY or an interrupted certificate rotation.
+install -m 0600 "$RUN/old-root-fingerprints" "$BACKUP/script_root_fingerprints"
+python3 "$CERT_STORE" --cert "$SIGN_CRT" --db "$XPACK_DB" --bak "$BACKUP/core_settings_license_rootcert.json"
+if [ "${NO_APPLY:-0}" != 1 ]; then
+  REPLACE_ARGS=()
+  while IFS= read -r FP; do REPLACE_ARGS+=(--replace-root-fingerprint "$FP"); done < "$RUN/old-root-fingerprints"
+  python3 "$GEN_LICENSE" --import-file "$LICENSE_OUT" --apply --db "$XPACK_DB" \
+    --serial-path "$PANEL_ROOT/db/.serial" --no-restart "${REPLACE_ARGS[@]}"
+fi
+cmp -s "$RUN/core.offline" "$CORE_BIN" || die "Installed core changed during license apply"
+if [ -n "$AGENT_SOURCE" ]; then
+  systemctl start "$AGENT_SVC"
+  systemctl is-active --quiet "$AGENT_SVC"
+fi
+systemctl start "$CORE_SVC"
+systemctl is-active --quiet "$CORE_SVC"
+python3 "$PATCH_CORE" --verify --in "$CORE_BIN"
+python3 "$CERT_STORE" --db "$XPACK_DB" --show
+check_root
+if [ "${NO_APPLY:-0}" != 1 ]; then
+  python3 "$GEN_LICENSE" --verify-db --db "$XPACK_DB" --serial-path "$PANEL_ROOT/db/.serial"
+fi
+if [ "${NO_APPLY:-0}" = 1 ]; then log "Core/certificate replaced; license NOT applied (NO_APPLY=1)"
+else log "Core/certificate replaced; offline license applied with automatic main-node binding"; fi
+log "License and verified artifacts retained: $RUN"
+log "Rollback: bash unlock.sh restore (official images: $BACKUP)"
