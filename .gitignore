@@ -14,3 +14,6 @@ __pycache__/
 # Public root certificates are versioned; local signing keys remain local.
 state/*.key
 web/state/*.key
+
+# dpanel 测试产物
+dist/
