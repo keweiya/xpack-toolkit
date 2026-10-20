@@ -596,7 +596,7 @@ if [ "$NEED_AGENT" = 1 ]; then
   fetch "$(<"$RUN/agent.url")" "$RUN/agent.orig"
   python3 "$PATCH_AGENT" --patch --in "$RUN/agent.orig" --out "$RUN/agent" \
     --orig "$RUN/agent.orig" --manifest "$RUN/agent.manifest.json"
-  python3 "$PATCH_AGENT" --verify --in "$RUN/agent"
+  python3 "$PATCH_AGENT" --verify --in "$RUN/agent" --orig "$RUN/agent.orig"
   AGENT_SOURCE="$RUN/agent"
   log "Rebuilt $ARCH agent from verified official source"
 fi

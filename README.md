@@ -68,7 +68,9 @@ sudo bash unlock.sh restore                    # 回滚到替换前的官方内�
 | A7 | `app/service.syncNodeInfo` 分支 | 恒走 InitXpack，永不 ResetXpack |
 | A8 | `alert_xpack.GetLicenseAlert` | 入口返回 nil，不再弹授权告警 |
 
-arm64 用等价指令实现同一套语义：入口 `mov w0,#1; ret`、`mov x0..x2,xzr; ret`，读 edition 字节的 `ldrb` 换成 `mov wN,#1`，`tbz` 分支换成 `nop`。
+arm64 不写死指令偏移，改成结构化解码：先从 `IsXpack()` 里解出 `isXpack` 全局字节的地址（`adrp` + `ldrb` 的页 + 页内偏移），再在 `initXpack` / `InitLicenseInfo` / `syncNodeInfo` 里找写这个地址的 `strb`，回溯出 `edition` 字段的读法，最后把这几处 `ldrb` 全换成 `mov wN,#1`（入口另加两个返回桩）。因为地址和字段都是现场解出来的，v2.3.x 和 v2.4.x 共用同一份代码，上游再发新版也不用来回改表。
+
+校验已经打过补丁的 Agent 时要带 `--orig` 指向官方原件：入口桩打完之后 `IsXpack()` 里已经没有 `adrp`/`ldrb` 可解，需要拿原件推站点偏移。
 
 ### 版本差异（v2.3.2 → v2.4.0）
 

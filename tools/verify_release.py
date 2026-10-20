@@ -73,7 +73,8 @@ def check_platform(release, platform, info):
     with tempfile.TemporaryDirectory() as tmp:
         target = Path(tmp) / "agent"
         run([ROOT / "tools/patch_agent.py", "--in", agent, "--out", target, "--patch"])
-        listing = run([ROOT / "tools/patch_agent.py", "--in", target, "--verify"])
+        listing = run([ROOT / "tools/patch_agent.py", "--in", target, "--verify",
+                       "--orig", agent])
         if "all patches present" not in listing:
             raise VerifyError("agent patches incomplete for {}:\n{}".format(platform, listing))
         if target.stat().st_size != agent.stat().st_size:

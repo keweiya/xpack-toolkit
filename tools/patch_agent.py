@@ -84,34 +84,7 @@ PATTERN_SITES = {
          bytes.fromhex("b8010000009090908805"),
          "app/service.syncNodeInfo: isXpack 全局 <- 1"),
     ],
-    # arm64：把「读 edition 字节」改成 mov wN,#1；把 tbz 改成 nop。
-    # 每个模式带上下一条指令，避免同函数内同 opcode 撞车（A6 就是靠这个区分的）。
-    "arm64": [
-        ("A3.initXpack.log_true", "xpack.initXpack",
-         bytes.fromhex("08604239895c00b0"),
-         bytes.fromhex("280080d2895c00b0"),
-         "日志行读取 isXpack=true"),
-        ("A4.initXpack.store_true", "xpack.initXpack",
-         bytes.fromhex("a56042399b6701b0"),
-         bytes.fromhex("250080d29b6701b0"),
-         "isXpack 全局 <- 1"),
-        ("A5.InitLicenseInfo.store_true", "common_xpack.InitLicenseInfo",
-         bytes.fromhex("006042393be501b0"),
-         bytes.fromhex("200080d23be501b0"),
-         "common_xpack.InitLicenseInfo: isXpack 全局 <- 1"),
-        ("A6.syncNodeInfo.store_true", "app/service.syncNodeInfo",
-         bytes.fromhex("e04344391b6a01d0"),
-         bytes.fromhex("200080d21b6a01d0"),
-         "app/service.syncNodeInfo: isXpack 全局 <- 1"),
-        ("A2.initXpack.drop_guard", "xpack.initXpack",
-         bytes.fromhex("26080036a69c46a9"),
-         bytes.fromhex("1f2003d5a69c46a9"),
-         "xpack.initXpack: 永不跳过 X-Pack 初始化块"),
-        ("A7.syncNodeInfo.prefer_init", "app/service.syncNodeInfo",
-         bytes.fromhex("e0000036b89aff97"),
-         bytes.fromhex("1f2003d5b89aff97"),
-         "syncNodeInfo: 恒调 InitXpack()，永不 ResetXpack()"),
-    ],
+    "arm64": [],
 }
 
 # 需要「先锚定比较指令，再改它后面的条件跳转」的站点：
@@ -127,6 +100,138 @@ BRANCH_SITES = {
     ],
     "arm64": [],
 }
+
+
+# --------------------------------------------------------------------------- #
+# arm64：结构化解码定位（不写死偏移，跨版本复用）
+#
+# isXpack 全局字节的地址每个版本都不同（v2.3.2 是 adrp+2938，v2.4.0 是 adrp+1658），
+# 所以不能像 amd64 那样固定字节模式。这里的做法是：
+#   1. 从 IsXpack 自己的代码里解出全局地址（adrp + ldrb）；
+#   2. 在 initXpack / InitLicenseInfo / syncNodeInfo 里找写这个地址的 strb，
+#      再回溯拿到值来源那条 ldrb 的字段偏移；
+#   3. 把这些函数里「读同一个字段」的 ldrb 全部换成 mov wN,#1。
+# 顺带把授权分支（tbz）也一并消除——因为判断用的就是同一个字段。
+# --------------------------------------------------------------------------- #
+A64_TARGET_FUNCS = (
+    ("xpack.initXpack", ("A3.initXpack.log_true", "A2.initXpack.drop_guard",
+                         "A4.initXpack.store_true")),
+    ("common_xpack.InitLicenseInfo", ("A5.InitLicenseInfo.store_true",)),
+    ("app/service.syncNodeInfo", ("A6.syncNodeInfo.store_true",
+                                  "A7.syncNodeInfo.prefer_init")),
+)
+
+
+def _a64_adrp(word, pc):
+    """ADRP：返回 (目标页地址, Rd)。"""
+    if word & 0x9F000000 != 0x90000000:
+        return None
+    immlo = (word >> 29) & 0x3
+    immhi = (word >> 5) & 0x7FFFF
+    immediate = (immhi << 2) | immlo
+    if immediate & (1 << 20):
+        immediate -= 1 << 21
+    return ((pc & ~0xFFF) + (immediate << 12)) & 0xFFFFFFFFFFFF, word & 0x1F
+
+
+def _a64_byte_mem(word):
+    """LDRB / STRB (unsigned immediate)：返回 (kind, Rt, Rn, imm)。"""
+    if word & 0xFFC00000 == 0x39400000:
+        kind = "ldrb"
+    elif word & 0xFFC00000 == 0x39000000:
+        kind = "strb"
+    else:
+        return None
+    return kind, word & 0x1F, (word >> 5) & 0x1F, (word >> 10) & 0xFFF
+
+
+def _a64_mov_one(reg):
+    """MOV wN, #1（零扩展，等价于编译器生成的 movz）。"""
+    return 0xD2800000 | (1 << 5) | (reg & 0x1F)
+
+
+def _a64_words(data, sym):
+    lo, hi = sym["off"], sym["off"] + sym["size"]
+    return [(lo + i, struct.unpack_from("<I", data, lo + i)[0])
+            for i in range(0, hi - lo - 3, 4)], lo
+
+
+def _a64_global_byte(data, syms):
+    """从 IsXpack 解出 isXpack 全局字节的绝对地址。"""
+    sym = _func(syms, ".(*multiNodeHelper).IsXpack")
+    words, lo = _a64_words(data, sym)
+    page = None
+    for off, word in words:
+        adrp = _a64_adrp(word, sym["vaddr"] + (off - lo))
+        if adrp:
+            page = adrp
+            continue
+        mem = _a64_byte_mem(word)
+        if page and mem and mem[0] == "ldrb" and mem[2] == page[1]:
+            return (page[0] + mem[3]) & 0xFFFFFFFFFFFF
+    raise ValueError("cannot resolve isXpack global byte from IsXpack()"
+                     "（文件可能已打过补丁，请用 --orig 指向官方原件）")
+
+
+def _a64_store_sites(data, syms, suffix, target):
+    """函数内写 target 的 strb 站点：(offset, Rt, 值来源 ldrb 的字段偏移)。"""
+    sym = _func(syms, suffix)
+    words, lo = _a64_words(data, sym)
+    pages = {}
+    found = []
+    for index, (off, word) in enumerate(words):
+        adrp = _a64_adrp(word, sym["vaddr"] + (off - lo))
+        if adrp:
+            pages[adrp[1]] = adrp[0]
+            continue
+        mem = _a64_byte_mem(word)
+        if not mem or mem[0] != "strb":
+            continue
+        base = pages.get(mem[2])
+        if base is None or base + mem[3] != target:
+            continue
+        # 回溯：谁写了这个值寄存器 —— 拿到 (是否 SP 相对, 立即数) 这个「读法」
+        source = None
+        for back in range(index - 1, max(index - 9, -1), -1):
+            src = _a64_byte_mem(words[back][1])
+            if src and src[0] == "ldrb" and src[1] == mem[1]:
+                source = (src[2] == 31, src[3])
+                break
+        found.append((off, mem[1], source))
+    return found
+
+
+def a64_sites(data, syms):
+    """arm64 的 8 个站点：2 个入口桩 + 6 处 edition 字段读取。"""
+    rows = [_entry(data, syms, name, suffix, stub, note)
+            for name, suffix, stub, note in ENTRY_STUBS["arm64"]]
+    target = _a64_global_byte(data, syms)
+
+    for suffix, names in A64_TARGET_FUNCS:
+        sources = {row[2] for row in _a64_store_sites(data, syms, suffix, target)}
+        if len(sources) != 1 or None in sources:
+            raise ValueError("cannot derive the edition read pattern in %s: %r"
+                             % (suffix, sorted(str(item) for item in sources)))
+        is_sp, field = sources.pop()
+        sym = _func(syms, suffix)
+        words, _lo = _a64_words(data, sym)
+        reads = [(off, word) for off, word in words
+                 if (lambda m: m and m[0] == "ldrb" and (m[2] == 31) == is_sp
+                     and m[3] == field)(_a64_byte_mem(word))]
+        if len(reads) != len(names):
+            raise ValueError("expected %d edition reads in %s, got %d"
+                             % (len(names), suffix, len(reads)))
+        for (off, word), name in zip(reads, names):
+            rt = word & 0x1F
+            orig = data[off:off + 4]
+            patch = struct.pack("<I", _a64_mov_one(rt))
+            rows.append((name, off, orig, patch, state_of(data, off, patch, orig),
+                         "edition 读取恒为 1（isXpack=true）"))
+    rows.sort(key=lambda row: row[1])
+    names = [row[0] for row in rows]
+    if len(names) != 8 or len(set(names)) != 8:
+        raise ValueError("expected eight unique arm64 patch sites, got %r" % (names,))
+    return rows
 
 
 def sha256(path):
@@ -253,11 +358,24 @@ def machine(data):
     return arch
 
 
-def sites(data, syms=None):
-    """完整站点列表：(name, off, orig, patch, state, note)，共 8 条。"""
-    arch = machine(data)
+def sites(data, syms=None, orig=None):
+    """完整站点列表：(name, off, orig, patch, state, note)，共 8 条。
+
+    orig 是「官方原件」：arm64 的站点靠解码 isXpack 全局地址推导，入口桩打完后
+    IsXpack 里已经没有 adrp/ldrb 可解，所以校验已打过补丁的文件要用原件做参考，
+    再按同一偏移在 data 里判状态。
+    """
+    arch = machine(data if orig is None else orig)
+    base = data if orig is None else orig
     if syms is None:
-        syms = _symbols(data)
+        syms = _symbols(base)
+    if arch == "arm64":
+        rows = a64_sites(base, syms)
+        if orig is None:
+            return rows
+        return [(name, off, data[off:off + len(patch)], patch,
+                 state_of(data, off, patch, cur), note)
+                for name, off, cur, patch, _state, note in rows]
     rows = [_entry(data, syms, name, suffix, stub, note)
             for name, suffix, stub, note in ENTRY_STUBS[arch]]
     rows.extend(_site(data, syms, name, suffix, orig, patch, note)
@@ -272,16 +390,18 @@ def sites(data, syms=None):
     return rows
 
 
-def locate(data, syms=None):
+def locate(data, syms=None, orig=None):
     """与 release.py 约定的接口：(name, file_offset, state, current_bytes)。"""
-    return [(name, off, state, cur) for name, off, cur, _patch, state, _note in sites(data, syms)]
+    return [(name, off, state, cur)
+            for name, off, cur, _patch, state, _note in sites(data, syms, orig)]
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--in", dest="src", default="/usr/local/bin/1panel-agent")
     ap.add_argument("--out", dest="dst", default=None)
-    ap.add_argument("--orig", default="build/orig/1panel-agent.orig")
+    ap.add_argument("--orig", default=None,
+                    help="官方原件路径：--patch 时作为原始备份，--verify 时作为解析参考")
     ap.add_argument("--manifest", default="build/1panel-agent.manifest.json")
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--verify", action="store_true")
@@ -309,8 +429,15 @@ def main():
         print("binary : %s" % args.src)
         print("sha256 : %s" % sha256(args.src))
         print("size   : %d" % len(data))
+        reference = None
+        if args.orig:
+            if not os.path.exists(args.orig):
+                print("!! missing pristine reference: %s" % args.orig)
+                return 2
+            reference = open(args.orig, "rb").read()
+            print("reference: %s" % args.orig)
         try:
-            rows = sites(data)
+            rows = sites(data, orig=reference)
         except (ValueError, OSError) as exc:
             print("!! %s" % exc)
             return 1
@@ -335,6 +462,7 @@ def main():
 
     if args.patch:
         src, dst = args.src, args.dst or args.src
+        args.orig = args.orig or "build/orig/1panel-agent.orig"
         data = bytearray(open(src, "rb").read())
         try:
             rows = sites(bytes(data))

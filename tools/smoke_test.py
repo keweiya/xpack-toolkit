@@ -152,7 +152,8 @@ def patch_agent(original, output):
     run([sys.executable, str(ROOT / "tools/patch_agent.py"), "--patch",
          "--in", str(original), "--out", str(output),
          "--manifest", str(Path(output).with_suffix(".manifest.json"))])
-    listing = run([sys.executable, str(ROOT / "tools/patch_agent.py"), "--verify", "--in", str(output)])
+    listing = run([sys.executable, str(ROOT / "tools/patch_agent.py"), "--verify",
+                   "--in", str(output), "--orig", str(original)])
     if "all patches present" not in listing:
         raise SmokeError("agent patch verification failed:\n" + listing)
 

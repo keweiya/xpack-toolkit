@@ -28,13 +28,41 @@ class MachineTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 agent.machine(blob)
 
-    def test_each_architecture_has_eight_sites(self):
+    def test_table_driven_architectures_have_eight_sites(self):
         for arch in ("amd64", "arm64"):
             names = [row[0] for row in agent.ENTRY_STUBS[arch]]
             names += [row[0] for row in agent.PATTERN_SITES[arch]]
             names += [row[0] for row in agent.BRANCH_SITES[arch]]
-            self.assertEqual(len(names), 8, arch)
-            self.assertEqual(len(set(names)), 8, arch)
+            if arch == "amd64":
+                self.assertEqual(len(names), 8, arch)
+            else:
+                # arm64 只有两个入口桩写死在表里，其余站点由结构化解码现场推导
+                self.assertEqual(len(names), 2, arch)
+            self.assertEqual(len(set(names)), len(names), arch)
+
+    def test_arm64_declares_six_derived_sites(self):
+        derived = [name for _suffix, names in agent.A64_TARGET_FUNCS for name in names]
+        self.assertEqual(len(derived), 6)
+        self.assertEqual(len(set(derived)), 6)
+
+
+V232 = ROOT / "build/release-v2.3.2"
+
+
+@unittest.skipUnless((V232 / "agent-linux-arm64.orig").is_file(),
+                     "official v2.3.2 arm64 agent not present")
+class CrossVersionTest(unittest.TestCase):
+    """arm64 站点靠解码 isXpack 全局地址推导，不写死偏移，跨版本应自动适配。"""
+
+    def test_v232_arm64_is_locatable(self):
+        rows = agent.sites((V232 / "agent-linux-arm64.orig").read_bytes())
+        self.assertEqual([row[4] for row in rows], ["original"] * 8)
+
+    def test_v232_and_v240_use_different_offsets(self):
+        old = agent.sites((V232 / "agent-linux-arm64.orig").read_bytes())
+        new = agent.sites(asset("arm64").read_bytes())
+        self.assertEqual([row[0] for row in old], [row[0] for row in new])
+        self.assertNotEqual([row[1] for row in old], [row[1] for row in new])
 
 
 @unittest.skipUnless(asset("amd64").is_file() and asset("arm64").is_file(),
@@ -49,7 +77,7 @@ class RoundTripTest(unittest.TestCase):
             patched[off:off + len(patch)] = patch
         patched = bytes(patched)
         self.assertEqual(len(patched), len(data), "补丁必须等长")
-        again = agent.sites(patched)
+        again = agent.sites(patched, orig=data)
         self.assertEqual([row[4] for row in again], ["patched"] * 8)
         changed = [i for i in range(len(data)) if data[i] != patched[i]]
         limit = sum(len(row[3]) for row in rows)
@@ -74,7 +102,7 @@ class RoundTripTest(unittest.TestCase):
                             "--manifest", str(Path(tmp) / "m.json")],
                            check=True, capture_output=True)
             listing = subprocess.run([sys.executable, str(ROOT / "tools/patch_agent.py"),
-                                      "--verify", "--in", str(out)],
+                                      "--verify", "--in", str(out), "--orig", str(asset("arm64"))],
                                      check=True, capture_output=True, text=True).stdout
             self.assertIn("all patches present", listing)
 
