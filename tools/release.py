@@ -192,7 +192,10 @@ def verify_agent_original(path, arch):
     spec = importlib.util.spec_from_file_location("xpack_release_agent", ROOT / "tools/patch_agent.py")
     agent = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(agent)
-    sites = agent.locate(path.read_bytes())
+    try:
+        sites = agent.locate(path.read_bytes())
+    except (ValueError, OSError) as exc:
+        raise ReleaseError("official amd64 agent patch sites are not locatable: " + str(exc)) from exc
     if len(sites) != 8 or len({name for name, _, _, _ in sites}) != 8:
         raise ReleaseError("official amd64 agent requires exactly eight known original patch sites")
     bad = [name + ":" + state for name, _, state, _ in sites if state != "original"]

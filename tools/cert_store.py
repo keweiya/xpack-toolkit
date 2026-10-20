@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """把「本站根证书」写进面板的 core_settings，让官方校验真实通过。
 
-背景（逆向自 1panel-core v2.3.2）
+背景（逆向自 1panel-core v2.3.2，v2.4.0 复核一致）
 --------------------------------
 面板导入许可证时走 license_helper.CheckInLocal：
 

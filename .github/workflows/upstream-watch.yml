@@ -1,0 +1,73 @@
+name: upstream-watch
+
+# 定时盯上游：官方一发新稳定版，就自动破解 + 自检 + 接口冒烟，全绿才发布。
+on:
+  schedule:
+    - cron: "23 2 * * *"     # 每天 02:23 UTC（10:23 CST）
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "强制指定版本（留空 = 自动检测上游最新稳定版）"
+        required: false
+        default: ""
+      smoke:
+        description: "是否跑 Docker 接口冒烟测试"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: xpack-publish-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  detect:
+    runs-on: ubuntu-24.04
+    outputs:
+      status: ${{ steps.watch.outputs.status }}
+      version: ${{ steps.watch.outputs.version }}
+      upstream: ${{ steps.watch.outputs.upstream }}
+      published: ${{ steps.watch.outputs.published }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compare upstream with published releases
+        id: watch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCED_VERSION: ${{ inputs.version }}
+        run: |
+          if [ -n "$FORCED_VERSION" ]; then
+            python3 tools/upstream_watch.py --repo "$GITHUB_REPOSITORY" \
+              --version "$FORCED_VERSION" --github-output
+          else
+            python3 tools/upstream_watch.py --repo "$GITHUB_REPOSITORY" --github-output
+          fi
+
+      - name: Summary
+        env:
+          UPSTREAM: ${{ steps.watch.outputs.upstream }}
+          PUBLISHED: ${{ steps.watch.outputs.published }}
+          STATUS: ${{ steps.watch.outputs.status }}
+        run: |
+          {
+            echo "### 上游检测"
+            echo "- 上游最新稳定版：\`${UPSTREAM:-未知}\`"
+            echo "- 仓库已发布：\`${PUBLISHED:-无}\`"
+            echo "- 结论：\`${STATUS}\`（update 才会进入构建发布）"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  release:
+    needs: detect
+    if: needs.detect.outputs.status == 'update'
+    permissions:
+      contents: write
+    uses: ./.github/workflows/pipeline.yml
+    with:
+      version: ${{ needs.detect.outputs.version }}
+      smoke: ${{ github.event_name != 'workflow_dispatch' || inputs.smoke }}
+    secrets: inherit

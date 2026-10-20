@@ -1,34 +1,32 @@
 name: build
 
+# 手动发布：跑与自动跟进完全相同的门禁流程（单测 -> 构建 -> 自检 -> Docker 冒烟 -> 发布）。
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Panel version (v2.3.2)"
+        description: "Panel version (v2.4.0)"
         required: true
-        default: "v2.3.2"
+        default: "v2.4.0"
+      smoke:
+        description: "是否跑 Docker 接口冒烟测试"
+        required: false
+        type: boolean
+        default: true
 
 permissions:
   contents: write
 
 concurrency:
-  group: xpack-release-${{ github.repository }}
+  group: xpack-publish-${{ github.repository }}
   cancel-in-progress: false
 
 jobs:
-  buildrelease:
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Checkout public source
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Build all verified platforms and publish one release
-        env:
-          VERSION: ${{ inputs.version }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: python3 tools/release.py --version "$VERSION" --publish --repo "$GITHUB_REPOSITORY"
+  release:
+    permissions:
+      contents: write
+    uses: ./.github/workflows/pipeline.yml
+    with:
+      version: ${{ inputs.version }}
+      smoke: ${{ inputs.smoke }}
+    secrets: inherit

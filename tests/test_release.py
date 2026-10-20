@@ -106,13 +106,43 @@ class ReleaseTests(unittest.TestCase):
 
     @classmethod
     def original_agent(cls, arch="amd64"):
-        if arch == "arm64":
-            return cls.elf_header(arch) + b"official arm64 agent"
-        data = bytearray(max(offset + len(original) for _, offset, original, _, _ in agent.PATCHES))
-        data[:20] = cls.elf_header(arch)
-        for _, offset, original, _, _ in agent.PATCHES:
-            data[offset:offset + len(original)] = original
-        return bytes(data)
+        # Archive-level fixtures only; agent patch sites are symbol/pattern located
+        # and exercised separately with an injected symbol table.
+        return cls.elf_header(arch) + b"official " + arch.encode() + b" agent"
+
+    @staticmethod
+    def agent_fixture():
+        """Synthetic agent bytes + injected pclntab symbol table for locate() tests."""
+        buffer = bytearray(b"\xcc" * 0x900)
+        sites = {
+            # A1 IsXpack entry: movzbl global,%eax; ret
+            0x100: "0fb60579cc0804c3",
+            # A8 GetLicenseAlert entry: stack check prologue
+            0x200: "493b6610763d554889e5",
+            # A3 log line reads isXpack
+            0x310: "440fb690980000004c8d1d00000000000000",
+            # A4 isXpack global <- value
+            0x330: "0fb69298000000881500000000",
+            # A2 anchor (cmpb $0,0x98(%rdx)) + long jump
+            0x350: "80ba98000000000f8420010000",
+            # A5 InitLicenseInfo store
+            0x510: "0fb68098000000880500000000",
+            # A6 syncNodeInfo store
+            0x710: "0fb6842408010000880500000000",
+            # A7 anchor (cmpb $0,0x108(%rsp)) + short jump
+            0x730: "80bc2408010000007410" + "90",
+        }
+        for offset, data in sites.items():
+            raw = bytes.fromhex(data)
+            buffer[offset:offset + len(raw)] = raw
+        syms = [
+            {"name": "x/xpack/edition/helper.(*multiNodeHelper).IsXpack", "off": 0x100, "size": 0x20},
+            {"name": "x/xpack/utils/alert_xpack.GetLicenseAlert", "off": 0x200, "size": 0x20},
+            {"name": "x/xpack.initXpack", "off": 0x300, "size": 0x100},
+            {"name": "x/xpack/utils/common_xpack.InitLicenseInfo", "off": 0x500, "size": 0x40},
+            {"name": "x/xpack/app/service.syncNodeInfo", "off": 0x700, "size": 0x100},
+        ]
+        return bytes(buffer), syms
 
     @classmethod
     def core_archive(cls, path, names, arch="amd64"):
@@ -173,20 +203,43 @@ class ReleaseTests(unittest.TestCase):
             self.assertEqual(destination.read_bytes(), self.elf_header("arm64"))
             self.assertEqual(destination.stat().st_mode & 0o777, 0o755)
 
-    def test_amd64_agent_requires_all_eight_original_sites(self):
+    def test_agent_patch_sites_are_located_by_symbol_and_pattern(self):
+        original, syms = self.agent_fixture()
+        rows = agent.sites(original, syms)
+        self.assertEqual(len(rows), 8)
+        self.assertEqual(len({name for name, *_ in rows}), 8)
+        self.assertTrue(all(state == "original" for _, _, _, _, state, _ in rows),
+                        [(name, state) for name, _, _, _, state, _ in rows])
+
+        patched = bytearray(original)
+        for _name, offset, _cur, patch, _state, _note in rows:
+            patched[offset:offset + len(patch)] = patch
+        patched = bytes(patched)
+        self.assertTrue(all(state == "patched" for _, _, state, _ in agent.locate(patched, syms)))
+
+        # A single unexpected byte must not be patched blindly.
+        broken = bytearray(original)
+        broken[0x310] ^= 0xFF
+        with self.assertRaisesRegex(ValueError, "A3.initXpack.log_true"):
+            agent.locate(bytes(broken), syms)
+
+    @unittest.skipUnless((ROOT / "build/release-v2.3.2/agent-linux-amd64.orig").is_file(),
+                         "official amd64 agent not present")
+    def test_official_agent_requires_all_eight_original_sites(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "agent"
-            original = self.original_agent()
+            original = (ROOT / "build/release-v2.3.2/agent-linux-amd64.orig").read_bytes()
             path.write_bytes(original)
             release.verify_agent_original(path, "amd64")
-            for name, offset, before, after, _ in agent.PATCHES:
-                for state, replacement in (("patched", after), ("unknown", b"\xff" * len(before))):
-                    with self.subTest(site=name, state=state):
-                        modified = bytearray(original)
-                        modified[offset:offset + len(before)] = replacement
-                        path.write_bytes(modified)
-                        with self.assertRaisesRegex(release.ReleaseError, name + ":" + state):
-                            release.verify_agent_original(path, "amd64")
+
+            rows = agent.sites(original)
+            modified = bytearray(original)
+            name, offset, _cur, patch, _state, _note = rows[0]
+            modified[offset:offset + len(patch)] = patch
+            path.write_bytes(bytes(modified))
+            with self.assertRaisesRegex(release.ReleaseError, name + ":patched"):
+                release.verify_agent_original(path, "amd64")
+
             path.write_bytes(self.original_agent("arm64"))
             with mock.patch.object(release.importlib.util, "spec_from_file_location") as load:
                 release.verify_agent_original(path, "arm64")
@@ -351,6 +404,7 @@ class ReleaseTests(unittest.TestCase):
                                                    "output_sha256": release.sha256(patched)}))
 
             with mock.patch.object(release, "extract_core", side_effect=extract), \
+                    mock.patch.object(release, "verify_agent_original"), \
                     mock.patch.object(release, "command", side_effect=patcher):
                 platforms = {arch: release.build_platform("v2.3.2", arch, root / (arch + ".tar.gz"), root / arch, assets)
                              for arch in release.SUPPORTED_ARCHES}
