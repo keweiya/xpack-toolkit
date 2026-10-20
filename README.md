@@ -70,6 +70,8 @@ sudo bash unlock.sh restore                    # 回滚到替换前的官方内�
 | A7 | `app/service.syncNodeInfo` 分支 | 恒走 InitXpack，永不 ResetXpack |
 | A8 | `alert_xpack.GetLicenseAlert` | 入口返回 nil，不再弹授权告警 |
 
+arm64 用等价指令实现同一套语义：入口 `mov w0,#1; ret`、`mov x0..x2,xzr; ret`，读 edition 字节的 `ldrb` 换成 `mov wN,#1`，`tbz` 分支换成 `nop`。
+
 ### 版本差异（v2.3.2 → v2.4.0）
 
 | 项目 | 变化 | 对破解流程的影响 |
@@ -77,7 +79,7 @@ sudo bash unlock.sh restore                    # 回滚到替换前的官方内�
 | 内核门控 | 8 个函数符号名、参数完全一致 | 定位方式零改动，重跑 `--verify` 即可确认 |
 | 内核桩 | C1 `checkLicense` 入口字节按版本自适应（`c3` / `b80100000031db31c9c3` / `31c031dbc3`） | 脚本自动挑能放下的那一种，不写死 |
 | Agent | 授权开关变成 `xpack/utils/edition.isXpack` 包级字节，3 写 7 读 | 旧的写死偏移失效，改成「符号 + 代码模式」定位（A1–A8） |
-| Agent 架构 | v2.4.0 的 arm64 模式与 amd64 不同 | arm64 不重建 Agent，沿用官方原件 |
+| Agent 架构 | v2.4.0 的 arm64 代码与 amd64 不同（`ldrb/strb`、`tbz`） | arm64 用单独一套模式：读 edition 字节改成 `mov wN,#1`、条件分支改成 `nop`，同样等长覆盖 |
 | 授权接口 | `/api/v2/core/enterprise/*` 消失，统一到 `/api/v2/core/licenses/*` | 冒烟测试改打 `/licenses/master/status`、`/licenses/search`、`/xpack/nodes/search` |
 | 登录协议 | `POST /api/v2/core/auth/login`，口令为 `b64(RSA(aeskey)):b64(iv):b64(AES-CBC(pwd))` 三段式，进户口令必须走 `EntranceCode` 头（JSON 字段被忽略） | `smoke_test.py` 内置这套加密，首次登录无验证码可直接自动化 |
 | 证书校验 | 官方内核在 `POST /licenses/upload` 处直接 `verify certificate failed` | 破解内核越过该校验；生产安装仍走「写库 + 绑定」路径，不依赖 upload 的三段式格式 |
@@ -99,7 +101,7 @@ sudo bash unlock.sh restore                    # 回滚到替换前的官方内�
 2. **单测**——`python3 -m unittest discover -s tests`。
 3. **构建**（`tools/release.py --build-only`）——按 SHA 校验官方包后逐平台打补丁，不发布。
 4. **资产自检**（`tools/verify_release.py`）——manifest 大小/哈希与实际文件一致、内核 8/8 补丁已打、Agent 原件能完整复现 8/8、等长覆盖不改体积。
-5. **接口冒烟**（`tools/smoke_test.py`，需 root/sudo：容器内面板以 root 建库，`db` 目录 0700）——**只在 Docker 容器里跑**，绝不碰宿主机的 1Panel：启动面板 → 登录 → 自制证书上传（官方内核此处失败、破解内核通过）→ 落库绑定 → `licenses/master/status` 为 `Bound`、节点 `isXpack=true` → 专业版接口放行。
+5. **接口冒烟**（`tools/smoke_test.py`，需 root/sudo：容器内面板以 root 建库，`db` 目录 0700）——**只在 Docker 容器里跑**，绝不碰宿主机的 1Panel，`amd64` / `arm64` 各跑一遍（arm64 走 qemu 模拟）：启动面板 → 登录 → 自制证书上传（官方内核此处失败、破解内核通过）→ 落库绑定 → `licenses/master/status` 为 `Bound`、节点 `isXpack=true` → 专业版接口放行。
 6. **发布**——前 5 步全绿才执行 `release.py --publish`，原子替换同名 Release。
 
 手动触发（`build` 工作流）走的是同一条 `pipeline.yml` 门禁流程，只是版本号由人填。
@@ -108,7 +110,7 @@ sudo bash unlock.sh restore                    # 回滚到替换前的官方内�
 
 - 仓库当前最高稳定版本 `v2.4.0`；机器版本高于它时提前退出。
 - 内核：`amd64 / x86_64`、`arm64 / aarch64`。
-- Agent 重建：`amd64`；arm64 保留现有 Agent。
+- Agent 重建：`amd64` / `arm64`，两个架构各自一套指令模式，都在 Docker 里冒烟验证过。
 - 所有架构放在同一 Release，始终选最高稳定版本；不回退、不降级机器。
 
 ## 安装失败

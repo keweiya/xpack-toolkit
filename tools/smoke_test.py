@@ -44,6 +44,8 @@ PASSWORD = "Admin123456"
 ENTRANCE_FALLBACK = "entrance"
 CONTAINER_PORT = 9999
 
+BASE_IMAGE = "ubuntu:24.04"
+
 DOCKERFILE = """FROM ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \\
@@ -183,19 +185,26 @@ def extract_1pctl(package):
     raise SmokeError("1pctl not found in official package: " + str(package))
 
 
-def build_image(context, tag):
-    print("== building smoke image {}".format(tag), flush=True)
-    run(["docker", "build", "-q", "-t", tag, str(context)], timeout=900)
+def build_image(context, tag, arch="amd64"):
+    platform = "linux/" + arch
+    print("== building smoke image {} ({})".format(tag, platform), flush=True)
+    # 同一台机器先后跑 amd64 / arm64 时，基础镜像 tag 会被另一次 pull 覆盖，
+    # 所以按平台重新 pull，并禁用层缓存，避免命中另一架构的中间层。
+    subprocess.run(["docker", "pull", "-q", "--platform", platform, BASE_IMAGE],
+                   text=True, capture_output=True)
+    run(["docker", "build", "-q", "--no-cache", "--platform", platform,
+         "-t", tag, str(context)], timeout=1800)
 
 
 class Panel:
     """一个隔离的 1Panel 运行实例（容器 + 宿主机数据目录）。"""
 
-    def __init__(self, name, image, data, port):
+    def __init__(self, name, image, data, port, arch="amd64"):
         self.name = name
         self.image = image
         self.data = data
         self.port = port
+        self.arch = arch
         self.url = "http://127.0.0.1:{}".format(port)
         self.cookies = {}
 
@@ -206,6 +215,7 @@ class Panel:
     def create(self):
         self.remove()
         run(["docker", "run", "-d", "--name", self.name,
+             "--platform", "linux/" + self.arch,
              "-p", "127.0.0.1:{}:9999".format(self.port),
              "-v", "{}:/opt/1panel".format(self.data), self.image])
         self.wait_ready()
@@ -381,11 +391,11 @@ def upload_license(panel, license_file):
 CERT_FAILURE_MARKERS = ("verify certificate", "证书校验", "证书链", "certificate failed")
 
 
-def patched_case(image, workdir, checker):
+def patched_case(image, workdir, checker, arch="amd64"):
     print("\n== 破解内核：完整接口链路", flush=True)
     data = workdir / "data-patched"
     data.mkdir()
-    panel = Panel("xpack-smoke-patched", image, data, free_port())
+    panel = Panel("xpack-smoke-patched", image, data, free_port(), arch)
     try:
         panel.create()
         license_file = workdir / "license-patched.txt"
@@ -432,11 +442,11 @@ def patched_case(image, workdir, checker):
         panel.remove()
 
 
-def official_case(image, workdir, checker, patched_message):
+def official_case(image, workdir, checker, patched_message, arch="amd64"):
     print("\n== 官方内核：同一份证书对照", flush=True)
     data = workdir / "data-official"
     data.mkdir()
-    panel = Panel("xpack-smoke-official", image, data, free_port())
+    panel = Panel("xpack-smoke-official", image, data, free_port(), arch)
     try:
         panel.create()
         license_file = workdir / "license-official.txt"
@@ -496,21 +506,22 @@ def main(argv=None):
     release = args.release.resolve()
     manifest_path = release / "manifest.json"
     version = json.loads(manifest_path.read_text())["version"] if manifest_path.is_file() else "unknown"
-    tag = args.image or "xpack-smoke:{}".format(re.sub(r"[^a-z0-9.-]+", "-", version.lower()))
+    tag = args.image or "xpack-smoke:{}".format(
+        re.sub(r"[^a-z0-9.-]+", "-", "{}-{}".format(version, args.arch).lower()))
 
     workdir = Path(tempfile.mkdtemp(prefix="xpack-smoke-"))
     checker = Checker()
     try:
         context = prepare_context(release, args.package.resolve(), args.arch, workdir)
-        build_image(context, tag)
-        patched_message = patched_case(tag, workdir, checker)
+        build_image(context, tag, args.arch)
+        patched_message = patched_case(tag, workdir, checker, args.arch)
         if args.orig_core:
             official_context = context.parent / "ctx-official"
             shutil.copytree(context, official_context)
             shutil.copyfile(args.orig_core.resolve(), official_context / "core")
             official_image = tag + "-official"
-            build_image(official_context, official_image)
-            official_case(official_image, workdir, checker, patched_message)
+            build_image(official_context, official_image, args.arch)
+            official_case(official_image, workdir, checker, patched_message, args.arch)
         else:
             print("\n== 跳过官方内核对照（未提供 --orig-core）", flush=True)
     except Exception as exc:  # noqa: BLE001 - 冒烟失败要以非 0 退出

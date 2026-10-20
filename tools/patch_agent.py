@@ -32,51 +32,101 @@ import hashlib
 import json
 import os
 import shutil
+import struct
 import sys
 import tempfile
 
 NOP = b"\x90"
 
-# 入口桩：整函数直接返回常量，覆盖入口即可（长度与官方入口指令一致）。
-ENTRY_STUBS = [
-    ("A1.IsXpack.return_true", ".(*multiNodeHelper).IsXpack",
-     bytes.fromhex("b8010000009090c3"),
-     "(*multiNodeHelper).IsXpack -> true"),
-    ("A8.GetLicenseAlert.return_nil", "alert_xpack.GetLicenseAlert",
-     bytes.fromhex("31c031db31c9c3"),
-     "alert_xpack.GetLicenseAlert -> nil"),
-]
+# 架构：ELF e_machine -> 名称
+ELF_MACHINES = {62: "amd64", 183: "arm64"}
+
+# 入口桩：整函数直接返回常量，覆盖入口即可（长度不超过官方入口指令）。
+#   amd64: mov eax,1; nop; nop; ret   / xor eax,eax; xor ebx,ebx; xor ecx,ecx; ret
+#   arm64: mov w0,#1; ret; nop       / mov x0..x2,xzr; ret
+ENTRY_STUBS = {
+    "amd64": [
+        ("A1.IsXpack.return_true", ".(*multiNodeHelper).IsXpack",
+         bytes.fromhex("b8010000009090c3"),
+         "(*multiNodeHelper).IsXpack -> true"),
+        ("A8.GetLicenseAlert.return_nil", "alert_xpack.GetLicenseAlert",
+         bytes.fromhex("31c031db31c9c3"),
+         "alert_xpack.GetLicenseAlert -> nil"),
+    ],
+    "arm64": [
+        ("A1.IsXpack.return_true", ".(*multiNodeHelper).IsXpack",
+         bytes.fromhex("20008052c0035fd61f2003d5"),
+         "(*multiNodeHelper).IsXpack -> true"),
+        ("A8.GetLicenseAlert.return_nil", "alert_xpack.GetLicenseAlert",
+         bytes.fromhex("aa1f03e0aa1f03e1aa1f03e2d65f03c0"),
+         "alert_xpack.GetLicenseAlert -> nil"),
+    ],
+}
 
 # 代码模式补丁：(名称, 所在函数符号后缀, 原始字节, 补丁字节, 说明)
-PATTERN_SITES = [
-    ("A3.initXpack.log_true", "xpack.initXpack",
-     bytes.fromhex("440fb690980000004c8d1d"),
-     bytes.fromhex("41ba0100000090904c8d1d"),
-     "日志行读取 isXpack=true"),
-    ("A4.initXpack.store_true", "xpack.initXpack",
-     bytes.fromhex("0fb692980000008815"),
-     bytes.fromhex("ba0100000090908815"),
-     "isXpack 全局 <- 1"),
-    ("A5.InitLicenseInfo.store_true", "common_xpack.InitLicenseInfo",
-     bytes.fromhex("0fb680980000008805"),
-     bytes.fromhex("b80100000090908805"),
-     "common_xpack.InitLicenseInfo: isXpack 全局 <- 1"),
-    ("A6.syncNodeInfo.store_true", "app/service.syncNodeInfo",
-     bytes.fromhex("0fb68424080100008805"),
-     bytes.fromhex("b8010000009090908805"),
-     "app/service.syncNodeInfo: isXpack 全局 <- 1"),
-]
+# 等长覆盖；arm64 改条件分支只需换一条指令，所以 A2/A7 也放在这里。
+PATTERN_SITES = {
+    "amd64": [
+        ("A3.initXpack.log_true", "xpack.initXpack",
+         bytes.fromhex("440fb690980000004c8d1d"),
+         bytes.fromhex("41ba0100000090904c8d1d"),
+         "日志行读取 isXpack=true"),
+        ("A4.initXpack.store_true", "xpack.initXpack",
+         bytes.fromhex("0fb692980000008815"),
+         bytes.fromhex("ba0100000090908815"),
+         "isXpack 全局 <- 1"),
+        ("A5.InitLicenseInfo.store_true", "common_xpack.InitLicenseInfo",
+         bytes.fromhex("0fb680980000008805"),
+         bytes.fromhex("b80100000090908805"),
+         "common_xpack.InitLicenseInfo: isXpack 全局 <- 1"),
+        ("A6.syncNodeInfo.store_true", "app/service.syncNodeInfo",
+         bytes.fromhex("0fb68424080100008805"),
+         bytes.fromhex("b8010000009090908805"),
+         "app/service.syncNodeInfo: isXpack 全局 <- 1"),
+    ],
+    # arm64：把「读 edition 字节」改成 mov wN,#1；把 tbz 改成 nop。
+    # 每个模式带上下一条指令，避免同函数内同 opcode 撞车（A6 就是靠这个区分的）。
+    "arm64": [
+        ("A3.initXpack.log_true", "xpack.initXpack",
+         bytes.fromhex("08604239895c00b0"),
+         bytes.fromhex("280080d2895c00b0"),
+         "日志行读取 isXpack=true"),
+        ("A4.initXpack.store_true", "xpack.initXpack",
+         bytes.fromhex("a56042399b6701b0"),
+         bytes.fromhex("250080d29b6701b0"),
+         "isXpack 全局 <- 1"),
+        ("A5.InitLicenseInfo.store_true", "common_xpack.InitLicenseInfo",
+         bytes.fromhex("006042393be501b0"),
+         bytes.fromhex("200080d23be501b0"),
+         "common_xpack.InitLicenseInfo: isXpack 全局 <- 1"),
+        ("A6.syncNodeInfo.store_true", "app/service.syncNodeInfo",
+         bytes.fromhex("e04344391b6a01d0"),
+         bytes.fromhex("200080d21b6a01d0"),
+         "app/service.syncNodeInfo: isXpack 全局 <- 1"),
+        ("A2.initXpack.drop_guard", "xpack.initXpack",
+         bytes.fromhex("26080036a69c46a9"),
+         bytes.fromhex("1f2003d5a69c46a9"),
+         "xpack.initXpack: 永不跳过 X-Pack 初始化块"),
+        ("A7.syncNodeInfo.prefer_init", "app/service.syncNodeInfo",
+         bytes.fromhex("e0000036b89aff97"),
+         bytes.fromhex("1f2003d5b89aff97"),
+         "syncNodeInfo: 恒调 InitXpack()，永不 ResetXpack()"),
+    ],
+}
 
-# 分支补丁：先锚定比较指令，再改它后面的条件跳转。
-A2_NAME = "A2.initXpack.drop_guard"
-A2_FUNC = "xpack.initXpack"
-A2_ANCHOR = bytes.fromhex("80ba9800000000")      # cmpb $0x0, 0x98(%rdx)
-A2_NOTE = "xpack.initXpack: 永不跳过 X-Pack 初始化块"
-
-A7_NAME = "A7.syncNodeInfo.prefer_init"
-A7_FUNC = "app/service.syncNodeInfo"
-A7_ANCHOR = bytes.fromhex("80bc240801000000")    # cmpb $0x0, 0x108(%rsp)
-A7_NOTE = "syncNodeInfo: 恒调 InitXpack()，永不 ResetXpack()"
+# 需要「先锚定比较指令，再改它后面的条件跳转」的站点：
+# 只有 amd64 需要（短/长两种跳转编码 + 位移字节会变），arm64 一条指令即可。
+BRANCH_SITES = {
+    "amd64": [
+        ("A2.initXpack.drop_guard", "xpack.initXpack",
+         bytes.fromhex("80ba9800000000"),          # cmpb $0x0, 0x98(%rdx)
+         "xpack.initXpack: 永不跳过 X-Pack 初始化块", True),
+        ("A7.syncNodeInfo.prefer_init", "app/service.syncNodeInfo",
+         bytes.fromhex("80bc240801000000"),        # cmpb $0x0, 0x108(%rsp)
+         "syncNodeInfo: 恒调 InitXpack()，永不 ResetXpack()", False),
+    ],
+    "arm64": [],
+}
 
 
 def sha256(path):
@@ -192,17 +242,29 @@ def _branch(data, syms, name, suffix, anchor, note, allow_long=True):
     raise ValueError("no conditional jump found after anchor for %s" % name)
 
 
+def machine(data):
+    """按 ELF e_machine 判断架构。"""
+    if len(data) < 20 or data[:4] != b"\x7fELF":
+        raise ValueError("not an ELF file")
+    number = struct.unpack_from("<H", data, 18)[0]
+    arch = ELF_MACHINES.get(number)
+    if arch is None:
+        raise ValueError("unsupported ELF machine: %d" % number)
+    return arch
+
+
 def sites(data, syms=None):
     """完整站点列表：(name, off, orig, patch, state, note)，共 8 条。"""
+    arch = machine(data)
     if syms is None:
         syms = _symbols(data)
     rows = [_entry(data, syms, name, suffix, stub, note)
-            for name, suffix, stub, note in ENTRY_STUBS]
-    rows.append(_branch(data, syms, A2_NAME, A2_FUNC, A2_ANCHOR, A2_NOTE))
+            for name, suffix, stub, note in ENTRY_STUBS[arch]]
     rows.extend(_site(data, syms, name, suffix, orig, patch, note)
-                for name, suffix, orig, patch, note in PATTERN_SITES)
-    rows.append(_branch(data, syms, A7_NAME, A7_FUNC, A7_ANCHOR, A7_NOTE,
-                        allow_long=False))
+                for name, suffix, orig, patch, note in PATTERN_SITES[arch])
+    for name, suffix, anchor, note, allow_long in BRANCH_SITES[arch]:
+        rows.append(_branch(data, syms, name, suffix, anchor, note,
+                            allow_long=allow_long))
     rows.sort(key=lambda row: row[1])
     names = [row[0] for row in rows]
     if len(names) != 8 or len(set(names)) != 8:
@@ -228,14 +290,18 @@ def main():
     args = ap.parse_args()
 
     if args.list:
-        print("入口桩（Go 符号定位，等长覆盖）:")
-        for name, sym, stub, note in ENTRY_STUBS:
-            print("  %-34s symbol=…%-30s patch=%s  %s" % (name, sym, stub.hex(), note))
-        print("代码模式（函数内唯一定位）:")
-        print("  %-34s anchor=%s -> 抹掉授权分支跳转" % (A2_NAME, A2_ANCHOR.hex()))
-        for name, sym, orig, patch, note in PATTERN_SITES:
-            print("  %-34s %s  %s" % (name, orig.hex(), note))
-        print("  %-34s anchor=%s -> 恒走 InitXpack()" % (A7_NAME, A7_ANCHOR.hex()))
+        for arch in ("amd64", "arm64"):
+            print("[%s] 入口桩（Go 符号定位，等长覆盖）:" % arch)
+            for name, sym, stub, note in ENTRY_STUBS[arch]:
+                print("  %-34s symbol=…%-30s patch=%s  %s"
+                      % (name, sym, stub.hex(), note))
+            print("[%s] 代码模式（函数内唯一定位）:" % arch)
+            for name, sym, orig, patch, note in PATTERN_SITES[arch]:
+                print("  %-34s %s -> %s  %s" % (name, orig.hex(), patch.hex(), note))
+            for name, sym, anchor, note, _long in BRANCH_SITES[arch]:
+                print("  %-34s anchor=%s -> 抹掉授权分支跳转  %s"
+                      % (name, anchor.hex(), note))
+            print()
         return 0
 
     if args.verify:

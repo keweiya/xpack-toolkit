@@ -187,20 +187,20 @@ def extract_agent(package, destination, arch):
 
 
 def verify_agent_original(path, arch):
-    if arch != "amd64":
+    if arch not in SUPPORTED_ARCHES:
         return
     spec = importlib.util.spec_from_file_location("xpack_release_agent", ROOT / "tools/patch_agent.py")
     agent = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(agent)
     try:
         sites = agent.locate(path.read_bytes())
-    except (ValueError, OSError) as exc:
-        raise ReleaseError("official amd64 agent patch sites are not locatable: " + str(exc)) from exc
+    except (ValueError, OSError, struct.error, IndexError) as exc:
+        raise ReleaseError("official {} agent patch sites are not locatable: {}".format(arch, exc)) from exc
     if len(sites) != 8 or len({name for name, _, _, _ in sites}) != 8:
-        raise ReleaseError("official amd64 agent requires exactly eight known original patch sites")
+        raise ReleaseError("official {} agent requires exactly eight known original patch sites".format(arch))
     bad = [name + ":" + state for name, _, state, _ in sites if state != "original"]
     if bad:
-        raise ReleaseError("official amd64 agent is not pristine: " + ", ".join(bad))
+        raise ReleaseError("official {} agent is not pristine: {}".format(arch, ", ".join(bad)))
 
 
 def command(args, *, env=None, capture=False):

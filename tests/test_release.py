@@ -114,6 +114,8 @@ class ReleaseTests(unittest.TestCase):
     def agent_fixture():
         """Synthetic agent bytes + injected pclntab symbol table for locate() tests."""
         buffer = bytearray(b"\xcc" * 0x900)
+        # 合法的 ELF 头（amd64），sites() 会按 e_machine 选补丁表
+        buffer[:20] = b"\x7fELF\x02\x01" + b"\x00" * 12 + struct.pack("<H", 62)
         sites = {
             # A1 IsXpack entry: movzbl global,%eax; ret
             0x100: "0fb60579cc0804c3",
@@ -240,10 +242,10 @@ class ReleaseTests(unittest.TestCase):
             with self.assertRaisesRegex(release.ReleaseError, name + ":patched"):
                 release.verify_agent_original(path, "amd64")
 
+            # arm64 同样必须能定位到 8 个站点：合成文件定位不到时直接报错
             path.write_bytes(self.original_agent("arm64"))
-            with mock.patch.object(release.importlib.util, "spec_from_file_location") as load:
+            with self.assertRaisesRegex(release.ReleaseError, "arm64 agent patch sites are not locatable"):
                 release.verify_agent_original(path, "arm64")
-                load.assert_not_called()
 
     def test_stage_package_rehashes_and_preserves_cache(self):
         with tempfile.TemporaryDirectory() as temporary:

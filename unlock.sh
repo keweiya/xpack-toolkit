@@ -588,9 +588,9 @@ PY
 # 校验下载来的内核确实「已移除全部检查」
 python3 "$PATCH_CORE" --verify --in "$RUN/core" || die "Downloaded core is not the remove-all-checks kernel"
 
-# Agent：amd64 从官方原件重建；其它架构保留现有 Agent
+# Agent：两个架构都从官方原件重建（amd64 / arm64 各自的补丁模式）
 NEED_AGENT=0
-if [ "$ARCH" = amd64 ] && [ "$SKIP_AGENT" != 1 ] && [ -f "$AGENT_BIN" ]; then NEED_AGENT=1; fi
+if [ "$SKIP_AGENT" != 1 ] && [ -f "$AGENT_BIN" ]; then NEED_AGENT=1; fi
 AGENT_SOURCE=""
 if [ "$NEED_AGENT" = 1 ]; then
   fetch "$(<"$RUN/agent.url")" "$RUN/agent.orig"
@@ -598,7 +598,7 @@ if [ "$NEED_AGENT" = 1 ]; then
     --orig "$RUN/agent.orig" --manifest "$RUN/agent.manifest.json"
   python3 "$PATCH_AGENT" --verify --in "$RUN/agent"
   AGENT_SOURCE="$RUN/agent"
-  log "Rebuilt amd64 agent from verified official source"
+  log "Rebuilt $ARCH agent from verified official source"
 fi
 
 # 备份并替换内核

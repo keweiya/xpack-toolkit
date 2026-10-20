@@ -63,16 +63,32 @@ jobs:
           VERSION: ${{ steps.version.outputs.value }}
         run: python3 tools/verify_release.py --release "build/release-$VERSION"
 
-      - name: Docker interface smoke test
+      - name: Enable arm64 emulation
+        if: inputs.smoke
+        run: docker run --privileged --rm tonistiigi/binfmt --install arm64
+
+      - name: Docker smoke test (linux-amd64)
         if: inputs.smoke
         env:
           VERSION: ${{ steps.version.outputs.value }}
         # 容器里的 1Panel 以 root 运行、数据库目录 0700，宿主机侧读写需要 root。
         run: |
           sudo --preserve-env=PATH,HOME "$(command -v python3)" tools/smoke_test.py \
+            --arch amd64 \
             --release "build/release-$VERSION" \
             --package "build/dl/1panel-$VERSION-linux-amd64.tar.gz" \
             --orig-core "build/release-$VERSION/core-linux-amd64.orig"
+
+      - name: Docker smoke test (linux-arm64)
+        if: inputs.smoke
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          sudo --preserve-env=PATH,HOME "$(command -v python3)" tools/smoke_test.py \
+            --arch arm64 \
+            --release "build/release-$VERSION" \
+            --package "build/dl/1panel-$VERSION-linux-arm64.tar.gz" \
+            --orig-core "build/release-$VERSION/core-linux-arm64.orig"
 
       - name: Publish release (atomic replace)
         env:

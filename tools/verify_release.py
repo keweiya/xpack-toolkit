@@ -22,8 +22,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 EXPECTED_PATCHES = 8
-# Agent 的 X-Pack 开关改写只在 amd64 上验证过；arm64 保留官方 Agent（unlock.sh 也这么装）。
-AGENT_PATCH_PLATFORMS = ("linux-amd64",)
+# Agent 的 X-Pack 开关两个架构都改写（arm64 指令集不同，模式各自一套）。
+AGENT_PATCH_PLATFORMS = ("linux-amd64", "linux-arm64")
 
 
 class VerifyError(Exception):

@@ -97,7 +97,8 @@ def find_pclntab(data):
 
 
 def read_syms(path):
-    data = open(path, "rb").read()
+    with open(path, "rb") as fh:
+        data = fh.read()
     end, sections, phdrs = parse_elf(data)
     text = sections.get(".text")
     base = find_pclntab(data)
