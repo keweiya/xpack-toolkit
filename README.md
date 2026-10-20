@@ -2,8 +2,6 @@
 
 1Panel v2 内网本地破解内核一键安装 / 更新工具。已有安装直接重跑同一条命令即可，无需手动卸载。
 
-> 另一个目标：[dpanel](https://github.com/donknap/dpanel) 专业版（PE）授权解锁，见 [docs/dpanel.md](docs/dpanel.md)。
-
 ## 一键安装 / 更新
 
 国外服务器：
