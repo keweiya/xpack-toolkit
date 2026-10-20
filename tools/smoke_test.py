@@ -27,6 +27,7 @@ import os
 import re
 import shutil
 import socket
+import sqlite3
 import subprocess
 import sys
 import tarfile
@@ -113,6 +114,13 @@ def http(url, method="GET", body=None, headers=None, timeout=15):
         return 0, str(error), []
 
 
+def _readable(path):
+    try:
+        return Path(path).is_file()
+    except PermissionError as exc:
+        raise SmokeError("无法读取 {}（{}）；请用 root / sudo 运行冒烟测试".format(path, exc)) from exc
+
+
 def json_of(text):
     try:
         return json.loads(text)
@@ -140,7 +148,8 @@ def wait_until(description, probe, timeout=150, interval=2):
 # --------------------------------------------------------------------------- #
 def patch_agent(original, output):
     run([sys.executable, str(ROOT / "tools/patch_agent.py"), "--patch",
-         "--in", str(original), "--out", str(output)])
+         "--in", str(original), "--out", str(output),
+         "--manifest", str(Path(output).with_suffix(".manifest.json"))])
     listing = run([sys.executable, str(ROOT / "tools/patch_agent.py"), "--verify", "--in", str(output)])
     if "all patches present" not in listing:
         raise SmokeError("agent patch verification failed:\n" + listing)
@@ -209,11 +218,36 @@ class Panel:
 
     def wait_ready(self, timeout=180):
         wait_until("panel http", lambda: http(self.url + "/entrance")[0] == 200, timeout=timeout)
-        wait_until("panel database", lambda: (Path(self.data) / "db/core.db").is_file(), timeout=60)
+        wait_until("panel database", self.db_ready, timeout=90)
         wait_until("panel auth key", lambda: self.setting("PASSWORD_PUBLIC_KEY"), timeout=120)
+        wait_until("xpack database", self.xpack_ready, timeout=180)
+
+    def db_ready(self):
+        self.relax()
+        return _readable(Path(self.data) / "db/core.db")
+
+    def xpack_ready(self):
+        """授权表由 core 启动时的 xpack 迁移创建，导入证书前必须就绪。"""
+        self.relax()
+        db = Path(self.data) / "db/xpack.db"
+        if not _readable(db):
+            return False
+        try:
+            with sqlite3.connect("file:{}?mode=ro".format(db), uri=True) as con:
+                return con.execute(
+                    "select count(*) from sqlite_master where type='table' and name='licenses'"
+                ).fetchone()[0] == 1
+        except sqlite3.Error:
+            return False
+
+    def relax(self):
+        """容器内 1Panel 以 root 建库（目录 0700 / 文件 0600），宿主机非 root 需要放开一次。"""
+        subprocess.run(["docker", "exec", self.name, "chmod", "-R", "a+rwX",
+                        "/opt/1panel/db", "/opt/1panel/conf"],
+                       text=True, capture_output=True)
 
     def setting(self, key):
-        import sqlite3
+        self.relax()
         db = Path(self.data) / "db/core.db"
         if not db.is_file():
             return None
@@ -365,6 +399,7 @@ def patched_case(image, workdir, checker):
                       not any(marker in patched_message for marker in CERT_FAILURE_MARKERS),
                       "HTTP {} {}".format(upload_status, patched_message[:200]))
 
+        panel.relax()
         panel.stop()
         apply_license(panel, license_file)
         panel.start()
