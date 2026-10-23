@@ -1,0 +1,14 @@
+name: call-test
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  release:
+    permissions:
+      contents: write
+    uses: ./.github/workflows/build.yml
+    with:
+      version: v2.4.1
+      smoke: false
+    secrets: inherit
