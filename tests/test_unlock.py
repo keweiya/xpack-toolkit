@@ -192,6 +192,33 @@ class ReleaseSelectionTests(unittest.TestCase):
             self.assertEqual((run / "agent.url").read_text(), "https://x/agent-linux-amd64")
 
 
+class VersionGateTests(unittest.TestCase):
+    """升级后数据库版本还没迁移完时，门禁要认 1pctl 里的包版本。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.script = UNLOCK.read_text()
+        cls.fn = re.search(r"^ctl_version\(\) \{.*?^\}", cls.script, flags=re.S | re.M).group(0)
+
+    def test_reads_original_version_from_1pctl(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ctl = Path(tmp) / "1pctl"
+            ctl.write_text('#!/bin/bash\nBASE_DIR=/opt/1panel\nORIGINAL_VERSION=v2.4.1\n')
+            result = subprocess.run(["bash", "-c", self.fn + '\nPANEL_CTL="$1"; ctl_version', "_", str(ctl)],
+                                    capture_output=True, text=True)
+            self.assertEqual(result.stdout.strip(), "v2.4.1")
+
+    def test_missing_1pctl_yields_empty(self):
+        result = subprocess.run(["bash", "-c", self.fn + '\nPANEL_CTL=/nonexistent; ctl_version'],
+                                capture_output=True, text=True)
+        self.assertEqual(result.stdout.strip(), "")
+
+    def test_gate_consults_1pctl_before_waiting(self):
+        gate = self.script.index("Version check passed on the installed 1pctl")
+        wait = self.script.index("wait_for_version \"$RELEASE_VERSION\"")
+        self.assertLess(gate, wait)
+
+
 class ScriptStartupTests(unittest.TestCase):
     """脚本头部必须能把 set -u 下的变量都准备好，且不因缺变量崩在启动阶段。"""
 

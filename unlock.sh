@@ -279,6 +279,26 @@ print(version)
 PY
 }
 
+ctl_version() {
+  # 已安装 1pctl 里写死了本包版本（ORIGINAL_VERSION=v2.4.1），升级后会跟着换。
+  # 数据库里的 SystemVersion 要等官方内核迁移跑完才更新，升级瞬间还是旧值。
+  [ -f "$PANEL_CTL" ] || return 0
+  grep -m1 -oE 'ORIGINAL_VERSION=["'"'"']?v?[0-9]+\.[0-9]+\.[0-9]+' "$PANEL_CTL" 2>/dev/null \
+    | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+' | sed 's/^[0-9]/v&/' || true
+}
+
+wait_for_version() {
+  # 升级后数据库里的版本号由官方内核启动时迁移写入，这里等它追上（最多 60s）。
+  local WANT="$1" GOT="" I=0
+  while [ "$I" -lt 30 ]; do
+    GOT="$(detect_installed_version 2>/dev/null || true)"
+    [ "$GOT" = "$WANT" ] && { printf '%s\n' "$GOT"; return 0; }
+    I=$((I + 1))
+    sleep 1
+  done
+  printf '%s\n' "$GOT"
+}
+
 select_release() {
   # 选出最高稳定 Release，写出下载 URL 与版本号。
   # 先走 GitHub API；被限流/被网关拦（403）时退到 releases.atom，资产 URL 按约定拼。
@@ -542,10 +562,22 @@ else
   log "Installed panel is already at Release version $RELEASE_VERSION; skip official upgrade"
 fi
 
-# 版本门禁：本地内核版本必须与 Release 完全一致，否则不做任何替换
+# 版本门禁：本地内核版本必须与 Release 一致，否则不做任何替换。
+# 刚升级完时数据库里的 SystemVersion 还没被官方内核的迁移刷新，先等它追上；
+# 等不到就看内核二进制自己报的版本（数据库下一轮启动会自己补上）。
 INSTALLED_VERSION="$(detect_installed_version)"
 if [ "$INSTALLED_VERSION" != "$RELEASE_VERSION" ]; then
-  die "Version mismatch (installed $INSTALLED_VERSION / release $RELEASE_VERSION); nothing was replaced"
+  # 升级刚完成时数据库还是旧值：先看随包换掉的 1pctl，再等数据库迁移追上
+  CTL_VERSION="$(ctl_version)"
+  if [ "$CTL_VERSION" = "$RELEASE_VERSION" ]; then
+    log "Version check passed on the installed 1pctl ($CTL_VERSION); database catches up on next start"
+    INSTALLED_VERSION="$CTL_VERSION"
+  else
+    log "Waiting for the upgraded panel to report $RELEASE_VERSION (database migration)"
+    INSTALLED_VERSION="$(wait_for_version "$RELEASE_VERSION")"
+    [ "$INSTALLED_VERSION" = "$RELEASE_VERSION" ] || \
+      die "Version mismatch (installed $INSTALLED_VERSION / 1pctl $CTL_VERSION / release $RELEASE_VERSION); nothing was replaced"
+  fi
 fi
 log "Version check passed: panel $INSTALLED_VERSION == release $RELEASE_VERSION"
 
