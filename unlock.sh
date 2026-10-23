@@ -49,6 +49,16 @@ detect_bootstrap_route() {
 }
 detect_bootstrap_route
 
+[ "$(id -u)" -eq 0 ] || die "Run as root"
+[ "$(uname -s)" = Linux ] || die "This release provides Linux cores"
+case "$(uname -m)" in
+  x86_64|amd64) ARCH=amd64 ;; aarch64|arm64) ARCH=arm64 ;;
+  armv7l) ARCH=armv7 ;; ppc64le|s390x|riscv64) ARCH="$(uname -m)" ;;
+  *) die "Unknown architecture: $(uname -m)" ;;
+esac
+PLATFORM="linux-$ARCH"
+PANEL_CTL="${PANEL_CTL:-/usr/local/bin/1pctl}"
+
 PANEL_ROOT="${PANEL_ROOT:-/opt/1panel}"
 CORE_BIN="${CORE_BIN:-/usr/local/bin/1panel-core}"
 AGENT_BIN="${AGENT_BIN:-/usr/local/bin/1panel-agent}"

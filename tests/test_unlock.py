@@ -1,9 +1,11 @@
 """Installer flow regressions (unlock.sh syntax + release selection logic)."""
 
 import json
+import os
 import re
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -147,6 +149,32 @@ class RouteAndAssetsTests(unittest.TestCase):
         gate = self.script.index("Version mismatch (installed")
         replace = self.script.index('install -m 0755 "$RUN/core" "$CORE_BIN"')
         self.assertLess(gate, replace)
+
+
+class ScriptStartupTests(unittest.TestCase):
+    """脚本头部必须能把 set -u 下的变量都准备好，且不因缺变量崩在启动阶段。"""
+
+    def test_platform_and_ctl_variables_defined(self):
+        script = UNLOCK.read_text()
+        for line in ('[ "$(id -u)" -eq 0 ] || die "Run as root"',
+                     'PLATFORM="linux-$ARCH"',
+                     'PANEL_CTL="${PANEL_CTL:-/usr/local/bin/1pctl}"'):
+            self.assertIn(line, script)
+
+    @unittest.skipUnless(os.geteuid() == 0, "需要在 root 下执行脚本")
+    def test_fake_env_fails_on_version_detection_not_unbound_variable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            environment = os.environ.copy()
+            environment.update({
+                "PANEL_ROOT": tmp, "CORE_BIN": tmp + "/core", "AGENT_BIN": tmp + "/agent",
+                "BACKUP": tmp + "/backup", "UNLOCK_WORK": tmp + "/unlock",
+                "PANEL_CTL": tmp + "/1pctl",
+            })
+            run = subprocess.run(["bash", str(UNLOCK), "install", "--no-progress"],
+                                 capture_output=True, text=True, env=environment, timeout=180)
+            self.assertEqual(run.returncode, 1)
+            self.assertNotIn("unbound variable", run.stderr)
+            self.assertIn("Installed panel version was not detected", run.stderr)
 
 
 if __name__ == "__main__":
