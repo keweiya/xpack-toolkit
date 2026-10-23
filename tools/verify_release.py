@@ -79,7 +79,8 @@ def check_platform(release, platform, info):
             raise VerifyError("agent patches incomplete for {}:\n{}".format(platform, listing))
         if target.stat().st_size != agent.stat().st_size:
             raise VerifyError("patched agent changed size: " + str(target))
-    return patched, "8/8"
+        total = listing.count("patched")
+    return patched, "{}/{}".format(total, total)
 
 
 def verify(release):

@@ -196,8 +196,11 @@ def verify_agent_original(path, arch):
         sites = agent.locate(path.read_bytes())
     except (ValueError, OSError, struct.error, IndexError) as exc:
         raise ReleaseError("official {} agent patch sites are not locatable: {}".format(arch, exc)) from exc
-    if len(sites) != 8 or len({name for name, _, _, _ in sites}) != 8:
-        raise ReleaseError("official {} agent requires exactly eight known original patch sites".format(arch))
+    names = {name for name, _, _, _ in sites}
+    required = set(agent.REQUIRED_SITES)
+    if not required <= names or len(names) != len(sites) or len(sites) < len(required):
+        raise ReleaseError("official {} agent is missing required patch sites: {}".format(
+            arch, ", ".join(sorted(required - names)) or "duplicated sites"))
     bad = [name + ":" + state for name, _, state, _ in sites if state != "original"]
     if bad:
         raise ReleaseError("official {} agent is not pristine: {}".format(arch, ", ".join(bad)))

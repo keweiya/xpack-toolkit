@@ -28,17 +28,17 @@ class MachineTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 agent.machine(blob)
 
-    def test_table_driven_architectures_have_eight_sites(self):
+    def test_table_driven_architectures_cover_required_sites(self):
         for arch in ("amd64", "arm64"):
             names = [row[0] for row in agent.ENTRY_STUBS[arch]]
             names += [row[0] for row in agent.PATTERN_SITES[arch]]
             names += [row[0] for row in agent.BRANCH_SITES[arch]]
-            if arch == "amd64":
-                self.assertEqual(len(names), 8, arch)
-            else:
-                # arm64 只有两个入口桩写死在表里，其余站点由结构化解码现场推导
-                self.assertEqual(len(names), 2, arch)
+            names += [name for _suffix, derived in agent.A64_TARGET_FUNCS for name in derived] \
+                if arch == "arm64" else []
             self.assertEqual(len(set(names)), len(names), arch)
+            # A7 是可选的（v2.4.1 起守卫分支直接判读到的值），其余必须都在
+            for required in agent.REQUIRED_SITES:
+                self.assertIn(required, names, arch)
 
     def test_arm64_declares_six_derived_sites(self):
         derived = [name for _suffix, names in agent.A64_TARGET_FUNCS for name in names]
@@ -49,6 +49,22 @@ class MachineTest(unittest.TestCase):
 V232 = ROOT / "build/release-v2.3.2"
 
 
+V241 = ROOT / "build/release-v2.4.1"
+
+
+@unittest.skipUnless((V241 / "agent-linux-amd64.orig").is_file(),
+                     "official v2.4.1 agents not present")
+class MergedGuardTest(unittest.TestCase):
+    """v2.4.1 把 syncNodeInfo 的守卫并进了 A6 那条读指令，A7 不再是必打站点。"""
+
+    def test_v241_keeps_required_sites_on_both_architectures(self):
+        for arch in ("amd64", "arm64"):
+            rows = agent.sites((V241 / "agent-linux-{}.orig".format(arch)).read_bytes())
+            names = [row[0] for row in rows]
+            self.assertIn(len(rows), (7, 8), arch)   # A7 可打可不打
+            self.assertTrue(set(agent.REQUIRED_SITES) <= set(names), arch)
+
+
 @unittest.skipUnless((V232 / "agent-linux-arm64.orig").is_file(),
                      "official v2.3.2 arm64 agent not present")
 class CrossVersionTest(unittest.TestCase):
@@ -56,7 +72,8 @@ class CrossVersionTest(unittest.TestCase):
 
     def test_v232_arm64_is_locatable(self):
         rows = agent.sites((V232 / "agent-linux-arm64.orig").read_bytes())
-        self.assertEqual([row[4] for row in rows], ["original"] * 8)
+        self.assertEqual([row[4] for row in rows], ["original"] * len(rows))
+        self.assertTrue(set(agent.REQUIRED_SITES) <= {row[0] for row in rows})
 
     def test_v232_and_v240_use_different_offsets(self):
         old = agent.sites((V232 / "agent-linux-arm64.orig").read_bytes())
@@ -71,14 +88,15 @@ class RoundTripTest(unittest.TestCase):
     def check(self, arch):
         data = asset(arch).read_bytes()
         rows = agent.sites(data)
-        self.assertEqual([row[4] for row in rows], ["original"] * 8)
+        self.assertEqual([row[4] for row in rows], ["original"] * len(rows))
+        self.assertTrue(set(agent.REQUIRED_SITES) <= {row[0] for row in rows})
         patched = bytearray(data)
         for _name, off, _orig, patch, _state, _note in rows:
             patched[off:off + len(patch)] = patch
         patched = bytes(patched)
         self.assertEqual(len(patched), len(data), "补丁必须等长")
         again = agent.sites(patched, orig=data)
-        self.assertEqual([row[4] for row in again], ["patched"] * 8)
+        self.assertEqual([row[4] for row in again], ["patched"] * len(again))
         changed = [i for i in range(len(data)) if data[i] != patched[i]]
         limit = sum(len(row[3]) for row in rows)
         self.assertLessEqual(len(changed), limit)

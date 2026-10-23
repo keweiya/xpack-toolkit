@@ -41,6 +41,12 @@ NOP = b"\x90"
 # 架构：ELF e_machine -> 名称
 ELF_MACHINES = {62: "amd64", 183: "arm64"}
 
+# 必须命中的站点（A7 随版本可选：判断条件可能已经被 A6 的改写覆盖）
+REQUIRED_SITES = ("A1.IsXpack.return_true", "A2.initXpack.drop_guard",
+                  "A3.initXpack.log_true", "A4.initXpack.store_true",
+                  "A5.InitLicenseInfo.store_true", "A6.syncNodeInfo.store_true")
+SUF_NODE_INFO = "app/service.syncNodeInfo"
+
 # 入口桩：整函数直接返回常量，覆盖入口即可（长度不超过官方入口指令）。
 #   amd64: mov eax,1; nop; nop; ret   / xor eax,eax; xor ebx,ebx; xor ecx,ecx; ret
 #   arm64: mov w0,#1; ret; nop       / mov x0..x2,xzr; ret
@@ -94,12 +100,75 @@ BRANCH_SITES = {
         ("A2.initXpack.drop_guard", "xpack.initXpack",
          bytes.fromhex("80ba9800000000"),          # cmpb $0x0, 0x98(%rdx)
          "xpack.initXpack: 永不跳过 X-Pack 初始化块", True),
-        ("A7.syncNodeInfo.prefer_init", "app/service.syncNodeInfo",
-         bytes.fromhex("80bc240801000000"),        # cmpb $0x0, 0x108(%rsp)
-         "syncNodeInfo: 恒调 InitXpack()，永不 ResetXpack()", False),
     ],
     "arm64": [],
 }
+
+# syncNodeInfo 的守卫分支形状随版本变过：
+#   v2.4.0  cmpb $0x0,0x108(%rsp) + je        —— 直接比较栈上的副本
+#   v2.4.1  movzbl 0x108(%rsp),%eax; mov %al,<isXpack>; test %al,%al + je
+# 后者判断的正是 A6 改写的那条读指令，改完自然不走 ResetXpack，所以 A7 是
+# 「能找到就抹掉、找不到就跳过」的可选站点。
+A7_ANCHOR = bytes.fromhex("80bc240801000000")
+
+
+def _x86_guard_branch(data, start, limit=32, saw_compare=False):
+    """从 start 往后找「测试刚写进去的值」的条件跳转，返回 (offset, length)。"""
+    pos = start
+    end = min(start + limit, len(data) - 2)
+    while pos < end:
+        opcode = data[pos]
+        if opcode in (0x84, 0x85) and (data[pos + 1] >> 6) == 3:
+            saw_compare = True
+            pos += 2
+            continue
+        if opcode == 0x80 and ((data[pos + 1] >> 3) & 7) == 7:
+            modrm = data[pos + 1]
+            mod = modrm >> 6
+            size = 2 + (1 if (modrm & 7) == 4 else 0) + (1 if mod == 1 else 4 if mod == 2 else 0) + 1
+            saw_compare = True
+            pos += size
+            continue
+        if 0x70 <= opcode <= 0x7F and saw_compare:
+            return pos, 2
+        if opcode == 0x0F and data[pos + 1] in (0x84, 0x85) and saw_compare:
+            return pos, 6
+        break
+    return None
+
+
+def _nop_site(data, offset, length, name, note):
+    orig = data[offset:offset + length]
+    patch = b"\x90" * length
+    return (name, offset, orig, patch, state_of(data, offset, patch, orig), note)
+
+
+def _optional_branch_sites(data, syms, rows):
+    """A7：抹掉 syncNodeInfo 里「走 ResetXpack」的那条分支。"""
+    try:
+        _func(syms, SUF_NODE_INFO)
+    except ValueError:
+        return []
+    note = "syncNodeInfo: 恒调 InitXpack()，永不 ResetXpack()"
+    sym = _func(syms, SUF_NODE_INFO)
+    hits = _find_all(data, sym["off"], sym["off"] + sym["size"], A7_ANCHOR)
+    anchor = hits[0] if len(hits) == 1 else None
+    if anchor is not None:
+        branch = _x86_guard_branch(data, anchor + len(A7_ANCHOR), saw_compare=True)
+        if branch:
+            return [_nop_site(data, branch[0], branch[1], "A7.syncNodeInfo.prefer_init", note)]
+        return []
+    store = next((row for row in rows if row[0] == "A6.syncNodeInfo.store_true"), None)
+    if store is None:
+        return []
+    # 模式里只覆盖到写入指令的 opcode，后面还跟着 disp32，所以从几个可能的起点试一遍
+    for delta in range(len(store[3]), len(store[3]) + 8):
+        branch = _x86_guard_branch(data, store[1] + delta)
+        if branch and branch[0] > store[1]:
+            return [_nop_site(data, branch[0], branch[1],
+                              "A7.syncNodeInfo.prefer_init", note)]
+    return []
+
 
 
 # --------------------------------------------------------------------------- #
@@ -218,7 +287,9 @@ def a64_sites(data, syms):
         reads = [(off, word) for off, word in words
                  if (lambda m: m and m[0] == "ldrb" and (m[2] == 31) == is_sp
                      and m[3] == field)(_a64_byte_mem(word))]
-        if len(reads) != len(names):
+        # 末尾的名字是可选的：v2.4.1 起 syncNodeInfo 的守卫分支直接判读到的值，
+        # 改完 A6 就自然生效，不需要单独的 A7 站点
+        if len(reads) not in (len(names), len(names) - 1):
             raise ValueError("expected %d edition reads in %s, got %d"
                              % (len(names), suffix, len(reads)))
         for (off, word), name in zip(reads, names):
@@ -229,8 +300,9 @@ def a64_sites(data, syms):
                          "edition 读取恒为 1（isXpack=true）"))
     rows.sort(key=lambda row: row[1])
     names = [row[0] for row in rows]
-    if len(names) != 8 or len(set(names)) != 8:
-        raise ValueError("expected eight unique arm64 patch sites, got %r" % (names,))
+    missing = [name for name in REQUIRED_SITES if name not in names]
+    if missing or len(names) != len(set(names)):
+        raise ValueError("missing required arm64 patch sites %r (found %r)" % (missing, names))
     return rows
 
 
@@ -383,10 +455,12 @@ def sites(data, syms=None, orig=None):
     for name, suffix, anchor, note, allow_long in BRANCH_SITES[arch]:
         rows.append(_branch(data, syms, name, suffix, anchor, note,
                             allow_long=allow_long))
+    rows.extend(_optional_branch_sites(data, syms, rows))
     rows.sort(key=lambda row: row[1])
     names = [row[0] for row in rows]
-    if len(names) != 8 or len(set(names)) != 8:
-        raise ValueError("expected eight unique patch sites, got %r" % (names,))
+    missing = [name for name in REQUIRED_SITES if name not in names]
+    if missing or len(names) != len(set(names)):
+        raise ValueError("missing required patch sites %r (found %r)" % (missing, names))
     return rows
 
 

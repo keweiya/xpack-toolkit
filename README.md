@@ -10,16 +10,18 @@
 curl -fsSL https://raw.githubusercontent.com/keweiya/xpack-toolkit/main/unlock.sh | sudo bash
 ```
 
-国内服务器（走 gh-proxy 镜像）：
+国内服务器（走 ghfast.top 加速镜像）：
 
 ```bash
-curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/keweiya/xpack-toolkit/main/unlock.sh | sudo bash
+curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/keweiya/xpack-toolkit/main/unlock.sh | sudo bash
 ```
+
+脚本内部所有 GitHub 下载（Release 资产、工具文件、官方安装包）**默认就走 `https://ghfast.top/`**，失败会依次回落到其它内置镜像和直连；想强制直连用 `--no-mirror`，想现场测速挑最快的用 `--use-mirror`。
 
 脚本自动完成：
 
 1. **版本检测与升级**：读取宿主机 1Panel 版本与仓库最高稳定 Release；若 Release 版本较新，先通过官方安装包把宿主机 1Panel 升级到与 Release 一致（数据库迁移随官方内核启动自动完成）。
-2. **替换破解内核**：从 Release 下载已移除全部授权检查的破解内核，替换官方或第三方内核；amd64 的 Agent 从官方原件重建。安装/证书工具（`gen_license.py` 等）直接从 `main` 分支拉取，不打包进 Release。
+2. **替换破解内核**：从 Release 下载**已移除全部授权检查的破解内核**直接替换（不在本机重新打内核补丁）；Agent 则下载 Release 里的官方原件、在本机重新打补丁并用 `--orig` 校验。安装/证书工具（`gen_license.py` 等）直接从 `main` 分支拉取，不打包进 Release。
 3. **本地生成授权证书**：生成企业版授权（999 节点、永久有效、离线），直接写入 `licenses` 表并绑定主节点。**本工具之前生成的证书会删除重做（子节点绑定自动迁移）**；第三方/官方证书一律保留，若主节点已绑定其它证书则先解除旧绑定。
 
 破解内核已**移除全部授权检查**：授权中间件放行、本地签名/根证书校验恒通过、节点额度校验恒通过、授权上报/解绑不回连服务器。因此**不需要宿主机额外签发/生成任何授权证书，也不需要签名私钥**。
@@ -27,9 +29,10 @@ curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/keweiya/xpack-
 ## 选项
 
 ```bash
-sudo bash unlock.sh install --use-mirror       # 启用内置镜像并自动选最低延迟
+sudo bash unlock.sh install --use-mirror       # 现场测速，选延迟最低的镜像（默认已用 ghfast.top）
 sudo bash unlock.sh install --prompt-unbind    # 解绑旧证书前交互确认
-sudo bash unlock.sh install --skip-agent       # 不重建/替换 amd64 Agent
+sudo bash unlock.sh install --skip-agent       # 不重建/替换 Agent（默认 amd64、arm64 都重建）
+sudo bash unlock.sh install --no-mirror        # 全程直连 GitHub，不用加速镜像
 sudo bash unlock.sh verify                     # 回读校验破解内核与已绑定授权
 sudo bash unlock.sh restore                    # 回滚到替换前的官方内核
 ```
@@ -65,21 +68,21 @@ sudo bash unlock.sh restore                    # 回滚到替换前的官方内�
 | A4 | `xpack.initXpack` 写入点 | isXpack 恒写 1 |
 | A5 | `common_xpack.InitLicenseInfo` 写入点 | isXpack 恒写 1 |
 | A6 | `app/service.syncNodeInfo` 写入点 | isXpack 恒写 1 |
-| A7 | `app/service.syncNodeInfo` 分支 | 恒走 InitXpack，永不 ResetXpack |
+| A7 | `app/service.syncNodeInfo` 分支 | 恒走 InitXpack，永不 ResetXpack（**可选**：v2.4.1 起守卫直接判 A6 改写的那条读指令，改完即生效，找不到就不打） |
 | A8 | `alert_xpack.GetLicenseAlert` | 入口返回 nil，不再弹授权告警 |
 
 arm64 不写死指令偏移，改成结构化解码：先从 `IsXpack()` 里解出 `isXpack` 全局字节的地址（`adrp` + `ldrb` 的页 + 页内偏移），再在 `initXpack` / `InitLicenseInfo` / `syncNodeInfo` 里找写这个地址的 `strb`，回溯出 `edition` 字段的读法，最后把这几处 `ldrb` 全换成 `mov wN,#1`（入口另加两个返回桩）。因为地址和字段都是现场解出来的，v2.3.x 和 v2.4.x 共用同一份代码，上游再发新版也不用来回改表。
 
 校验已经打过补丁的 Agent 时要带 `--orig` 指向官方原件：入口桩打完之后 `IsXpack()` 里已经没有 `adrp`/`ldrb` 可解，需要拿原件推站点偏移。
 
-### 版本差异（v2.3.2 → v2.4.0）
+### 版本差异（v2.3.2 → v2.4.1）
 
 | 项目 | 变化 | 对破解流程的影响 |
 | --- | --- | --- |
 | 内核门控 | 8 个函数符号名、参数完全一致 | 定位方式零改动，重跑 `--verify` 即可确认 |
 | 内核桩 | C1 `checkLicense` 入口字节按版本自适应（`c3` / `b80100000031db31c9c3` / `31c031dbc3`） | 脚本自动挑能放下的那一种，不写死 |
 | Agent | 授权开关变成 `xpack/utils/edition.isXpack` 包级字节，3 写 7 读 | 旧的写死偏移失效，改成「符号 + 代码模式」定位（A1–A8） |
-| Agent 架构 | v2.4.0 的 arm64 代码与 amd64 不同（`ldrb/strb`、`tbz`） | arm64 用单独一套模式：读 edition 字节改成 `mov wN,#1`、条件分支改成 `nop`，同样等长覆盖 |
+| Agent 架构 | arm64 代码与 amd64 完全不同（`ldrb/strb`、`tbz`） | arm64 靠结构化解码定位，两架构共用一套逻辑，站点数随版本 7–8 个自适应 |
 | 授权接口 | `/api/v2/core/enterprise/*` 消失，统一到 `/api/v2/core/licenses/*` | 冒烟测试改打 `/licenses/master/status`、`/licenses/search`、`/xpack/nodes/search` |
 | 登录协议 | `POST /api/v2/core/auth/login`，口令为 `b64(RSA(aeskey)):b64(iv):b64(AES-CBC(pwd))` 三段式，进户口令必须走 `EntranceCode` 头（JSON 字段被忽略） | `smoke_test.py` 内置这套加密，首次登录无验证码可直接自动化 |
 | 证书校验 | 官方内核在 `POST /licenses/upload` 处直接 `verify certificate failed` | 破解内核越过该校验；生产安装仍走「写库 + 绑定」路径，不依赖 upload 的三段式格式 |
@@ -108,7 +111,7 @@ arm64 不写死指令偏移，改成结构化解码：先从 `IsXpack()` 里解�
 
 ## 当前支持
 
-- 仓库当前最高稳定版本 `v2.4.0`；机器版本高于它时提前退出。
+- 仓库当前最高稳定版本 `v2.4.1`；机器版本高于它时提前退出。
 - 内核：`amd64 / x86_64`、`arm64 / aarch64`。
 - Agent 重建：`amd64` / `arm64`，两个架构各自一套指令模式，都在 Docker 里冒烟验证过。
 - 所有架构放在同一 Release，始终选最高稳定版本；不回退、不降级机器。

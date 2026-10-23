@@ -85,7 +85,7 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 
-MIRROR_CHOICE="${CLI_ROUTE:-${GH_PROXY:-}}"
+MIRROR_CHOICE="${CLI_ROUTE:-${GH_PROXY:-https://ghfast.top/}}"
 [ "$(id -u)" -eq 0 ] || die "Run as root"
 [ "$(uname -s)" = Linux ] || die "This release provides Linux cores"
 case "$(uname -m)" in
@@ -168,17 +168,8 @@ PY
 }
 configure_mirrors() {
   [ "$MIRROR_READY" = 0 ] || return 0
-  local ANSWER="" RANKED="" PREFIX
-  if [ -z "$MIRROR_CHOICE" ]; then
-    MIRROR_CHOICE=direct
-    if { exec 3<>/dev/tty; } 2>/dev/null; then
-      printf '是否使用内置 GitHub 镜像？[y/N]（启用后自动选择延迟最低的有效镜像）：' >&3
-      if IFS= read -r ANSWER <&3; then
-        case "$ANSWER" in y|Y|yes|YES|1) MIRROR_CHOICE=auto ;; esac
-      fi
-      exec 3>&-
-    fi
-  fi
+  local RANKED="" PREFIX
+  [ -n "$MIRROR_CHOICE" ] || MIRROR_CHOICE=auto
   case "$MIRROR_CHOICE" in
     direct) MIRRORS=(); log "GitHub download mode: direct (mirrors disabled)" ;;
     auto)
@@ -238,6 +229,7 @@ fetch() {
       if [ "${#MIRRORS[@]}" -gt 0 ]; then
         ROUTES=()
         for PREFIX in "${MIRRORS[@]}"; do ROUTES+=("$PREFIX$URL"); done
+        ROUTES+=("$URL")   # 镜像全挂时回落到直连，避免卡死在加速器上
       fi ;;
   esac
   [ -z "${XPACK_HTTP_PROXY:-}" ] || CURL_PROXY=(--proxy "$XPACK_HTTP_PROXY")
