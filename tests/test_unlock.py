@@ -115,7 +115,9 @@ class RouteAndAssetsTests(unittest.TestCase):
         self.assertEqual(self.script.count("ROUTE_READY=1"), 1)
         self.assertEqual(self.script.count("ROUTE_READY=0"), 1)
         self.assertEqual(self.script.count("probe_route"), 2)   # 定义 + fetch 里调用
-        self.assertIn('ROUTES=("$MIRROR_PREFIX$URL")', self.script)
+        self.assertIn('ROUTES=("$MIRROR_PREFIX$URL" "$URL")', self.script)
+        # api.github.com 不套镜像（网关会 403）
+        self.assertNotIn("https://api.github.com/*)", self.script)
 
     def test_bootstrap_prefix_wins_over_probe(self):
         self.assertIn("BOOTSTRAP_PREFIX", self.script)
@@ -143,12 +145,51 @@ class RouteAndAssetsTests(unittest.TestCase):
         self.assertNotIn("agent.orig.url", self.script)
         self.assertNotIn("--patch --in \"$RUN/agent.orig\"", self.script)
         self.assertIn("Verified patched agent sha256 + arch", self.script)
-        self.assertIn("Release has no $PLATFORM agent asset", self.script)
+        self.assertIn("No downloadable $PLATFORM agent", self.script)
 
     def test_version_gate_runs_before_replacement(self):
         gate = self.script.index("Version mismatch (installed")
         replace = self.script.index('install -m 0755 "$RUN/core" "$CORE_BIN"')
         self.assertLess(gate, replace)
+
+
+class ReleaseSelectionTests(unittest.TestCase):
+    """select_release 支持 API 与 atom 两种来源，资产 URL 都要能拼出来。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.code = extract_heredoc(UNLOCK.read_text(), "releases.atom")
+
+    def run_parser(self, run, platform, source):
+        return subprocess.run([sys.executable, "-c", self.code, str(run), platform,
+                               "keweiya/xpack-toolkit", source],
+                              capture_output=True, text=True)
+
+    def test_atom_source_picks_highest_and_builds_urls(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            (run / "releases.atom").write_text(
+                "<feed><entry><title>core-v2.4.0</title></entry>"
+                "<entry><title>core-v2.4.1</title></entry></feed>")
+            result = self.run_parser(run, "linux-arm64", "atom")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((run / "selected.version").read_text(), "v2.4.1")
+            self.assertIn("core-linux-arm64", (run / "core.url").read_text())
+            self.assertIn("agent-linux-arm64", (run / "agent.url").read_text())
+            self.assertIn("core-v2.4.1", (run / "manifest.url").read_text())
+
+    def test_api_source_uses_published_assets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            (run / "releases.json").write_text(json.dumps([{
+                "tag_name": "core-v2.4.1", "draft": False, "prerelease": False,
+                "assets": [{"name": n, "browser_download_url": "https://x/" + n}
+                           for n in ("manifest.json", "core-linux-amd64",
+                                     "core-linux-amd64.orig", "agent-linux-amd64")]}]))
+            result = self.run_parser(run, "linux-amd64", "api")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((run / "core.url").read_text(), "https://x/core-linux-amd64")
+            self.assertEqual((run / "agent.url").read_text(), "https://x/agent-linux-amd64")
 
 
 class ScriptStartupTests(unittest.TestCase):

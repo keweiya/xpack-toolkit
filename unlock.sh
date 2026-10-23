@@ -197,10 +197,11 @@ fetch() {
   local URL="$1" DEST="$2" SILENT="${3:-}" PREFIX CANDIDATE PART ERROR HOST ATTEMPT=0
   local -a ROUTES=("$URL") CURL_PROXY=()
   case "$URL" in
-    https://github.com/*|https://raw.githubusercontent.com/*|https://api.github.com/*)
+    https://github.com/*|https://raw.githubusercontent.com/*)
+      # 加速网关不代理 api.github.com（会 403），API 请求始终直连
       probe_route
       if [ -n "$MIRROR_PREFIX" ]; then
-        ROUTES=("$MIRROR_PREFIX$URL")
+        ROUTES=("$MIRROR_PREFIX$URL" "$URL")
       fi ;;
   esac
   [ -z "${XPACK_HTTP_PROXY:-}" ] || CURL_PROXY=(--proxy "$XPACK_HTTP_PROXY")
@@ -280,25 +281,41 @@ PY
 
 select_release() {
   # 选出最高稳定 Release，写出下载 URL 与版本号。
-  python3 - "$RUN" "$PLATFORM" <<'PY'
+  # 先走 GitHub API；被限流/被网关拦（403）时退到 releases.atom，资产 URL 按约定拼。
+  local SOURCE=api
+  if ! fetch "https://api.github.com/repos/$REPO/releases?per_page=100" "$RUN/releases.json" 1 2>/dev/null; then
+    SOURCE=atom
+    log "GitHub API unavailable; falling back to the releases feed"
+    fetch "https://github.com/$REPO/releases.atom" "$RUN/releases.atom" 1 || \
+      die "Cannot read the release list (API and atom feed both failed)"
+  fi
+  python3 - "$RUN" "$PLATFORM" "$REPO" "$SOURCE" <<'PY'
 import json, pathlib, re, sys
-run, platform = pathlib.Path(sys.argv[1]), sys.argv[2]
+run, platform, repo, source = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
 def version(value):
     return tuple(map(int, value.lstrip("v").split(".")))
-releases = []
-for release in json.loads((run / "releases.json").read_text()):
-    tag = release.get("tag_name", "")
-    if release.get("draft") or release.get("prerelease") or not re.fullmatch(r"core-v\d+\.\d+\.\d+", tag):
-        continue
-    releases.append((version(tag[5:]), release))
-if not releases:
+names = ("manifest.json", "core-" + platform, "core-" + platform + ".orig",
+         "agent-" + platform, "agent-" + platform + ".orig")
+if source == "api":
+    tags = [release.get("tag_name", "")
+            for release in json.loads((run / "releases.json").read_text())
+            if not release.get("draft") and not release.get("prerelease")]
+else:
+    tags = re.findall(r"core-v\d+\.\d+\.\d+", (run / "releases.atom").read_text())
+tags = [tag for tag in set(tags) if re.fullmatch(r"core-v\d+\.\d+\.\d+", tag)]
+if not tags:
     raise SystemExit("No stable project release is published")
-target, release = max(releases, key=lambda item: item[0])
-tag = release["tag_name"]
-assets = {a["name"]: a["browser_download_url"] for a in release.get("assets", [])}
-needed = ("manifest.json", "core-" + platform, "core-" + platform + ".orig")
-if not all(name in assets for name in needed):
-    raise SystemExit("Unsupported: latest Release " + tag + " has no verified assets for " + platform)
+tag = max(tags, key=lambda item: version(item[5:]))
+base = "https://github.com/" + repo + "/releases/download/" + tag + "/"
+if source == "api":
+    release = next(item for item in json.loads((run / "releases.json").read_text())
+                   if item.get("tag_name") == tag)
+    assets = {a["name"]: a["browser_download_url"] for a in release.get("assets", [])}
+    needed = ("manifest.json", "core-" + platform, "core-" + platform + ".orig")
+    if not all(name in assets for name in needed):
+        raise SystemExit("Unsupported: latest Release " + tag + " has no verified assets for " + platform)
+else:
+    assets = {name: base + name for name in names}
 (run / "manifest.url").write_text(assets["manifest.json"])
 (run / "core.url").write_text(assets["core-" + platform])
 (run / "orig.url").write_text(assets["core-" + platform + ".orig"])
@@ -495,9 +512,7 @@ fi
 INSTALLED_VERSION="$(detect_installed_version)"
 log "Installed panel $INSTALLED_VERSION / $PLATFORM"
 
-fetch "https://api.github.com/repos/$REPO/releases?per_page=100" "$PREFLIGHT/releases.json"
 RUN="$(mktemp -d "$PERSIST/run.XXXXXX")"
-cp "$PREFLIGHT/releases.json" "$RUN/releases.json"
 RELEASE_LINE="$(select_release)"
 log "$RELEASE_LINE"
 RELEASE_VERSION="$(<"$RUN/selected.version")"
@@ -559,8 +574,7 @@ NEED_AGENT=0
 if [ "$SKIP_AGENT" != 1 ] && [ -f "$AGENT_BIN" ]; then NEED_AGENT=1; fi
 AGENT_SOURCE=""
 if [ "$NEED_AGENT" = 1 ]; then
-  if [ -f "$RUN/agent.url" ]; then
-    fetch "$(<"$RUN/agent.url")" "$RUN/agent"
+  if [ -f "$RUN/agent.url" ] && fetch "$(<"$RUN/agent.url")" "$RUN/agent"; then
     python3 - "$RUN" "$PLATFORM" <<'PYEOF' || die "Downloaded patched agent failed verification"
 import hashlib, json, pathlib, struct, sys
 run, platform = pathlib.Path(sys.argv[1]), sys.argv[2]
@@ -577,7 +591,7 @@ PYEOF
     log "Using prebuilt patched $ARCH agent from Release"
   else
     NEED_AGENT=0
-    log "Release has no $PLATFORM agent asset; core replaced, agent left untouched"
+    log "No downloadable $PLATFORM agent; core replaced, agent left untouched"
   fi
 fi
 
