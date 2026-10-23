@@ -145,7 +145,7 @@ run_download_silent() {
 }
 fetch() {
   local URL="$1" DEST="$2" SILENT="${3:-}" PREFIX CANDIDATE PART ERROR HOST ATTEMPT=0
-  local -a ROUTES=("$URL") CURL_PROXY=() ORDER=()
+  local -a ROUTES=("$URL") CURL_PROXY=()
   case "$URL" in
     https://github.com/*|https://raw.githubusercontent.com/*|https://api.github.com/*)
       probe_route
