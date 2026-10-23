@@ -115,6 +115,28 @@ class RouteAndAssetsTests(unittest.TestCase):
         self.assertEqual(self.script.count("probe_route"), 2)   # 定义 + fetch 里调用
         self.assertIn('ROUTES=("$MIRROR_PREFIX$URL")', self.script)
 
+    def test_bootstrap_prefix_wins_over_probe(self):
+        self.assertIn("BOOTSTRAP_PREFIX", self.script)
+        detect = self.script.index("detect_bootstrap_route\n")
+        self.assertLess(detect, self.script.index("probe_route() {"))
+        # 探测前先看启动前缀
+        probe = self.script.index("probe_route() {")
+        body = self.script[probe:probe + 1200]
+        self.assertLess(body.index("BOOTSTRAP_PREFIX"), body.index("GH_MIRROR_FORCE"))
+
+    def test_bootstrap_prefix_parser(self):
+        import subprocess
+        fn = re.search(r"^mirror_prefix_from_url\(\) \{.*?^\}", self.script, flags=re.S | re.M).group(0)
+        cases = {
+            "https://ghfast.top/https://raw.githubusercontent.com/a/b/main/unlock.sh": "https://ghfast.top/",
+            "https://raw.githubusercontent.com/a/b/main/unlock.sh": "",
+            "https://gh-proxy.com/https://github.com/a/b/releases/download/x/y": "https://gh-proxy.com/",
+        }
+        for url, expected in cases.items():
+            result = subprocess.run(["bash", "-c", fn + '\nmirror_prefix_from_url "$1"', "_", url],
+                                    capture_output=True, text=True)
+            self.assertEqual(result.stdout.strip(), expected, url)
+
     def test_agent_is_replaced_not_patched(self):
         self.assertNotIn("agent.orig.url", self.script)
         self.assertNotIn("--patch --in \"$RUN/agent.orig\"", self.script)

@@ -16,12 +16,12 @@ curl -fsSL https://raw.githubusercontent.com/keweiya/xpack-toolkit/main/unlock.s
 curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/keweiya/xpack-toolkit/main/unlock.sh | sudo bash
 ```
 
-下载线路是**一次探测、全程一致**，没有额外的镜像开关：
+下载线路由**你敲的那条命令**决定，脚本不再额外探测：
 
-- 脚本启动时先探一次 `raw.githubusercontent.com`（4 秒连接 / 8 秒总超时）
-- 通了 → 全程直连，不碰任何加速镜像（国外机器就是这个行为）
-- 不通 → 全程所有 GitHub 下载（Release 资产、工具文件、官方安装包）都加 `https://ghfast.top/` 前缀
-- 需要强制走加速：`GH_MIRROR_FORCE=1 sudo -E bash unlock.sh install`；要换前缀：`GH_MIRROR=https://…/`
+- 命令里套了加速前缀（上面那条）→ 脚本启动时从还在跑的 `curl` 命令行里读出前缀，**整轮所有下载都用它，不探测官方直连**
+- 命令是官方直连（国外机器）→ 探一次 `raw.githubusercontent.com`（4 秒连接 / 8 秒总超时）：通了全程直连；不通则全程走 `GH_MIRROR`（默认 `https://ghfast.top/`）
+- 先存成文件再跑（没有 curl 命令行可读）→ 走「官方直连」那一支
+- 需要强制加速：`GH_MIRROR_FORCE=1 sudo -E bash unlock.sh install`；要换前缀：`GH_MIRROR=https://…/`
 
 脚本自动完成：
 

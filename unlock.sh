@@ -14,6 +14,41 @@ set -euo pipefail
 umask 077
 REPO="${REPO:-keweiya/xpack-toolkit}"
 
+# ---------------------------------------------------------------------------
+# 启动方式决定下载线路：`curl <前缀>https://raw.githubusercontent.com/.../unlock.sh | sudo bash`
+# 里如果套了加速前缀，就整轮沿用那个前缀，不再探测官方直连。
+# 管道执行时 curl 还在把脚本喂给 bash，所以能在 /proc 里抓到它的命令行。
+# ---------------------------------------------------------------------------
+mirror_prefix_from_url() {
+  local url="$1" scheme rest host tail
+  scheme="${url%%://*}"
+  rest="${url#*://}"
+  host="${rest%%/*}"
+  tail="${rest#*/}"
+  case "$tail" in
+    http://*|https://*) printf '%s://%s/\n' "$scheme" "$host" ;;
+  esac
+}
+
+BOOTSTRAP_PREFIX=""
+detect_bootstrap_route() {
+  local pid comm arg found=""
+  for pid in /proc/[0-9]*; do
+    [ "${pid#/proc/}" = "$$" ] && continue
+    comm="$(cat "$pid/comm" 2>/dev/null)" || continue
+    case "$comm" in curl|wget) ;; *) continue ;; esac
+    while IFS= read -r -d '' arg; do
+      case "$arg" in
+        http://*unlock.sh|https://*unlock.sh) found="$arg" ;;
+      esac
+    done < "$pid/cmdline" 2>/dev/null || true
+    [ -n "$found" ] && break
+  done
+  [ -n "$found" ] || return 0
+  BOOTSTRAP_PREFIX="$(mirror_prefix_from_url "$found")"
+}
+detect_bootstrap_route
+
 PANEL_ROOT="${PANEL_ROOT:-/opt/1panel}"
 CORE_BIN="${CORE_BIN:-/usr/local/bin/1panel-core}"
 AGENT_BIN="${AGENT_BIN:-/usr/local/bin/1panel-agent}"
@@ -90,6 +125,11 @@ probe_route() {
   local PROBE="https://raw.githubusercontent.com/$REPO/main/unlock.sh" STATUS=""
   local -a PROXY=()
   [ -z "${XPACK_HTTP_PROXY:-}" ] || PROXY=(--proxy "$XPACK_HTTP_PROXY")
+  if [ -n "$BOOTSTRAP_PREFIX" ]; then
+    MIRROR_PREFIX="$BOOTSTRAP_PREFIX"
+    log "GitHub download route: $MIRROR_PREFIX (from the bootstrap URL)"
+    return 0
+  fi
   if [ -n "${GH_MIRROR_FORCE:-}" ]; then
     MIRROR_PREFIX="$GH_MIRROR"
     log "GitHub download route: $MIRROR_PREFIX (forced)"
