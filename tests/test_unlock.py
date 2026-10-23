@@ -92,30 +92,39 @@ def extract_heredoc(script, marker):
     raise AssertionError("heredoc not found: " + marker)
 
 
-class MirrorConfigTests(unittest.TestCase):
-    """The mirror-prefix validator embedded in unlock.sh (unchanged download routing)."""
+class RouteAndAssetsTests(unittest.TestCase):
+    """下载线路只探测一次；Agent 只替换不打补丁；替换前有版本门禁。"""
 
     @classmethod
     def setUpClass(cls):
-        cls.code = extract_heredoc(UNLOCK.read_text(), "GitHub mirror prefix")
+        cls.script = UNLOCK.read_text()
 
-    def run_parser(self, preferred, configured):
-        return subprocess.run(
-            ["python3", "-c", self.code, preferred, configured],
-            capture_output=True, text=True)
+    def test_no_mirror_switches_left(self):
+        for flag in ("--use-mirror", "--mirror", "--no-mirror", "--direct", "GH_MIRRORS"):
+            self.assertNotIn(flag, self.script, flag)
+        self.assertNotIn("rank_mirrors", self.script)
+        self.assertNotIn("configure_mirrors", self.script)
 
-    def test_direct_and_auto(self):
-        self.assertEqual(self.run_parser("direct", "https://a.test/").returncode, 0)
-        self.assertEqual(self.run_parser("auto", "https://a.test/ https://b.test/").returncode, 0)
-        out = self.run_parser("auto", " https://a.test/ , https://b.test/ ").stdout
-        self.assertEqual(out.splitlines(), ["https://a.test/", "https://b.test/"])
+    def test_single_probe_decides_the_route(self):
+        self.assertIn('GH_MIRROR="${GH_MIRROR:-https://ghfast.top/}"', self.script)
+        self.assertIn("probe_route", self.script)
+        self.assertIn('if [ "$STATUS" = 200 ]', self.script)
+        # 探测只跑一次，结果对整个流程生效
+        self.assertEqual(self.script.count("ROUTE_READY=1"), 1)
+        self.assertEqual(self.script.count("ROUTE_READY=0"), 1)
+        self.assertEqual(self.script.count("probe_route"), 2)   # 定义 + fetch 里调用
+        self.assertIn('ROUTES=("$MIRROR_PREFIX$URL")', self.script)
 
-    def test_invalid_prefixes_rejected(self):
-        for prefix in ("ftp://m.test/", "https://user:pass@m.test/",
-                       "https://m.test/?x=1", "https://m.test/#f", "https://m.test:bad/"):
-            result = self.run_parser("", prefix)
-            self.assertNotEqual(result.returncode, 0, prefix)
-            self.assertIn("Invalid GitHub mirror", result.stderr)
+    def test_agent_is_replaced_not_patched(self):
+        self.assertNotIn("agent.orig.url", self.script)
+        self.assertNotIn("--patch --in \"$RUN/agent.orig\"", self.script)
+        self.assertIn("Verified patched agent sha256 + arch", self.script)
+        self.assertIn("Release has no $PLATFORM agent asset", self.script)
+
+    def test_version_gate_runs_before_replacement(self):
+        gate = self.script.index("Version mismatch (installed")
+        replace = self.script.index('install -m 0755 "$RUN/core" "$CORE_BIN"')
+        self.assertLess(gate, replace)
 
 
 if __name__ == "__main__":

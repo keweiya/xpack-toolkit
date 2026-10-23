@@ -16,12 +16,17 @@ curl -fsSL https://raw.githubusercontent.com/keweiya/xpack-toolkit/main/unlock.s
 curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/keweiya/xpack-toolkit/main/unlock.sh | sudo bash
 ```
 
-脚本内部所有 GitHub 下载（Release 资产、工具文件、官方安装包）**默认就走 `https://ghfast.top/`**，失败会依次回落到其它内置镜像和直连；想强制直连用 `--no-mirror`，想现场测速挑最快的用 `--use-mirror`。
+下载线路是**一次探测、全程一致**，没有额外的镜像开关：
+
+- 脚本启动时先探一次 `raw.githubusercontent.com`（4 秒连接 / 8 秒总超时）
+- 通了 → 全程直连，不碰任何加速镜像（国外机器就是这个行为）
+- 不通 → 全程所有 GitHub 下载（Release 资产、工具文件、官方安装包）都加 `https://ghfast.top/` 前缀
+- 需要强制走加速：`GH_MIRROR_FORCE=1 sudo -E bash unlock.sh install`；要换前缀：`GH_MIRROR=https://…/`
 
 脚本自动完成：
 
 1. **版本检测与升级**：读取宿主机 1Panel 版本与仓库最高稳定 Release；若 Release 版本较新，先通过官方安装包把宿主机 1Panel 升级到与 Release 一致（数据库迁移随官方内核启动自动完成）。
-2. **直接替换**：内核和 Agent 都是 Release 里**预构建好的破解产物**，装机器只做「校验 sha256 + ELF 架构 → 覆盖」，不需要在目标机上重新打补丁（老 Release 没有预构建 Agent 时才回落到「官方原件 + 本机现打」）。安装/证书工具（`gen_license.py` 等）直接从 `main` 分支拉取，不打包进 Release。
+2. **版本门禁 + 直接替换**：先比对本地面板版本与 Release 版本，不一致就先按官方包升级到一致；升级后仍不一致则**一个文件都不替换**直接退出。内核和 Agent 都是 Release 里**预构建好的破解产物**，装机器只做「校验 sha256 + ELF 架构 → 覆盖」，目标机上不做任何二进制改写；Release 缺该架构 Agent 资产时只换内核。安装/证书工具（`gen_license.py` 等）直接从 `main` 分支拉取，不打包进 Release。
 3. **本地生成授权证书**：生成企业版授权（999 节点、永久有效、离线），直接写入 `licenses` 表并绑定主节点。**本工具之前生成的证书会删除重做（子节点绑定自动迁移）**；第三方/官方证书一律保留，若主节点已绑定其它证书则先解除旧绑定。
 
 破解内核已**移除全部授权检查**：授权中间件放行、本地签名/根证书校验恒通过、节点额度校验恒通过、授权上报/解绑不回连服务器。因此**不需要宿主机额外签发/生成任何授权证书，也不需要签名私钥**。
@@ -32,7 +37,7 @@ curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/keweiya/xpack-to
 | --- | --- | --- |
 | `core-linux-<arch>` | 安装脚本 | 已移除全部授权检查的内核，校验 sha256/架构后直接替换 |
 | `agent-linux-<arch>` | 安装脚本 | 已打好 X-Pack 补丁的 Agent，校验后直接替换 |
-| `core-linux-<arch>.orig` / `agent-linux-<arch>.orig` | 回滚、诊断、老版本回落 | 官方原件，用于 `restore` 与本机现打 |
+| `core-linux-<arch>.orig` / `agent-linux-<arch>.orig` | 回滚、诊断 | 官方原件，`restore` 回滚时使用 |
 | `runtime.tar.gz` | 离线复用 / 审计 | 发布时刻的工具与证书快照；安装流程当前从 `main` 分支拉工具，该资产留作离线备用 |
 | `manifest.json` | 安装脚本 | 各资产的 sha256/尺寸/补丁数，安装前逐项核对 |
 
@@ -41,17 +46,15 @@ curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/keweiya/xpack-to
 ## 选项
 
 ```bash
-sudo bash unlock.sh install --use-mirror       # 现场测速，选延迟最低的镜像（默认已用 ghfast.top）
 sudo bash unlock.sh install --prompt-unbind    # 解绑旧证书前交互确认
-sudo bash unlock.sh install --skip-agent       # 不重建/替换 Agent（默认 amd64、arm64 都重建）
-sudo bash unlock.sh install --no-mirror        # 全程直连 GitHub，不用加速镜像
+sudo bash unlock.sh install --skip-agent       # 只换内核，Agent 保持原样
 sudo bash unlock.sh verify                     # 回读校验破解内核与已绑定授权
 sudo bash unlock.sh restore                    # 回滚到替换前的官方内核
 ```
 
-- `--mirror auto|URL` / `--no-mirror`：选择 GitHub 下载线路。
-- `--http-proxy URL`：设置本机网络代理。
-- 兼容环境变量 `GH_PROXY`、`GH_MIRRORS`，`curl` 沿用 `http_proxy` / `https_proxy`。
+- `--http-proxy URL`：设置本机网络代理（探测与下载都走它）。
+- `GH_MIRROR`：自定义加速前缀，默认 `https://ghfast.top/`；`GH_MIRROR_FORCE=1` 跳过探测强制使用。
+- `curl` 仍沿用 `http_proxy` / `https_proxy`。
 
 ## 内核破解方式
 
@@ -116,10 +119,10 @@ arm64 不写死指令偏移，改成结构化解码：先从 `IsXpack()` 里解�
 2. **单测**——`python3 -m unittest discover -s tests`。
 3. **构建**（`tools/release.py --build-only`）——按 SHA 校验官方包后逐平台打补丁，不发布。
 4. **资产自检**（`tools/verify_release.py`）——manifest 大小/哈希与实际文件一致、内核 8/8 补丁已打、Agent 原件能完整复现 8/8、等长覆盖不改体积。
-5. **接口冒烟**（`tools/smoke_test.py`，需 root/sudo：容器内面板以 root 建库，`db` 目录 0700）——**只在 Docker 容器里跑**，绝不碰宿主机的 1Panel，`amd64` / `arm64` 各跑一遍（arm64 走 qemu 模拟）：启动面板 → 登录 → 自制证书上传（官方内核此处失败、破解内核通过）→ 落库绑定 → `licenses/master/status` 为 `Bound`、节点 `isXpack=true` → 专业版接口放行。
+5. **接口冒烟**（`tools/smoke_test.py`，需 root/sudo：容器内面板以 root 建库，`db` 目录 0700，冒烟直接使用 Release 里发布的那两个二进制）——**只在 Docker 容器里跑**，绝不碰宿主机的 1Panel，`amd64` / `arm64` 各跑一遍（arm64 走 qemu 模拟）：启动面板 → 登录 → 自制证书上传（官方内核此处失败、破解内核通过）→ 落库绑定 → `licenses/master/status` 为 `Bound`、节点 `isXpack=true` → 专业版接口放行。
 6. **发布**——前 5 步全绿才执行 `release.py --publish`，原子替换同名 Release。
 
-手动触发（`build` 工作流）走的是同一条 `pipeline.yml` 门禁流程，只是版本号由人填。
+`build.yml` 是唯一一条发布流水线，既能手动触发（`workflow_dispatch`，版本号由人填），也被 `upstream-watch.yml` 通过 `uses:` 复用（`workflow_call`），两边跑的是完全相同的门禁步骤。
 
 ## 当前支持
 

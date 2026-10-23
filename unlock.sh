@@ -46,17 +46,13 @@ progress_bar_enabled() {
 
 usage() {
   printf '%s\n' 'Usage: unlock.sh [install|restore|verify] [options]' \
-    '  --use-mirror, --mirror auto  Measure built-in mirrors and use the fastest valid one' \
-    '  --mirror URL                Use only the specified HTTP(S) GitHub gateway' \
-    '  --no-mirror, --direct        Use GitHub directly, without mirror fallback' \
     '  --http-proxy URL            Set a local HTTP(S) network proxy for curl' \
     '  --progress / --no-progress  Force download progress on/off (default: auto)' \
-    '  --skip-agent                Do not rebuild/replace the amd64 agent' \
+    '  --skip-agent                Replace only the core, keep the current agent' \
     '  --prompt-unbind             Prompt before releasing an existing master binding' \
     '  --help                      Show this help'
 }
 
-CLI_ROUTE=""
 SKIP_AGENT=0
 PROMPT_UNBIND=0
 MODE_SET=0
@@ -65,12 +61,6 @@ while [ "$#" -gt 0 ]; do
     install|deploy|restore|verify)
       [ "$MODE_SET" = 0 ] || die "Specify only one operation"
       MODE="$1"; MODE_SET=1 ;;
-    --use-mirror) CLI_ROUTE=auto ;;
-    --mirror)
-      [ "$#" -ge 2 ] && [ -n "$2" ] || die "--mirror requires auto or an HTTP(S) URL"
-      CLI_ROUTE="$2"; shift ;;
-    --mirror=*) CLI_ROUTE="${1#*=}"; [ -n "$CLI_ROUTE" ] || die "--mirror requires auto or an HTTP(S) URL" ;;
-    --no-mirror|--direct) CLI_ROUTE=direct ;;
     --http-proxy)
       [ "$#" -ge 2 ] && [ -n "$2" ] || die "--http-proxy requires a proxy URL"
       export XPACK_HTTP_PROXY="$2"; shift ;;
@@ -85,102 +75,35 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 
-MIRROR_CHOICE="${CLI_ROUTE:-${GH_PROXY:-https://ghfast.top/}}"
-[ "$(id -u)" -eq 0 ] || die "Run as root"
-[ "$(uname -s)" = Linux ] || die "This release provides Linux cores"
-case "$(uname -m)" in
-  x86_64|amd64) ARCH=amd64 ;; aarch64|arm64) ARCH=arm64 ;;
-  armv7l) ARCH=armv7 ;; ppc64le|s390x|riscv64) ARCH="$(uname -m)" ;;
-  *) die "Unknown architecture: $(uname -m)" ;;
-esac
-PLATFORM="linux-$ARCH"
-PANEL_CTL="${PANEL_CTL:-/usr/local/bin/1pctl}"
-
 # ---------------------------------------------------------------------------
-# 镜像 / 下载
+# 下载线路：开跑前探测一次，决定整轮是直连还是走加速镜像
+#   · 直连 GitHub 能通（国外机器）→ 全程直连，不碰镜像
+#   · 直连不通/超时（国内机器）  → 全程使用 GH_MIRROR 前缀
+# 需要强制走加速：GH_MIRROR_FORCE=1 sudo -E bash unlock.sh install
 # ---------------------------------------------------------------------------
-MIRROR_CONFIG="$(python3 - "$MIRROR_CHOICE" "${GH_MIRRORS-https://ghfast.top/ https://gh-proxy.com/ https://ghproxy.net/}" <<'PY'
-import re, sys, urllib.parse
-preferred, configured = sys.argv[1:]
-if preferred == "direct":
-    raise SystemExit(0)
-if preferred == "auto":
-    preferred = ""
-seen = set()
-for value in ([preferred] if preferred else re.split(r"[\s,]+", configured.strip())):
-    if not value:
-        continue
-    parsed = urllib.parse.urlsplit(value)
-    if (parsed.scheme not in ("http", "https") or not parsed.hostname or
-            parsed.username is not None or parsed.password is not None or
-            parsed.query or parsed.fragment or any(ord(c) < 33 for c in value)):
-        raise SystemExit("Invalid GitHub mirror prefix; expected an HTTP(S) URL without credentials/query/fragment")
-    try:
-        parsed.port
-    except ValueError:
-        raise SystemExit("Invalid GitHub mirror port")
-    value = value.rstrip("/") + "/"
-    if value not in seen:
-        print(value)
-        seen.add(value)
-PY
-)" || die "Invalid GitHub mirror configuration"
-
-MIRRORS=()
-MIRROR_READY=0
-rank_mirrors() {
-  python3 - "$REPO" "$MIRROR_CONFIG" <<'PY'
-import concurrent.futures, json, math, os, pathlib, subprocess, sys, tempfile
-repo, configured = sys.argv[1:]
-prefixes = configured.splitlines()
-probe_url = "https://api.github.com/repos/" + repo + "/releases?per_page=100"
-def probe(item):
-    index, prefix = item
-    with tempfile.TemporaryDirectory(prefix="xpack-mirror-probe-") as directory:
-        target = pathlib.Path(directory) / "releases.json"
-        command = ["curl", "--proto", "=http,https", "--proto-redir", "=http,https",
-                   "--tlsv1.2", "-fsSL", "--connect-timeout", "3", "--max-time", "12",
-                   "--max-filesize", "2097152", "--write-out", "\n%{http_code}\t%{time_starttransfer}\n"]
-        if os.environ.get("XPACK_HTTP_PROXY"):
-            command += ["--proxy", os.environ["XPACK_HTTP_PROXY"]]
-        command += ["-o", str(target), prefix + probe_url]
-        try:
-            result = subprocess.run(command, capture_output=True, text=True, timeout=15)
-            status, measured = result.stdout.strip().split("\t")
-            elapsed = float(measured)
-            if result.returncode or status != "200" or not math.isfinite(elapsed) or not 0 < elapsed <= 12:
-                return None
-            data = json.loads(target.read_text())
-            if (not isinstance(data, list) or not data or any(not isinstance(r, dict) or
-                    not isinstance(r.get("tag_name"), str) or not isinstance(r.get("assets", []), list) for r in data)):
-                return None
-            return elapsed, index, prefix
-        except (OSError, ValueError, subprocess.SubprocessError):
-            return None
-with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
-    ranked = sorted(item for item in pool.map(probe, enumerate(prefixes)) if item is not None)
-if not ranked:
-    raise SystemExit("No valid GitHub mirror responded; select --no-mirror or specify --mirror URL")
-for elapsed, index, prefix in ranked:
-    print(prefix)
-    print("== Mirror " + prefix + " response latency: " + format(elapsed * 1000, ".1f") + " ms", file=sys.stderr)
-PY
-}
-configure_mirrors() {
-  [ "$MIRROR_READY" = 0 ] || return 0
-  local RANKED="" PREFIX
-  [ -n "$MIRROR_CHOICE" ] || MIRROR_CHOICE=auto
-  case "$MIRROR_CHOICE" in
-    direct) MIRRORS=(); log "GitHub download mode: direct (mirrors disabled)" ;;
-    auto)
-      [ -n "$MIRROR_CONFIG" ] || die "No mirror candidates configured"
-      log "Measuring GitHub mirror response latency"
-      RANKED="$(rank_mirrors)" || die "All mirror probes failed; no installation changes were made"
-      while IFS= read -r PREFIX; do MIRRORS+=("$PREFIX"); done <<< "$RANKED"
-      log "Selected lowest-latency GitHub mirror: ${MIRRORS[0]}" ;;
-    *) MIRRORS=("$MIRROR_CONFIG"); log "Using user-specified GitHub mirror: ${MIRRORS[0]}" ;;
-  esac
-  MIRROR_READY=1
+GH_MIRROR="${GH_MIRROR:-https://ghfast.top/}"
+MIRROR_PREFIX=""
+ROUTE_READY=0
+probe_route() {
+  [ "$ROUTE_READY" = 0 ] || return 0
+  ROUTE_READY=1
+  local PROBE="https://raw.githubusercontent.com/$REPO/main/unlock.sh" STATUS=""
+  local -a PROXY=()
+  [ -z "${XPACK_HTTP_PROXY:-}" ] || PROXY=(--proxy "$XPACK_HTTP_PROXY")
+  if [ -n "${GH_MIRROR_FORCE:-}" ]; then
+    MIRROR_PREFIX="$GH_MIRROR"
+    log "GitHub download route: $MIRROR_PREFIX (forced)"
+    return 0
+  fi
+  STATUS="$(curl --proto '=http,https' --proto-redir '=http,https' --tlsv1.2 -sS -o /dev/null \
+    --connect-timeout 4 --max-time 8 --write-out '%{http_code}' \
+    "${PROXY[@]}" "$PROBE" 2>/dev/null || true)"
+  if [ "$STATUS" = 200 ]; then
+    log "GitHub download route: direct"
+  else
+    MIRROR_PREFIX="$GH_MIRROR"
+    log "GitHub unreachable directly; every download goes through $MIRROR_PREFIX"
+  fi
 }
 run_download() {
   local PART="$1" CANDIDATE="$2" PID STATUS=0 ELAPSED=0 SIZE=0 START NOW
@@ -225,11 +148,9 @@ fetch() {
   local -a ROUTES=("$URL") CURL_PROXY=() ORDER=()
   case "$URL" in
     https://github.com/*|https://raw.githubusercontent.com/*|https://api.github.com/*)
-      configure_mirrors
-      if [ "${#MIRRORS[@]}" -gt 0 ]; then
-        ROUTES=()
-        for PREFIX in "${MIRRORS[@]}"; do ROUTES+=("$PREFIX$URL"); done
-        ROUTES+=("$URL")   # 镜像全挂时回落到直连，避免卡死在加速器上
+      probe_route
+      if [ -n "$MIRROR_PREFIX" ]; then
+        ROUTES=("$MIRROR_PREFIX$URL")
       fi ;;
   esac
   [ -z "${XPACK_HTTP_PROXY:-}" ] || CURL_PROXY=(--proxy "$XPACK_HTTP_PROXY")
@@ -245,12 +166,6 @@ fetch() {
     fi
     if [ $? -eq 0 ]; then
       mv -f -- "$PART" "$DEST"
-      if [ "$CANDIDATE" != "$URL" ]; then
-        PREFIX="${CANDIDATE%"$URL"}"
-        ORDER=("$PREFIX")
-        for HOST in "${MIRRORS[@]}"; do [ "$HOST" = "$PREFIX" ] || ORDER+=("$HOST"); done
-        MIRRORS=("${ORDER[@]}")
-      fi
       return 0
     fi
     [ -n "$SILENT" ] || printf '!! Download route %s failed; trying next route\n' "$HOST" >&2
@@ -337,11 +252,11 @@ if not all(name in assets for name in needed):
 (run / "manifest.url").write_text(assets["manifest.json"])
 (run / "core.url").write_text(assets["core-" + platform])
 (run / "orig.url").write_text(assets["core-" + platform + ".orig"])
-# 预构建的破解 Agent：有就直接下载替换；老 Release 没有时才回落到本机现打
+# 预构建的破解 Agent：有就下载替换；没有就只换内核，绝不退回到本机现打
 if "agent-" + platform in assets:
     (run / "agent.url").write_text(assets["agent-" + platform])
-if "agent-" + platform + ".orig" in assets:
-    (run / "agent.orig.url").write_text(assets["agent-" + platform + ".orig"])
+else:
+    (run / "agent.missing").write_text("1")
 (run / "release.tag").write_text(tag)
 (run / "selected.version").write_text(tag[5:])
 print("Release " + tag[5:] + " selected for " + platform)
@@ -562,6 +477,13 @@ else
   log "Installed panel is already at Release version $RELEASE_VERSION; skip official upgrade"
 fi
 
+# 版本门禁：本地内核版本必须与 Release 完全一致，否则不做任何替换
+INSTALLED_VERSION="$(detect_installed_version)"
+if [ "$INSTALLED_VERSION" != "$RELEASE_VERSION" ]; then
+  die "Version mismatch (installed $INSTALLED_VERSION / release $RELEASE_VERSION); nothing was replaced"
+fi
+log "Version check passed: panel $INSTALLED_VERSION == release $RELEASE_VERSION"
+
 # 3.1 从 Release 下载破解内核并校验
 fetch "$(<"$RUN/core.url")" "$RUN/core"
 python3 - "$RUN" "$PLATFORM" <<'PY'
@@ -581,8 +503,8 @@ PY
 # 校验下载来的内核确实「已移除全部检查」
 python3 "$PATCH_CORE" --verify --in "$RUN/core" || die "Downloaded core is not the remove-all-checks kernel"
 
-# Agent：优先用 Release 里已经打好补丁的二进制，装机器只校验 + 替换；
-# 老 Release 没有预构建 Agent 时才回落到「官方原件 + 本机现打」。
+# Agent：用 Release 里已经打好补丁的二进制，装机器只校验 + 替换。
+# Release 缺这个架构的 Agent 资产时只换内核，不在本机做任何二进制改写。
 NEED_AGENT=0
 if [ "$SKIP_AGENT" != 1 ] && [ -f "$AGENT_BIN" ]; then NEED_AGENT=1; fi
 AGENT_SOURCE=""
@@ -603,15 +525,9 @@ print("Verified patched agent sha256 + arch: " + info["agent_sha256"][:16])
 PYEOF
     AGENT_SOURCE="$RUN/agent"
     log "Using prebuilt patched $ARCH agent from Release"
-  elif [ -f "$RUN/agent.orig.url" ]; then
-    fetch "$(<"$RUN/agent.orig.url")" "$RUN/agent.orig"
-    python3 "$PATCH_AGENT" --patch --in "$RUN/agent.orig" --out "$RUN/agent" \
-      --orig "$RUN/agent.orig" --manifest "$RUN/agent.manifest.json"
-    python3 "$PATCH_AGENT" --verify --in "$RUN/agent" --orig "$RUN/agent.orig"
-    AGENT_SOURCE="$RUN/agent"
-    log "Rebuilt $ARCH agent from verified official source"
   else
-    die "Release has no agent asset for $PLATFORM"
+    NEED_AGENT=0
+    log "Release has no $PLATFORM agent asset; core replaced, agent left untouched"
   fi
 fi
 
