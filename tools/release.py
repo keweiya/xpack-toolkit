@@ -298,18 +298,37 @@ def build_platform(version, arch, package, work, assets):
             or details.get("output_sha256") != sha256(patched)
             or patched.stat().st_size != original.stat().st_size):
         raise ReleaseError("unexpected fresh offline patch manifest for " + arch)
+    # Agent 也在构建期打好补丁随 Release 发布，装机器只做校验 + 替换，
+    # 不需要在目标机上再跑一遍补丁流程。
+    agent_patched = work / "agent"
+    agent_manifest = work / "agent-patches.json"
+    command([sys.executable, str(ROOT / "tools/patch_agent.py"), "--patch",
+             "--in", str(agent_original), "--out", str(agent_patched),
+             "--orig", str(agent_original), "--manifest", str(agent_manifest)])
+    command([sys.executable, str(ROOT / "tools/patch_agent.py"), "--verify",
+             "--in", str(agent_patched), "--orig", str(agent_original)])
+    agent_details = json.loads(agent_manifest.read_text(encoding="utf-8"))
+    agent_patches = agent_details.get("applied") or []
+    recorded = {item.get("name") for item in agent_details.get("patches") or []}
+    if (not agent_patches or set(agent_patches) != recorded
+            or agent_details.get("already_patched") != []
+            or agent_patched.stat().st_size != agent_original.stat().st_size):
+        raise ReleaseError("unexpected agent patch manifest for " + arch)
     core_asset = "core-linux-" + arch
     orig_asset = core_asset + ".orig"
-    agent_orig_asset = "agent-linux-" + arch + ".orig"
+    agent_asset = "agent-linux-" + arch
+    agent_orig_asset = agent_asset + ".orig"
     shutil.copyfile(patched, assets / core_asset)
     shutil.copyfile(original, assets / orig_asset)
+    shutil.copyfile(agent_patched, assets / agent_asset)
     shutil.copyfile(agent_original, assets / agent_orig_asset)
-    (assets / core_asset).chmod(0o755)
-    (assets / orig_asset).chmod(0o755)
-    (assets / agent_orig_asset).chmod(0o755)
+    for name in (core_asset, orig_asset, agent_asset, agent_orig_asset):
+        (assets / name).chmod(0o755)
     return {"arch": arch, "os": "linux", "size": patched.stat().st_size,
             "sha256": sha256(patched), "orig_sha256": sha256(original),
             "core_asset": core_asset, "orig_asset": orig_asset, "patches": len(patches),
+            "agent_asset": agent_asset, "agent_sha256": sha256(agent_patched),
+            "agent_size": agent_patched.stat().st_size, "agent_patches": len(agent_patches),
             "agent_orig_asset": agent_orig_asset, "agent_orig_sha256": sha256(agent_original),
             "agent_orig_size": agent_original.stat().st_size}
 
@@ -360,7 +379,7 @@ def build_release(args):
         names = ["manifest.json", "runtime.tar.gz"]
         for arch in args.arches:
             names.extend(["core-linux-" + arch, "core-linux-" + arch + ".orig",
-                          "agent-linux-" + arch + ".orig"])
+                          "agent-linux-" + arch, "agent-linux-" + arch + ".orig"])
         # Replace only our named assets after the entire release has built successfully.
         for name in names:
             target = output / name

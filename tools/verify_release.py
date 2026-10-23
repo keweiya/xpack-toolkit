@@ -51,7 +51,8 @@ def check_platform(release, platform, info):
     core = release / info["core_asset"]
     original = release / info["orig_asset"]
     agent = release / info["agent_orig_asset"]
-    for path in (core, original, agent):
+    agent_patched = release / info["agent_asset"]
+    for path in (core, original, agent, agent_patched):
         if not path.is_file():
             raise VerifyError("missing asset: " + str(path))
     if sha256(core) != info["sha256"]:
@@ -60,6 +61,10 @@ def check_platform(release, platform, info):
         raise VerifyError("orig sha256 mismatch: " + str(original))
     if sha256(agent) != info["agent_orig_sha256"]:
         raise VerifyError("agent sha256 mismatch: " + str(agent))
+    if sha256(agent_patched) != info["agent_sha256"]:
+        raise VerifyError("patched agent sha256 mismatch: " + str(agent_patched))
+    if agent_patched.stat().st_size != agent.stat().st_size:
+        raise VerifyError("patched agent changed size: " + str(agent_patched))
     if core.stat().st_size != original.stat().st_size:
         raise VerifyError("patched core changed size (not an equal-length patch): " + str(core))
 
@@ -70,16 +75,20 @@ def check_platform(release, platform, info):
 
     if platform not in AGENT_PATCH_PLATFORMS:
         return patched, "跳过（该平台保留官方 Agent）"
+    # 发布出去的就是打好补丁的 Agent：直接校验它，而不是临时再打一份
+    listing = run([ROOT / "tools/patch_agent.py", "--in", agent_patched,
+                   "--verify", "--orig", agent])
+    if "all patches present" not in listing:
+        raise VerifyError("shipped agent is not fully patched for {}:\n{}".format(platform, listing))
+    total = listing.count("patched")
+    # 再确认「官方原件 + 补丁 = 发布的产物」，保证可复现
     with tempfile.TemporaryDirectory() as tmp:
         target = Path(tmp) / "agent"
-        run([ROOT / "tools/patch_agent.py", "--in", agent, "--out", target, "--patch"])
-        listing = run([ROOT / "tools/patch_agent.py", "--in", target, "--verify",
-                       "--orig", agent])
-        if "all patches present" not in listing:
-            raise VerifyError("agent patches incomplete for {}:\n{}".format(platform, listing))
-        if target.stat().st_size != agent.stat().st_size:
-            raise VerifyError("patched agent changed size: " + str(target))
-        total = listing.count("patched")
+        run([ROOT / "tools/patch_agent.py", "--in", agent, "--out", target, "--patch",
+             "--orig", agent, "--manifest", Path(tmp) / "agent.json"])
+        if sha256(target) != sha256(agent_patched):
+            raise VerifyError("shipped agent is not reproducible from the official original: "
+                              + str(agent_patched))
     return patched, "{}/{}".format(total, total)
 
 

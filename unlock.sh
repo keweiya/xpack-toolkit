@@ -332,15 +332,16 @@ target, release = max(releases, key=lambda item: item[0])
 tag = release["tag_name"]
 assets = {a["name"]: a["browser_download_url"] for a in release.get("assets", [])}
 needed = ("manifest.json", "core-" + platform, "core-" + platform + ".orig")
-if platform == "linux-amd64":
-    needed += ("agent-" + platform + ".orig",)
 if not all(name in assets for name in needed):
     raise SystemExit("Unsupported: latest Release " + tag + " has no verified assets for " + platform)
 (run / "manifest.url").write_text(assets["manifest.json"])
 (run / "core.url").write_text(assets["core-" + platform])
 (run / "orig.url").write_text(assets["core-" + platform + ".orig"])
-if platform == "linux-amd64":
-    (run / "agent.url").write_text(assets["agent-" + platform + ".orig"])
+# 预构建的破解 Agent：有就直接下载替换；老 Release 没有时才回落到本机现打
+if "agent-" + platform in assets:
+    (run / "agent.url").write_text(assets["agent-" + platform])
+if "agent-" + platform + ".orig" in assets:
+    (run / "agent.orig.url").write_text(assets["agent-" + platform + ".orig"])
 (run / "release.tag").write_text(tag)
 (run / "selected.version").write_text(tag[5:])
 print("Release " + tag[5:] + " selected for " + platform)
@@ -580,17 +581,38 @@ PY
 # 校验下载来的内核确实「已移除全部检查」
 python3 "$PATCH_CORE" --verify --in "$RUN/core" || die "Downloaded core is not the remove-all-checks kernel"
 
-# Agent：两个架构都从官方原件重建（amd64 / arm64 各自的补丁模式）
+# Agent：优先用 Release 里已经打好补丁的二进制，装机器只校验 + 替换；
+# 老 Release 没有预构建 Agent 时才回落到「官方原件 + 本机现打」。
 NEED_AGENT=0
 if [ "$SKIP_AGENT" != 1 ] && [ -f "$AGENT_BIN" ]; then NEED_AGENT=1; fi
 AGENT_SOURCE=""
 if [ "$NEED_AGENT" = 1 ]; then
-  fetch "$(<"$RUN/agent.url")" "$RUN/agent.orig"
-  python3 "$PATCH_AGENT" --patch --in "$RUN/agent.orig" --out "$RUN/agent" \
-    --orig "$RUN/agent.orig" --manifest "$RUN/agent.manifest.json"
-  python3 "$PATCH_AGENT" --verify --in "$RUN/agent" --orig "$RUN/agent.orig"
-  AGENT_SOURCE="$RUN/agent"
-  log "Rebuilt $ARCH agent from verified official source"
+  if [ -f "$RUN/agent.url" ]; then
+    fetch "$(<"$RUN/agent.url")" "$RUN/agent"
+    python3 - "$RUN" "$PLATFORM" <<'PYEOF' || die "Downloaded patched agent failed verification"
+import hashlib, json, pathlib, struct, sys
+run, platform = pathlib.Path(sys.argv[1]), sys.argv[2]
+arch = platform[6:]
+info = json.loads((run / "manifest.json").read_text())["platforms"][platform]
+data = (run / "agent").read_bytes()
+if info.get("agent_sha256") != hashlib.sha256(data).hexdigest():
+    raise SystemExit("Patched agent SHA-256 mismatch")
+if len(data) < 20 or data[:6] != b"\x7fELF\x02\x01" or struct.unpack_from("<H", data, 18)[0] != {"amd64": 62, "arm64": 183}[arch]:
+    raise SystemExit("Patched agent ELF architecture mismatch")
+print("Verified patched agent sha256 + arch: " + info["agent_sha256"][:16])
+PYEOF
+    AGENT_SOURCE="$RUN/agent"
+    log "Using prebuilt patched $ARCH agent from Release"
+  elif [ -f "$RUN/agent.orig.url" ]; then
+    fetch "$(<"$RUN/agent.orig.url")" "$RUN/agent.orig"
+    python3 "$PATCH_AGENT" --patch --in "$RUN/agent.orig" --out "$RUN/agent" \
+      --orig "$RUN/agent.orig" --manifest "$RUN/agent.manifest.json"
+    python3 "$PATCH_AGENT" --verify --in "$RUN/agent" --orig "$RUN/agent.orig"
+    AGENT_SOURCE="$RUN/agent"
+    log "Rebuilt $ARCH agent from verified official source"
+  else
+    die "Release has no agent asset for $PLATFORM"
+  fi
 fi
 
 # 备份并替换内核

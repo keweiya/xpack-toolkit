@@ -431,31 +431,34 @@ def machine(data):
 
 
 def sites(data, syms=None, orig=None):
-    """完整站点列表：(name, off, orig, patch, state, note)，共 8 条。
+    """完整站点列表：(name, off, orig, patch, state, note)。
 
-    orig 是「官方原件」：arm64 的站点靠解码 isXpack 全局地址推导，入口桩打完后
-    IsXpack 里已经没有 adrp/ldrb 可解，所以校验已打过补丁的文件要用原件做参考，
-    再按同一偏移在 data 里判状态。
+    orig 是「官方原件」：站点定位一律在原件上做（打完补丁的文件里，A1 入口、
+    A7 分支这些位置已经看不出原样了），再按同一偏移在 data 里判状态。
     """
-    arch = machine(data if orig is None else orig)
-    base = data if orig is None else orig
+    reference = data if orig is None else orig
+    arch = machine(reference)
     if syms is None:
-        syms = _symbols(base)
+        syms = _symbols(reference)
+    rows = _locate_sites(reference, arch, syms)
+    if orig is None:
+        return rows
+    return [(name, off, data[off:off + len(patch)], patch,
+             state_of(data, off, patch, cur), note)
+            for name, off, cur, patch, _state, note in rows]
+
+
+def _locate_sites(reference, arch, syms):
     if arch == "arm64":
-        rows = a64_sites(base, syms)
-        if orig is None:
-            return rows
-        return [(name, off, data[off:off + len(patch)], patch,
-                 state_of(data, off, patch, cur), note)
-                for name, off, cur, patch, _state, note in rows]
-    rows = [_entry(data, syms, name, suffix, stub, note)
+        return a64_sites(reference, syms)
+    rows = [_entry(reference, syms, name, suffix, stub, note)
             for name, suffix, stub, note in ENTRY_STUBS[arch]]
-    rows.extend(_site(data, syms, name, suffix, orig, patch, note)
+    rows.extend(_site(reference, syms, name, suffix, orig, patch, note)
                 for name, suffix, orig, patch, note in PATTERN_SITES[arch])
     for name, suffix, anchor, note, allow_long in BRANCH_SITES[arch]:
-        rows.append(_branch(data, syms, name, suffix, anchor, note,
+        rows.append(_branch(reference, syms, name, suffix, anchor, note,
                             allow_long=allow_long))
-    rows.extend(_optional_branch_sites(data, syms, rows))
+    rows.extend(_optional_branch_sites(reference, syms, rows))
     rows.sort(key=lambda row: row[1])
     names = [row[0] for row in rows]
     missing = [name for name in REQUIRED_SITES if name not in names]

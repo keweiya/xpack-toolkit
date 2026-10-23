@@ -344,22 +344,27 @@ class ReleaseTests(unittest.TestCase):
                 self.assertEqual(package.parent, work.parent)
                 stages.append(package)
                 core = "core-linux-" + arch
-                agent_orig = "agent-linux-" + arch + ".orig"
-                for name in (core, core + ".orig", agent_orig):
+                agent = "agent-linux-" + arch
+                for name in (core, core + ".orig", agent, agent + ".orig"):
                     (assets / name).write_bytes(name.encode())
                 return {"core_asset": core, "orig_asset": core + ".orig",
-                        "agent_orig_asset": agent_orig, "agent_orig_sha256": release.sha256(assets / agent_orig),
-                        "agent_orig_size": (assets / agent_orig).stat().st_size}
+                        "agent_asset": agent, "agent_sha256": release.sha256(assets / agent),
+                        "agent_size": (assets / agent).stat().st_size,
+                        "agent_orig_asset": agent + ".orig",
+                        "agent_orig_sha256": release.sha256(assets / (agent + ".orig")),
+                        "agent_orig_size": (assets / (agent + ".orig")).stat().st_size}
 
             with mock.patch.object(release, "official_checksums", return_value=("https://example.invalid", "\n".join(checksums))), \
                     mock.patch.object(release, "build_platform", side_effect=platform), \
                     mock.patch.object(release.urllib.request, "urlopen") as network:
                 assets = release.build_release(args)
                 network.assert_not_called()
-            self.assertEqual(len(assets), 8)
+            self.assertEqual(len(assets), 10)
             self.assertEqual({path.name for path in assets}, {
                 "manifest.json", "runtime.tar.gz", "core-linux-amd64", "core-linux-amd64.orig",
-                "core-linux-arm64", "core-linux-arm64.orig", "agent-linux-amd64.orig", "agent-linux-arm64.orig"})
+                "core-linux-arm64", "core-linux-arm64.orig",
+                "agent-linux-amd64", "agent-linux-amd64.orig",
+                "agent-linux-arm64", "agent-linux-arm64.orig"})
             manifest = json.loads((args.output / "manifest.json").read_text())
             self.assertEqual(manifest["schema_version"], 2)
             self.assertEqual(set(manifest["platforms"]), {"linux-amd64", "linux-arm64"})
@@ -413,11 +418,13 @@ class ReleaseTests(unittest.TestCase):
             self.assertNotEqual(workdirs[0], workdirs[1])
             self.assertEqual({path.name for path in assets.iterdir()}, {
                 "core-linux-amd64", "core-linux-amd64.orig", "core-linux-arm64", "core-linux-arm64.orig",
-                "agent-linux-amd64.orig", "agent-linux-arm64.orig"})
+                "agent-linux-amd64", "agent-linux-amd64.orig",
+                "agent-linux-arm64", "agent-linux-arm64.orig"})
             for arch, metadata in platforms.items():
                 self.assertEqual(metadata["core_asset"], "core-linux-" + arch)
                 self.assertEqual(metadata["orig_asset"], "core-linux-" + arch + ".orig")
                 self.assertEqual(metadata["agent_orig_asset"], "agent-linux-" + arch + ".orig")
+                self.assertEqual(metadata["agent_asset"], "agent-linux-" + arch)
                 self.assertEqual(metadata["agent_orig_sha256"], release.sha256(assets / metadata["agent_orig_asset"]))
                 self.assertEqual(metadata["agent_orig_size"], (assets / metadata["agent_orig_asset"]).stat().st_size)
                 self.assertEqual((assets / metadata["agent_orig_asset"]).read_bytes(), self.original_agent(arch))

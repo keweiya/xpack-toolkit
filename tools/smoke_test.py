@@ -158,6 +158,22 @@ def patch_agent(original, output):
         raise SmokeError("agent patch verification failed:\n" + listing)
 
 
+def stage_agent(release, arch, output):
+    """优先用 Release 里发布的破解 Agent（装机器拿到的就是这个），没有才现打。"""
+    shipped = release / "agent-linux-{0}".format(arch)
+    original = release / "agent-linux-{0}.orig".format(arch)
+    if shipped.is_file():
+        shutil.copyfile(shipped, output)
+        output.chmod(0o755)
+        listing = run([sys.executable, str(ROOT / "tools/patch_agent.py"), "--verify",
+                       "--in", str(output), "--orig", str(original)])
+        if "all patches present" not in listing:
+            raise SmokeError("shipped agent is not patched:\n" + listing)
+        print("== using shipped patched agent {}".format(shipped.name), flush=True)
+        return
+    patch_agent(original, output)
+
+
 def patch_1pctl(text, port):
     replacements = {
         "BASE_DIR": "/opt",
@@ -478,7 +494,7 @@ def prepare_context(release, package, arch, workdir):
     context = workdir / "ctx"
     context.mkdir()
     shutil.copyfile(core, context / "core")
-    patch_agent(agent_original, context / "agent")
+    stage_agent(release, arch, context / "agent")
     (context / "1pctl").write_text(patch_1pctl(extract_1pctl(package), CONTAINER_PORT))
     (context / "entrypoint.sh").write_text(ENTRYPOINT)
     (context / "Dockerfile").write_text(DOCKERFILE)
