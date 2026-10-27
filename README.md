@@ -23,27 +23,27 @@ curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/keweiya/xpack-to
 - 先存成文件再跑（没有 curl 命令行可读）→ 走「官方直连」那一支
 - 需要强制加速：`GH_MIRROR_FORCE=1 sudo -E bash unlock.sh install`；要换前缀：`GH_MIRROR=https://…/`
 
-## 前置依赖
+## 运行依赖
 
-目标机需要 `python3`（只用标准库，无需第三方包）和 `sqlite3` 模块：
+目标机只需要 `bash` + coreutils + `openssl`（1Panel 宿主机默认都有），**安装流程不调用 python**：
 
-- 脚本启动时自查，缺就按发行版自动装（`apt-get` / `dnf` / `yum` / `apk` / `zypper`）；
-- 装不上直接退出并说明原因，不会留下半成品。
+| 环节 | 实现 |
+| --- | --- |
+| 版本检测 / 版本比较 | shell 读 `core.db`（有 sqlite3 时）、`core version`、1pctl 的 `ORIGINAL_VERSION`，`sort -V` 比较 |
+| Release 选择 | shell + awk 解析 GitHub API JSON（字符串内括号不计的对象切分），原子回退到 atom feed |
+| 资产校验 | `sha256sum` + `od` 读 ELF 魔数与 `e_machine` |
+| manifest 校验 | `awk` 按平台块提取字段 |
+| 1pctl 配置回填 | `awk` 键值替换 |
+| 授权证书 | `openssl enc -aes-128-cbc` 加密字段 + `sqlite3` 写 `licenses` 表（字段编码与 `tools/gen_license.py` 完全一致，两种实现可互读对方的库） |
 
-为什么预构建了破解内核还要 python：
+`sqlite3` CLI 是可选的：缺它时证书文件写到 `$PANEL_ROOT/unlock/license.txt`，不写库。破解内核已移除全部授权门控，因此没写库也不影响专业版功能，只是面板「授权」页不显示企业版。装上 `sqlite3` 后重跑同一条命令即可补写。
 
-| 用途 | 位置 | 能否用 shell 替代 |
-| --- | --- | --- |
-| 读 `db/core.db` 的 `SystemVersion` 判断已装版本 | `detect_installed_version` | 需要 sqlite3 客户端 |
-| 生成企业版授权证书（AES + 三段式结构、写 `licenses` 表、绑定主节点） | `tools/gen_license.py` | 需要 openssl + sqlite3 命令行，依赖不比 python 少 |
-| 校验 Release 资产 sha256 / ELF 架构、回读确认补丁 | `tools/patch_core.py`、`patch_agent.py` | 需要解析 Go pclntab |
-
-Release 里的 `core` / `agent` 已经是打过补丁的成品，但授权证书是**按机器现场生成**（节点绑定、写库、离线签名），所以生成证书这一步必须在目标机上跑，而不是随资产下发。
+`tools/*.py` 只用于 CI 打补丁与本地回归验证，不参与安装流程。
 
 脚本自动完成：
 
 1. **版本检测与升级**：读取宿主机 1Panel 版本与仓库最高稳定 Release；若 Release 版本较新，先通过官方安装包把宿主机 1Panel 升级到与 Release 一致（数据库迁移随官方内核启动自动完成）。
-2. **版本门禁 + 直接替换**：先比对本地面板版本与 Release 版本，不一致就先按官方包升级到一致；升级后仍不一致则**一个文件都不替换**直接退出。内核和 Agent 都是 Release 里**预构建好的破解产物**，装机器只做「校验 sha256 + ELF 架构 → 覆盖」，目标机上不做任何二进制改写；Release 缺该架构 Agent 资产时只换内核。安装/证书工具（`gen_license.py` 等）直接从 `main` 分支拉取，不打包进 Release。
+2. **版本门禁 + 直接替换**：先比对本地面板版本与 Release 版本，不一致就先按官方包升级到一致；升级后仍不一致则**一个文件都不替换**直接退出。内核和 Agent 都是 Release 里**预构建好的破解产物**，装机器只做「校验 sha256 + ELF 架构 → 覆盖」，目标机上不做任何二进制改写；Release 缺该架构 Agent 资产时只换内核。授权证书在装机器上由 shell 现场生成（`openssl` + `sqlite3`），不再下发任何脚本工具。
 3. **本地生成授权证书**：生成企业版授权（999 节点、永久有效、离线），直接写入 `licenses` 表并绑定主节点。**本工具之前生成的证书会删除重做（子节点绑定自动迁移）**；第三方/官方证书一律保留，若主节点已绑定其它证书则先解除旧绑定。
 
 破解内核已**移除全部授权检查**：授权中间件放行、本地签名/根证书校验恒通过、节点额度校验恒通过、授权上报/解绑不回连服务器。因此**不需要宿主机额外签发/生成任何授权证书，也不需要签名私钥**。

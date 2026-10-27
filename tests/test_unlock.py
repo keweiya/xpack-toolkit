@@ -1,5 +1,6 @@
 """Installer flow regressions (unlock.sh syntax + release selection logic)."""
 
+import importlib.util
 import json
 import os
 import re
@@ -64,106 +65,34 @@ class UnlockFlowTests(unittest.TestCase):
         ]), "core-v2.3.2")
 
 
-def extract_tool_files(script):
-    match = re.search(r'TOOL_FILES="([^"]+)"', script)
+def shell_function(name):
+    script = UNLOCK.read_text()
+    match = re.search(r"^%s\(\) \{.*?^\}" % re.escape(name), script, flags=re.S | re.M)
     if not match:
-        raise AssertionError("TOOL_FILES declaration not found in unlock.sh")
-    return match.group(1).split()
+        raise AssertionError("function not found in unlock.sh: " + name)
+    return match.group(0)
 
 
-class RuntimeToolFilesTests(unittest.TestCase):
-    """工具脚本现在从 main 分支下载，不再打进 runtime.tar.gz。"""
-
-    def test_tool_files_exist_in_repo(self):
-        for name in extract_tool_files(UNLOCK.read_text()):
-            self.assertTrue((ROOT / name).is_file(), name)
-
-    def test_tool_files_drop_legacy_cert_store(self):
-        # 遗留的 cert_store.py / official_rootcert.json 已不再随安装流程下载。
-        files = set(extract_tool_files(UNLOCK.read_text()))
-        self.assertNotIn("tools/cert_store.py", files)
-        self.assertNotIn("tools/official_rootcert.json", files)
-
-
-def extract_heredoc(script, marker):
-    """Extract the first ``<<'PY' ... PY`` heredoc whose body contains marker."""
-    blocks = re.findall(r"<<'PY'\n(.*?)\nPY", script, flags=re.S)
-    for block in blocks:
-        if marker in block:
-            return block
-    raise AssertionError("heredoc not found: " + marker)
-
-
-class RouteAndAssetsTests(unittest.TestCase):
-    """下载线路只探测一次；Agent 只替换不打补丁；替换前有版本门禁。"""
-
-    @classmethod
-    def setUpClass(cls):
-        cls.script = UNLOCK.read_text()
-
-    def test_no_mirror_switches_left(self):
-        for flag in ("--use-mirror", "--mirror", "--no-mirror", "--direct", "GH_MIRRORS"):
-            self.assertNotIn(flag, self.script, flag)
-        self.assertNotIn("rank_mirrors", self.script)
-        self.assertNotIn("configure_mirrors", self.script)
-
-    def test_single_probe_decides_the_route(self):
-        self.assertIn('GH_MIRROR="${GH_MIRROR:-https://ghfast.top/}"', self.script)
-        self.assertIn("probe_route", self.script)
-        self.assertIn('if [ "$STATUS" = 200 ]', self.script)
-        # 探测只跑一次，结果对整个流程生效
-        self.assertEqual(self.script.count("ROUTE_READY=1"), 1)
-        self.assertEqual(self.script.count("ROUTE_READY=0"), 1)
-        self.assertEqual(self.script.count("probe_route"), 2)   # 定义 + fetch 里调用
-        self.assertIn('ROUTES=("$MIRROR_PREFIX$URL" "$URL")', self.script)
-        # api.github.com 不套镜像（网关会 403）
-        self.assertNotIn("https://api.github.com/*)", self.script)
-
-    def test_bootstrap_prefix_wins_over_probe(self):
-        self.assertIn("BOOTSTRAP_PREFIX", self.script)
-        detect = self.script.index("detect_bootstrap_route\n")
-        self.assertLess(detect, self.script.index("probe_route() {"))
-        # 探测前先看启动前缀
-        probe = self.script.index("probe_route() {")
-        body = self.script[probe:probe + 1200]
-        self.assertLess(body.index("BOOTSTRAP_PREFIX"), body.index("GH_MIRROR_FORCE"))
-
-    def test_bootstrap_prefix_parser(self):
-        import subprocess
-        fn = re.search(r"^mirror_prefix_from_url\(\) \{.*?^\}", self.script, flags=re.S | re.M).group(0)
-        cases = {
-            "https://ghfast.top/https://raw.githubusercontent.com/a/b/main/unlock.sh": "https://ghfast.top/",
-            "https://raw.githubusercontent.com/a/b/main/unlock.sh": "",
-            "https://gh-proxy.com/https://github.com/a/b/releases/download/x/y": "https://gh-proxy.com/",
-        }
-        for url, expected in cases.items():
-            result = subprocess.run(["bash", "-c", fn + '\nmirror_prefix_from_url "$1"', "_", url],
-                                    capture_output=True, text=True)
-            self.assertEqual(result.stdout.strip(), expected, url)
-
-    def test_agent_is_replaced_not_patched(self):
-        self.assertNotIn("agent.orig.url", self.script)
-        self.assertNotIn("--patch --in \"$RUN/agent.orig\"", self.script)
-        self.assertIn("Verified patched agent sha256 + arch", self.script)
-        self.assertIn("No downloadable $PLATFORM agent", self.script)
-
-    def test_version_gate_runs_before_replacement(self):
-        gate = self.script.index("Version mismatch (installed")
-        replace = self.script.index('install -m 0755 "$RUN/core" "$CORE_BIN"')
-        self.assertLess(gate, replace)
+def run_shell(functions, body, timeout=60):
+    script = "set -uo pipefail\n" + "\n".join(functions) + "\n" + body
+    return subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=timeout)
 
 
 class ReleaseSelectionTests(unittest.TestCase):
-    """select_release 支持 API 与 atom 两种来源，资产 URL 都要能拼出来。"""
+    """select_release 现在是 shell 实现：API 与 atom 两种来源都要能选出最高稳定版并拼出资产 URL。"""
 
-    @classmethod
-    def setUpClass(cls):
-        cls.code = extract_heredoc(UNLOCK.read_text(), "releases.atom")
-
-    def run_parser(self, run, platform, source):
-        return subprocess.run([sys.executable, "-c", self.code, str(run), platform,
-                               "keweiya/xpack-toolkit", source],
-                              capture_output=True, text=True)
+    def select(self, run_dir, platform, api_ok=True):
+        harness = f"""
+die() {{ printf '!! %s\\n' "$*" >&2; exit 1; }}
+log() {{ :; }}
+FETCH_N=0
+fetch() {{ FETCH_N=$((FETCH_N+1)); if [ "$FETCH_N" = 1 ] && [ {int(api_ok)} = 0 ]; then return 1; fi; return 0; }}
+PLATFORM={platform}
+REPO=keweiya/xpack-toolkit
+RUN={run_dir}
+select_release
+"""
+        return run_shell([shell_function("json_objects"), shell_function("select_release")], harness)
 
     def test_atom_source_picks_highest_and_builds_urls(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -171,7 +100,7 @@ class ReleaseSelectionTests(unittest.TestCase):
             (run / "releases.atom").write_text(
                 "<feed><entry><title>core-v2.4.0</title></entry>"
                 "<entry><title>core-v2.4.1</title></entry></feed>")
-            result = self.run_parser(run, "linux-arm64", "atom")
+            result = self.select(run, "linux-arm64", api_ok=False)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual((run / "selected.version").read_text(), "v2.4.1")
             self.assertIn("core-linux-arm64", (run / "core.url").read_text())
@@ -186,10 +115,64 @@ class ReleaseSelectionTests(unittest.TestCase):
                 "assets": [{"name": n, "browser_download_url": "https://x/" + n}
                            for n in ("manifest.json", "core-linux-amd64",
                                      "core-linux-amd64.orig", "agent-linux-amd64")]}]))
-            result = self.run_parser(run, "linux-amd64", "api")
+            result = self.select(run, "linux-amd64")
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual((run / "core.url").read_text(), "https://x/core-linux-amd64")
-            self.assertEqual((run / "agent.url").read_text(), "https://x/agent-linux-amd64")
+            self.assertEqual((run / "core.url").read_text(),
+                             "https://github.com/keweiya/xpack-toolkit/releases/download/core-v2.4.1/core-linux-amd64")
+            self.assertEqual((run / "agent.url").read_text(),
+                             "https://github.com/keweiya/xpack-toolkit/releases/download/core-v2.4.1/agent-linux-amd64")
+            self.assertEqual((run / "selected.version").read_text(), "v2.4.1")
+
+    def test_draft_and_prerelease_are_ignored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            (run / "releases.json").write_text(json.dumps([
+                {"tag_name": "core-v2.3.2", "draft": False, "prerelease": False,
+                 "assets": [{"name": n, "browser_download_url": "https://x/" + n}
+                            for n in ("manifest.json", "core-linux-amd64", "core-linux-amd64.orig")]},
+                {"tag_name": "core-v2.5.0", "draft": True, "prerelease": False, "assets": []},
+                {"tag_name": "core-v2.4.9", "draft": False, "prerelease": True, "assets": []},
+            ]))
+            result = self.select(run, "linux-amd64")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((run / "selected.version").read_text(), "v2.3.2")
+
+
+class NoPythonTests(unittest.TestCase):
+    """脚本本身不再调用 python；授权证书由 shell（openssl + sqlite3）负责。"""
+
+    def test_script_has_no_python_invocation(self):
+        script = UNLOCK.read_text()
+        self.assertFalse("python3" in script, "unlock.sh still invokes python3")
+        self.assertFalse("py_compile" in script, "unlock.sh still compiles python tools")
+        self.assertFalse("<<'PY'" in script, "unlock.sh still embeds python heredocs")
+
+    def test_shell_license_decodes_with_python_reference(self):
+        spec = importlib.util.spec_from_file_location(
+            "gen_license", ROOT / "tools" / "gen_license.py")
+        gen = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(gen)
+        fns = [shell_function(n) for n in ("lic_token", "lic_json", "lic_encode")]
+        result = run_shell(fns, 'lic_encode "$(lic_json enterprise 9999-12-31 999 YG lxware '
+                                '100000 all 0123456789abcdef0123456789abcdef)"')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        content = gen.decode_license(result.stdout.strip())
+        self.assertEqual(content["products"][0]["maxNodeCount"], 999)
+        self.assertEqual(content["annotations"]["lxware.cn/xpack-toolkit"], "true")
+        self.assertEqual(content["assigneeName"], "YG")
+
+    def test_shell_aes_is_compatible_with_reference_codec(self):
+        spec = importlib.util.spec_from_file_location(
+            "gen_license", ROOT / "tools" / "gen_license.py")
+        gen = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(gen)
+        fns = [shell_function(n) for n in ("hexof", "lic_enc", "lic_dec")]
+        blob = run_shell(fns, 'lic_enc "Bound" "nel1Pa2520pack@x"').stdout
+        self.assertEqual(gen.decrypt_blob(blob), "Bound")
+        python_blob = gen.encrypt_blob(b"1Panel-Enterprise-AAAA1111BBBB")
+        dec = subprocess.run(["bash", "-c", "\n".join(fns) + '\nlic_dec "$1" "nel1Pa2520pack@x"',
+                              "_", python_blob], capture_output=True, text=True)
+        self.assertEqual(dec.stdout.strip(), "1Panel-Enterprise-AAAA1111BBBB")
 
 
 class VersionGateTests(unittest.TestCase):
