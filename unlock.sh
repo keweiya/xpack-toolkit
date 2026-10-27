@@ -834,7 +834,11 @@ cleanup_artifacts() {
     rmdir -- "$(dirname "$BACKUP")" 2>/dev/null || true
     log "Pre-replacement binaries removed; rollback images are gone"
   fi
-  log "Cleaned $removed artifact path(s); kept $PERSIST/license.txt"
+  if [ -f "$PERSIST/license.txt" ]; then
+    log "Cleaned $removed artifact path(s); kept $PERSIST/license.txt"
+  else
+    log "Cleaned $removed artifact path(s)"
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -847,19 +851,54 @@ mkdir -p "$PERSIST" "$BACKUP"
 # restore 只用 shell 覆盖文件；install/verify 走 shell + coreutils + openssl。
 
 if [ "$MODE" = restore ]; then
+  # 回滚到官方内核：优先用本地备份；备份已被清理时，直接从 fit2cloud 重新装官方包。
+  RUN=""
   CORE_ORIG="$BACKUP/1panel-core.previous"
   AGENT_ORIG="$BACKUP/1panel-agent.previous"
-  [ -f "$CORE_ORIG" ] || die "Missing core rollback image: $CORE_ORIG (backups are deleted after a successful install; reinstall with --keep-backup to keep them)"
-  systemctl stop "$CORE_SVC" 2>/dev/null || true
-  [ -f "$AGENT_ORIG" ] && systemctl stop "$AGENT_SVC" 2>/dev/null || true
-  install -m 0755 "$CORE_ORIG" "$CORE_BIN"
-  [ -f "$AGENT_ORIG" ] && install -m 0755 "$AGENT_ORIG" "$AGENT_BIN"
   CTL_ORIG="$BACKUP/1panel-ctl.previous"
-  [ -f "$CTL_ORIG" ] && install -m 0755 "$CTL_ORIG" "$PANEL_CTL"
-  systemctl start "$CORE_SVC"
-  [ -f "$AGENT_ORIG" ] && { systemctl start "$AGENT_SVC"; systemctl is-active --quiet "$AGENT_SVC"; }
-  systemctl is-active --quiet "$CORE_SVC"
-  log "Restored previous 1Panel binaries (licenses in the database are untouched)"
+
+  if [ -f "$CORE_ORIG" ]; then
+    log "Restoring from local rollback images in $BACKUP"
+    systemctl stop "$CORE_SVC" 2>/dev/null || true
+    [ -f "$AGENT_ORIG" ] && systemctl stop "$AGENT_SVC" 2>/dev/null || true
+    install -m 0755 "$CORE_ORIG" "$CORE_BIN"
+    [ -f "$AGENT_ORIG" ] && install -m 0755 "$AGENT_ORIG" "$AGENT_BIN"
+    [ -f "$CTL_ORIG" ] && install -m 0755 "$CTL_ORIG" "$PANEL_CTL"
+    systemctl start "$CORE_SVC"
+    [ -f "$AGENT_ORIG" ] && { systemctl start "$AGENT_SVC"; systemctl is-active --quiet "$AGENT_SVC"; }
+    systemctl is-active --quiet "$CORE_SVC"
+    log "Restored previous 1Panel binaries (licenses in the database are untouched)"
+  else
+    # 没有本地备份：按当前版本重新下载官方包覆盖回去（不依赖任何本地镜像）
+    VERSION="$(ctl_version)"
+    [ -n "$VERSION" ] || VERSION="$(detect_installed_version 2>/dev/null || true)"
+    [ -n "$VERSION" ] || die "Cannot determine the installed panel version; pass it with VERSION=v2.4.1"
+    log "No local rollback image; reinstalling the official $VERSION package from fit2cloud"
+    RUN="$(mktemp -d "$PERSIST/run.XXXXXX")"
+    TARBALL="$RUN/1panel-$VERSION-$PLATFORM.tar.gz"
+    fetch_direct "$OFFICIAL_BASE/$VERSION/release/1panel-$VERSION-$PLATFORM.tar.gz" "$TARBALL"
+    SRCDIR="$RUN/official-$VERSION"
+    mkdir -p "$SRCDIR"
+    tar xzf "$TARBALL" -C "$SRCDIR" --strip-components=1
+    [ -f "$SRCDIR/1panel-core" ] && [ -f "$SRCDIR/1panel-agent" ] || die "Official package lacks binaries"
+    systemctl stop "$CORE_SVC" 2>/dev/null || true
+    systemctl stop "$AGENT_SVC" 2>/dev/null || true
+    install -m 0755 "$SRCDIR/1panel-core" "$CORE_BIN"
+    install -m 0755 "$SRCDIR/1panel-agent" "$AGENT_BIN"
+    upgrade_1pctl "$SRCDIR"
+    if [ -f "$SRCDIR/GeoIP.mmdb" ]; then
+      mkdir -p "$PANEL_ROOT/geo"
+      install -m 0644 "$SRCDIR/GeoIP.mmdb" "$PANEL_ROOT/geo/GeoIP.mmdb"
+    fi
+    [ -d "$SRCDIR/lang" ] && cp -r "$SRCDIR/lang" /usr/local/bin/
+    systemctl start "$CORE_SVC"
+    systemctl is-active --quiet "$CORE_SVC"
+    systemctl start "$AGENT_SVC" 2>/dev/null || true
+    log "Official 1Panel $VERSION reinstalled (licenses in the database are untouched)"
+  fi
+
+  # restore 之后同样清理：临时目录、内置 sqlite3、备份镜像（--keep-backup 保留）
+  cleanup_artifacts
   exit 0
 fi
 

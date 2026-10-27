@@ -85,7 +85,7 @@ arm64 的 sha 目前留空：arm64 机器若没有系统 sqlite3，则只生成�
 | `$PANEL_ROOT/unlock/license.txt` | 保留（生成的证书，`verify` 会回读） |
 | `$PANEL_ROOT/unlock/license.status` | 保留（`applied` / `pending` 状态） |
 
-删掉备份后 `bash unlock.sh restore` 就没有回滚镜像了，脚本会明确报错并提示用 `--keep-backup` 重装。想留退路就先跑 `install --keep-backup`。
+删掉备份不影响回滚：`bash unlock.sh restore` 会改从 fit2cloud 重下官方包覆盖回去。想省一次下载就先跑 `install --keep-backup`。
 
 `verify` 模式同样会清理：它临时下载的内置 sqlite3 用完即删。
 
@@ -95,9 +95,16 @@ arm64 的 sha 目前留空：arm64 机器若没有系统 sqlite3，则只生成�
 sudo bash unlock.sh install --prompt-unbind    # 解绑旧证书前交互确认
 sudo bash unlock.sh install --skip-agent       # 只换内核，Agent 保持原样
 sudo bash unlock.sh verify                     # 回读校验破解内核与已绑定授权
-sudo bash unlock.sh restore                    # 回滚到替换前的官方内核（需 --keep-backup 留下的镜像）
-sudo bash unlock.sh install --keep-backup      # 保留旧二进制，之后可 restore
+sudo bash unlock.sh restore                    # 回滚到官方内核（有备份用备份，没有就重下官方包）
+sudo bash unlock.sh install --keep-backup      # 保留旧二进制，restore 优先用本地镜像
 ```
+
+`restore` 的两条路径：
+
+- **有本地备份**（上次装的时候带了 `--keep-backup`）→ 直接用 `$PANEL_ROOT/crack/backup` 里的原件覆盖回去，快且不联网。
+- **没有备份**（默认安装会删掉）→ 按当前版本从 `resource.fit2cloud.com` 重新下载官方包，装回 `1panel-core` / `1panel-agent` / `1pctl`（含 `GeoIP.mmdb`、`lang`），效果等同官方重装。版本取 `1pctl` 里的 `ORIGINAL_VERSION`，取不到可用 `VERSION=v2.4.1` 指定。
+
+两条路径都会在结束时清理临时目录与备份（`--keep-backup` 可保留），`licenses` 表里的证书不动。
 
 - `--http-proxy URL`：设置本机网络代理（探测与下载都走它）。
 - `GH_MIRROR`：自定义加速前缀，默认 `https://ghfast.top/`；`GH_MIRROR_FORCE=1` 跳过探测强制使用。

@@ -261,6 +261,55 @@ class CleanupTests(unittest.TestCase):
         self.assertIn("KEEP_BACKUP=1", self.script)
 
 
+class RestoreTests(unittest.TestCase):
+    """restore 用完即清：回滚后删掉备份；没有备份时从 fit2cloud 重装官方包。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.script = UNLOCK.read_text()
+
+    def test_restore_falls_back_to_official_package(self):
+        branch = self.script[self.script.index('if [ "$MODE" = restore ]'):
+                             self.script.index('if [ "$MODE" = verify ]')]
+        self.assertIn("OFFICIAL_BASE", branch)
+        self.assertIn("fetch_direct", branch)
+        self.assertNotIn("Missing core rollback image", branch)
+
+    def test_restore_cleans_up_after_itself(self):
+        branch = self.script[self.script.index('if [ "$MODE" = restore ]'):
+                             self.script.index('if [ "$MODE" = verify ]')]
+        self.assertIn("cleanup_artifacts", branch)
+
+    def test_restore_from_backup_then_removes_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            backup = os.path.join(tmp, "crack", "backup")
+            os.makedirs(backup)
+            for name, payload in (("1panel-core.previous", "ORIG-CORE"),
+                                  ("1panel-agent.previous", "ORIG-AGENT"),
+                                  ("1panel-ctl.previous", "ORIG-CTL")):
+                Path(backup, name).write_text(payload)
+            core = os.path.join(tmp, "core")
+            Path(core).write_text("CRACKED")
+            env = os.environ.copy()
+            env.update({
+                "PATH": tmp + "/bin:" + env["PATH"],
+                "PANEL_ROOT": tmp, "PANEL_CTL": os.path.join(tmp, "1pctl"),
+                "CORE_BIN": core, "AGENT_BIN": os.path.join(tmp, "agent"),
+                "CORE_SVC": "xpack-test", "AGENT_SVC": "xpack-test-agent",
+                "BACKUP": backup, "UNLOCK_WORK": os.path.join(tmp, "unlock"),
+                "XPACK_DB": os.path.join(tmp, "xpack.db"),
+                "SERIAL_PATH": os.path.join(tmp, "serial"),
+            })
+            os.makedirs(tmp + "/bin")
+            Path(tmp, "bin", "systemctl").write_text("#!/bin/sh\nexit 0\n")
+            os.chmod(tmp + "/bin/systemctl", 0o755)
+            run = subprocess.run(["bash", str(UNLOCK), "restore", "--no-progress"],
+                                 capture_output=True, text=True, env=env, timeout=120)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertEqual(Path(core).read_text(), "ORIG-CORE")
+            self.assertFalse(os.path.exists(backup), "backup should be removed after restore")
+
+
 class VersionGateTests(unittest.TestCase):
     """升级后数据库版本还没迁移完时，门禁要认 1pctl 里的包版本。"""
 
