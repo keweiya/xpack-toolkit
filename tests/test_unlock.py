@@ -1,5 +1,6 @@
 """Installer flow regressions (unlock.sh syntax + release selection logic)."""
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -173,6 +174,34 @@ class NoPythonTests(unittest.TestCase):
         dec = subprocess.run(["bash", "-c", "\n".join(fns) + '\nlic_dec "$1" "nel1Pa2520pack@x"',
                               "_", python_blob], capture_output=True, text=True)
         self.assertEqual(dec.stdout.strip(), "1Panel-Enterprise-AAAA1111BBBB")
+
+
+class BundledSqliteTests(unittest.TestCase):
+    """写授权表不依赖系统 sqlite3：仓库自带静态单文件，脚本里的 sha256 必须与它一致。"""
+
+    def test_sha_constant_matches_bundled_binary(self):
+        script = UNLOCK.read_text()
+        match = re.search(r'SQLITE3_SHA_amd64="([0-9a-f]{64})"', script)
+        self.assertIsNotNone(match, "SQLITE3_SHA_amd64 missing in unlock.sh")
+        binary = ROOT / "tools" / "bin" / "sqlite3mini-linux-amd64"
+        self.assertTrue(binary.is_file(), "bundled sqlite3 binary is missing")
+        self.assertEqual(match.group(1), hashlib.sha256(binary.read_bytes()).hexdigest())
+
+    def test_bundled_binary_executes_sql(self):
+        binary = ROOT / "tools" / "bin" / "sqlite3mini-linux-amd64"
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "t.db")
+            run = subprocess.run([str(binary), db,
+                                  "create table k(v); insert into k values('ok');"],
+                                 capture_output=True, text=True)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            read = subprocess.run([str(binary), "-batch", "-noheader", db, "select v from k;"],
+                                  capture_output=True, text=True)
+            self.assertEqual(read.stdout.strip(), "ok")
+            backup = subprocess.run([str(binary), db, ".backup '%s/b.db'" % tmp],
+                                    capture_output=True, text=True)
+            self.assertEqual(backup.returncode, 0, backup.stderr)
+            self.assertTrue(os.path.getsize(os.path.join(tmp, "b.db")) > 0)
 
 
 class VersionGateTests(unittest.TestCase):

@@ -25,18 +25,29 @@ curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/keweiya/xpack-to
 
 ## 运行依赖
 
-目标机只需要 `bash` + coreutils + `openssl`（1Panel 宿主机默认都有），**安装流程不调用 python**：
+目标机只需要 `bash` + coreutils + `openssl`（1Panel 宿主机默认都有）：**不装 python，也不需要装 sqlite3**。
 
 | 环节 | 实现 |
 | --- | --- |
-| 版本检测 / 版本比较 | shell 读 `core.db`（有 sqlite3 时）、`core version`、1pctl 的 `ORIGINAL_VERSION`，`sort -V` 比较 |
+| 版本检测 / 版本比较 | shell 读 `core.db`（拿到 SQLite 执行器时）、`core version`、1pctl 的 `ORIGINAL_VERSION`，`sort -V` 比较 |
 | Release 选择 | shell + awk 解析 GitHub API JSON（字符串内括号不计的对象切分），原子回退到 atom feed |
 | 资产校验 | `sha256sum` + `od` 读 ELF 魔数与 `e_machine` |
 | manifest 校验 | `awk` 按平台块提取字段 |
 | 1pctl 配置回填 | `awk` 键值替换 |
-| 授权证书 | `openssl enc -aes-128-cbc` 加密字段 + `sqlite3` 写 `licenses` 表（字段编码与 `tools/gen_license.py` 完全一致，两种实现可互读对方的库） |
+| 授权证书 | `openssl enc -aes-128-cbc` 加密字段；写 `licenses` 表优先用系统 `sqlite3`，没有就下载仓库内置的静态单文件 `tools/bin/sqlite3mini-linux-amd64`（1.5 MB，源码 `tools/sqlite3mini.c`，脚本按 `SQLITE3_SHA_amd64` 校验） |
 
-`sqlite3` CLI 是可选的：缺它时证书文件写到 `$PANEL_ROOT/unlock/license.txt`，不写库。破解内核已移除全部授权门控，因此没写库也不影响专业版功能，只是面板「授权」页不显示企业版。装上 `sqlite3` 后重跑同一条命令即可补写。
+内置执行器的字段编码与 `tools/gen_license.py` 完全一致，两种实现可以互读对方的库（回归测试里双向校验）。
+
+重建内置二进制（改了 `tools/sqlite3mini.c` 后）：
+
+```bash
+gcc -Os -static -I sqlite-amalgamation-<ver> tools/sqlite3mini.c \
+    sqlite-amalgamation-<ver>/sqlite3.c -lm -o tools/bin/sqlite3mini-linux-amd64
+strip --strip-all tools/bin/sqlite3mini-linux-amd64
+sha256sum tools/bin/sqlite3mini-linux-amd64   # 写回 unlock.sh 的 SQLITE3_SHA_amd64
+```
+
+arm64 的 sha 目前留空：arm64 机器若没有系统 sqlite3，则只生成证书文件、不写库（破解内核没有授权门控，专业版功能不受影响）。需要时按上面命令交叉编译后填上 `SQLITE3_SHA_arm64`。
 
 `tools/*.py` 只用于 CI 打补丁与本地回归验证，不参与安装流程。
 

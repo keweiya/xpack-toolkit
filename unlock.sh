@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # 1Panel v2 内网本地破解内核一键安装 / 更新。
 #
-# 依赖：bash + coreutils + openssl（系统自带）；写授权表需要 sqlite3 CLI，
-#       缺它时只生成证书文件，不影响专业版功能（破解内核已无任何授权门控）。
-#       脚本不依赖 python / py 工具链。
+# 依赖：bash + coreutils + openssl（系统自带）。授权表写入优先用系统 sqlite3，
+#       没有就自动下载仓库内置的静态单文件（tools/bin/sqlite3mini-linux-<arch>），
+#       所以目标机不需要装 python、也不需要装 sqlite3。
 #
 # 流程（不再需要本站签名私钥，也不再校验任何签名）：
 #   1) 检测宿主机 1Panel 版本与 Release 最新发版；
@@ -99,11 +99,35 @@ progress_bar_enabled() {
 # ---------------------------------------------------------------------------
 # 运行时依赖
 #   · 下载/校验/版本门禁：纯 bash + coreutils + openssl（系统默认安装）
-#   · 授权证书写库：sqlite3 CLI（有就写，没有就只生成证书文件；内核已无授权
-#     门控，未写库不影响专业版功能）
+#   · 授权证书写库：系统 sqlite3，缺失时下载仓库内置的静态 sqlite3mini
 # 脚本不再需要 python。
 # ---------------------------------------------------------------------------
-have_sqlite3() { command -v sqlite3 >/dev/null 2>&1; }
+# SQLite 执行器：优先系统的 sqlite3，没有就用仓库内置的静态单文件
+# （tools/bin/sqlite3mini-linux-<arch>，源码 tools/sqlite3mini.c，sha256 固定校验）。
+SQLITE3_SHA_amd64="ba5c50b4b24809fa88b760285c221e88c71851cc945e38133823880e002367d7"
+SQLITE3_SHA_arm64=""
+SQLITE3_BIN=""
+
+ensure_sqlite3() {
+  [ -n "$SQLITE3_BIN" ] && return 0
+  if command -v sqlite3 >/dev/null 2>&1; then
+    SQLITE3_BIN="$(command -v sqlite3)"; return 0
+  fi
+  local want got dir
+  eval "want=\"\${SQLITE3_SHA_$ARCH:-}\""
+  [ -n "$want" ] || return 1
+  dir="$PERSIST/tools"
+  mkdir -p "$dir"
+  if [ ! -x "$dir/sqlite3mini" ]; then
+    fetch "https://raw.githubusercontent.com/$REPO/main/tools/bin/sqlite3mini-linux-$ARCH" \
+      "$dir/sqlite3mini" silent || return 1
+    chmod 0755 "$dir/sqlite3mini"
+  fi
+  got="$(sha256sum "$dir/sqlite3mini" | awk '{print $1}')"
+  [ "$got" = "$want" ] || return 1
+  SQLITE3_BIN="$dir/sqlite3mini"
+  log "Using bundled static sqlite3 ($ARCH)"
+}
 
 norm_version() {
   case "$1" in
@@ -214,7 +238,7 @@ lic_dec() {  # $1 base64 $2 key -> 明文
   return "$rc"
 }
 
-lic_sql() { sqlite3 -batch -noheader "$@"; }
+lic_sql() { "$SQLITE3_BIN" -batch -noheader "$@"; }
 lic_db_ready() { [ -f "$1" ] && lic_sql "$1" "select count(*) from licenses;" >/dev/null 2>&1; }
 
 lic_token() { openssl rand -hex "$1" | tr 'a-f' 'A-F'; }
@@ -359,7 +383,7 @@ DELETE FROM licenses WHERE id=$id;"
   sql="$sql
 INSERT INTO licenses (license_name,usage_name,assignee_name,version_constraint,device_id,license,offline,trial,issuer,product_pro,last_sync_at,sms_total,sms_used,bind_node_id,free_count,free_nodes,status,message,created_at,updated_at) VALUES ('$v_license_name','$v_usage','$v_assignee','$v_version','$v_device','$v_license','$v_offline','$v_trial','$v_issuer','$v_product','$v_last_sync','$LIC_SMS','0','$v_bind','$v_free_count','$v_free_nodes','$v_status','$v_message','$stamp','$stamp');
 COMMIT;"
-  printf '%s\n' "$sql" | sqlite3 -batch "$LIC_DB" || {
+  printf '%s\n' "$sql" | "$SQLITE3_BIN" -batch "$LIC_DB" || {
     printf 'license insert failed\n' >&2; return 1; }
 
   if [ -f "$LIC_SERIAL" ]; then
@@ -557,8 +581,8 @@ detect_installed_version() {
   # 版本来源优先级：数据库 SystemVersion → 内核自报 → 1pctl 里的包版本。
   # 数据来源都可以用 shell 直接读，不需要 python。
   local version="" out uniq
-  if have_sqlite3 && [ -f "$PANEL_ROOT/db/core.db" ]; then
-    version="$(sqlite3 -readonly "$PANEL_ROOT/db/core.db" \
+  if [ -n "$SQLITE3_BIN" ] && [ -f "$PANEL_ROOT/db/core.db" ]; then
+    version="$("$SQLITE3_BIN" -readonly "$PANEL_ROOT/db/core.db" \
       "select value from settings where key='SystemVersion' limit 1;" 2>/dev/null | head -1)"
     version="$(norm_version "$version")"
   fi
@@ -824,7 +848,7 @@ if [ "$MODE" = verify ]; then
   fi
   if [ -f "$PERSIST/license.status" ] && [ "$(<"$PERSIST/license.status")" != applied ]; then
     log "Components verified; license is pending import (no sqlite3 when it was installed)"
-  elif have_sqlite3 && lic_db_ready "$XPACK_DB"; then
+  elif ensure_sqlite3 && lic_db_ready "$XPACK_DB"; then
     LIC_NAME="$(lic_verify "$XPACK_DB" "$SERIAL_PATH")" || die "License readback failed"
     log "License bound to master node: $LIC_NAME"
   else
@@ -933,7 +957,7 @@ LIC_TEXT="$(lic_encode "$LIC_JSON_TEXT")"
 printf '%s\n' "$LIC_TEXT" > "$LICENSE_OUT"
 log "License generated: $LIC_NAME (nodes $LIC_NODES, expires $LIC_EXPIRES, offline)"
 
-if have_sqlite3 && lic_db_ready "$XPACK_DB"; then
+if ensure_sqlite3 && lic_db_ready "$XPACK_DB"; then
   if [ "$PROMPT_UNBIND" = 1 ] && [ -t 0 ]; then
     BOUND_NAMES="$(lic_bound_names "$XPACK_DB")"
     if [ -n "$BOUND_NAMES" ]; then
@@ -960,7 +984,7 @@ if [ -n "$AGENT_SOURCE" ]; then
 fi
 systemctl start "$CORE_SVC"
 systemctl is-active --quiet "$CORE_SVC"
-if have_sqlite3 && lic_db_ready "$XPACK_DB"; then
+if ensure_sqlite3 && lic_db_ready "$XPACK_DB"; then
   LIC_NAME="$(lic_verify "$XPACK_DB" "$SERIAL_PATH")" || die "License readback failed"
   log "License verified: $LIC_NAME bound to the master node"
 fi
