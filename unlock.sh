@@ -434,11 +434,13 @@ usage() {
     '  --progress / --no-progress  Force download progress on/off (default: auto)' \
     '  --skip-agent                Replace only the core, keep the current agent' \
     '  --prompt-unbind             Prompt before releasing an existing master binding' \
+    '  --keep-backup               Keep the pre-replacement binaries (default: deleted on success)' \
     '  --help                      Show this help'
 }
 
 SKIP_AGENT=0
 PROMPT_UNBIND=0
+KEEP_BACKUP=0
 MODE_SET=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -453,6 +455,7 @@ while [ "$#" -gt 0 ]; do
     --no-progress) PROGRESS=off ;;
     --skip-agent) SKIP_AGENT=1 ;;
     --prompt-unbind) PROMPT_UNBIND=1 ;;
+    --keep-backup) KEEP_BACKUP=1 ;;
     --help|-h) usage; exit 0 ;;
     *) usage >&2; die "Unknown installation argument" ;;
   esac
@@ -804,6 +807,37 @@ backup_binary() {
 }
 
 # ---------------------------------------------------------------------------
+# 成功后清理：下载的资产、内置 sqlite3、临时运行目录、库备份、旧二进制备份
+#   · 保留 $PERSIST/license.txt（生成的证书）与 license.status，供 verify 回读
+#   · --keep-backup 可保留 $BACKUP，用于 bash unlock.sh restore 回滚
+# ---------------------------------------------------------------------------
+cleanup_artifacts() {
+  local removed=0
+  for path in "$RUN" "$PREFLIGHT" "$PERSIST/tools"; do
+    [ -e "$path" ] || continue
+    rm -rf -- "$path" && removed=$((removed + 1))
+  done
+  # 旧版本遗留的运行目录（run.* / runtime.*）
+  for path in "$PERSIST"/run.* "$PERSIST"/runtime.*; do
+    [ -e "$path" ] || continue
+    rm -rf -- "$path" && removed=$((removed + 1))
+  done
+  # 写库前的 licenses 表备份
+  if [ -e "$XPACK_DB.pre-license" ]; then
+    rm -f -- "$XPACK_DB.pre-license" && removed=$((removed + 1))
+  fi
+  if [ "$KEEP_BACKUP" = 1 ]; then
+    [ -d "$BACKUP" ] && log "Pre-replacement binaries kept in $BACKUP (rollback: bash unlock.sh restore)"
+  elif [ -e "$BACKUP" ]; then
+    rm -rf -- "$BACKUP" && removed=$((removed + 1))
+    # 顺带清掉空的父目录（$PANEL_ROOT/crack），不留空壳
+    rmdir -- "$(dirname "$BACKUP")" 2>/dev/null || true
+    log "Pre-replacement binaries removed; rollback images are gone"
+  fi
+  log "Cleaned $removed artifact path(s); kept $PERSIST/license.txt"
+}
+
+# ---------------------------------------------------------------------------
 # 主流程
 # ---------------------------------------------------------------------------
 PREFLIGHT="$(mktemp -d "${TMPDIR:-/tmp}/xpack-preflight.XXXXXX")"
@@ -815,7 +849,7 @@ mkdir -p "$PERSIST" "$BACKUP"
 if [ "$MODE" = restore ]; then
   CORE_ORIG="$BACKUP/1panel-core.previous"
   AGENT_ORIG="$BACKUP/1panel-agent.previous"
-  [ -f "$CORE_ORIG" ] || die "Missing core rollback image: $CORE_ORIG"
+  [ -f "$CORE_ORIG" ] || die "Missing core rollback image: $CORE_ORIG (backups are deleted after a successful install; reinstall with --keep-backup to keep them)"
   systemctl stop "$CORE_SVC" 2>/dev/null || true
   [ -f "$AGENT_ORIG" ] && systemctl stop "$AGENT_SVC" 2>/dev/null || true
   install -m 0755 "$CORE_ORIG" "$CORE_BIN"
@@ -855,7 +889,7 @@ if [ "$MODE" = verify ]; then
     log "sqlite3 not available; skipped license database readback"
   fi
   systemctl is-active --quiet "$CORE_SVC"
-  rm -rf -- "$RUN"
+  cleanup_artifacts
   log "Cracked kernel verified on $CORE_BIN"
   exit 0
 fi
@@ -989,10 +1023,8 @@ if ensure_sqlite3 && lic_db_ready "$XPACK_DB"; then
   log "License verified: $LIC_NAME bound to the master node"
 fi
 
-# 静默清理下载的临时内容（release 资产与工具脚本），退出前不残留运行目录。
-rm -rf -- "$RUN" "$PREFLIGHT" 2>/dev/null || true
-
 log "Kernel replaced (all license checks removed)"
 log "Third-party certificates preserved; any prior master binding was released first"
-log "Downloaded artifacts cleaned up"
-log "Rollback: bash unlock.sh restore (previous images: $BACKUP)"
+
+# 清理下载内容、内置 sqlite3、临时目录与备份（--keep-backup 可保留回滚镜像）
+cleanup_artifacts

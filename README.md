@@ -71,13 +71,32 @@ arm64 的 sha 目前留空：arm64 机器若没有系统 sqlite3，则只生成�
 
 > 装机器拿到的就是 CI 里跑过双架构冒烟的那两个二进制，安装期不再做任何二进制改写（`--skip-agent` 可只换内核）。
 
+## 安装成功后的清理
+
+成功退出前会删掉这一轮下载与生成的全部中间产物，只留证书：
+
+| 路径 | 处理 |
+| --- | --- |
+| `$PANEL_ROOT/unlock/run.*` | 删除（Release 资产：core / agent / manifest） |
+| `$PANEL_ROOT/unlock/tools/sqlite3mini` | 删除（内置静态 sqlite3） |
+| `$PANEL_ROOT/unlock/runtime.*` | 删除（旧版本遗留的运行目录） |
+| `$PANEL_ROOT/db/xpack.db.pre-license` | 删除（写库前的 licenses 表备份） |
+| `$PANEL_ROOT/crack/backup/` | **默认删除**（旧内核/Agent/1pctl 备份）；`--keep-backup` 保留 |
+| `$PANEL_ROOT/unlock/license.txt` | 保留（生成的证书，`verify` 会回读） |
+| `$PANEL_ROOT/unlock/license.status` | 保留（`applied` / `pending` 状态） |
+
+删掉备份后 `bash unlock.sh restore` 就没有回滚镜像了，脚本会明确报错并提示用 `--keep-backup` 重装。想留退路就先跑 `install --keep-backup`。
+
+`verify` 模式同样会清理：它临时下载的内置 sqlite3 用完即删。
+
 ## 选项
 
 ```bash
 sudo bash unlock.sh install --prompt-unbind    # 解绑旧证书前交互确认
 sudo bash unlock.sh install --skip-agent       # 只换内核，Agent 保持原样
 sudo bash unlock.sh verify                     # 回读校验破解内核与已绑定授权
-sudo bash unlock.sh restore                    # 回滚到替换前的官方内核
+sudo bash unlock.sh restore                    # 回滚到替换前的官方内核（需 --keep-backup 留下的镜像）
+sudo bash unlock.sh install --keep-backup      # 保留旧二进制，之后可 restore
 ```
 
 - `--http-proxy URL`：设置本机网络代理（探测与下载都走它）。

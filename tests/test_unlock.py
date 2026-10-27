@@ -204,6 +204,63 @@ class BundledSqliteTests(unittest.TestCase):
             self.assertTrue(os.path.getsize(os.path.join(tmp, "b.db")) > 0)
 
 
+class CleanupTests(unittest.TestCase):
+    """成功后要清掉下载物、内置 sqlite3、库备份与旧二进制备份，只留证书。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.script = UNLOCK.read_text()
+        cls.fn = shell_function("cleanup_artifacts")
+
+    def run_cleanup(self, tmp, keep_backup=0):
+        paths = {
+            "RUN": os.path.join(tmp, "run.abc"),
+            "PREFLIGHT": os.path.join(tmp, "preflight"),
+            "PERSIST": os.path.join(tmp, "unlock"),
+            "BACKUP": os.path.join(tmp, "crack", "backup"),
+            "XPACK_DB": os.path.join(tmp, "xpack.db"),
+        }
+        for path in (paths["RUN"], paths["PREFLIGHT"],
+                     os.path.join(paths["PERSIST"], "tools"),
+                     paths["BACKUP"]):
+            os.makedirs(path, exist_ok=True)
+        open(os.path.join(paths["PERSIST"], "tools", "sqlite3mini"), "w").write("x")
+        open(os.path.join(paths["PERSIST"], "license.txt"), "w").write("cert")
+        open(paths["XPACK_DB"] + ".pre-license", "w").write("bak")
+        open(os.path.join(paths["BACKUP"], "1panel-core.previous"), "w").write("bin")
+        body = "\n".join("%s=%s" % (k, v) for k, v in paths.items())
+        body += "\nKEEP_BACKUP=%d\nlog() { :; }\ncleanup_artifacts\n" % keep_backup
+        return run_shell([self.fn], body)
+
+    def test_default_removes_downloads_and_backups(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.run_cleanup(tmp)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(os.path.exists(os.path.join(tmp, "run.abc")))
+            self.assertFalse(os.path.exists(os.path.join(tmp, "unlock", "tools")))
+            self.assertFalse(os.path.exists(os.path.join(tmp, "crack")))
+            self.assertFalse(os.path.exists(os.path.join(tmp, "xpack.db.pre-license")))
+            # 证书本身保留
+            self.assertTrue(os.path.exists(os.path.join(tmp, "unlock", "license.txt")))
+
+    def test_keep_backup_preserves_rollback_images(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.run_cleanup(tmp, keep_backup=1)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(os.path.exists(
+                os.path.join(tmp, "crack", "backup", "1panel-core.previous")))
+            self.assertFalse(os.path.exists(os.path.join(tmp, "unlock", "tools")))
+
+    def test_install_calls_cleanup_after_replacement(self):
+        replace = self.script.index('install -m 0755 "$RUN/core" "$CORE_BIN"')
+        cleanup = self.script.index("cleanup_artifacts\n", self.script.index("# 清理下载内容"))
+        self.assertLess(replace, cleanup)
+
+    def test_keep_backup_flag_is_documented(self):
+        self.assertIn("--keep-backup", self.script)
+        self.assertIn("KEEP_BACKUP=1", self.script)
+
+
 class VersionGateTests(unittest.TestCase):
     """升级后数据库版本还没迁移完时，门禁要认 1pctl 里的包版本。"""
 
