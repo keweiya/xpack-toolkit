@@ -14,6 +14,10 @@ set -euo pipefail
 umask 077
 REPO="${REPO:-keweiya/xpack-toolkit}"
 
+# 先定义日志/失败出口：下面的 root、架构检查在它们之前就要用。
+log() { printf '== %s\n' "$*"; }
+die() { printf '!! %s\n' "$*" >&2; exit 1; }
+
 # ---------------------------------------------------------------------------
 # 启动方式决定下载线路：`curl <前缀>https://raw.githubusercontent.com/.../unlock.sh | sudo bash`
 # 里如果套了加速前缀，就整轮沿用那个前缀，不再探测官方直连。
@@ -71,8 +75,6 @@ PERSIST="${UNLOCK_WORK:-$PANEL_ROOT/unlock}"
 OFFICIAL_BASE="https://resource.fit2cloud.com/1panel/package/v2/stable"
 MODE=install
 
-log() { printf '== %s\n' "$*"; }
-die() { printf '!! %s\n' "$*" >&2; exit 1; }
 trap 'printf "!! Failed; artifacts/backups retained: %s / %s\n" "$PERSIST" "$BACKUP" >&2' ERR
 
 PROGRESS="${PROGRESS:-auto}"
@@ -87,6 +89,49 @@ progress_bar_enabled() {
     auto) [ -t 2 ] ;;
     *) die "Invalid PROGRESS; expected auto, on or off" ;;
   esac
+}
+
+# ---------------------------------------------------------------------------
+# 运行时依赖：python3（标准库，无第三方包）
+#   · 读 core.db 判断已装版本、比较版本号
+#   · 生成企业版授权证书（AES/RSA + 三段式结构）并写入 xpack.db、绑定主节点
+#   · 校验 Release 资产 sha256 / ELF 架构、回读确认补丁
+# 缺它就直接在第一步炸掉（detect_installed_version），所以先自查并尝试自动装。
+# ---------------------------------------------------------------------------
+have_python3() { command -v python3 >/dev/null 2>&1; }
+
+install_python3() {
+  local PM=""
+  for PM in apt-get dnf yum apk zypper; do
+    command -v "$PM" >/dev/null 2>&1 && break
+    PM=""
+  done
+  [ -n "$PM" ] || return 1
+  log "Installing python3 via $PM"
+  case "$PM" in
+    apt-get)
+      DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3 >/dev/null 2>&1 || true ;;
+    dnf|yum) "$PM" install -y -q python3 >/dev/null 2>&1 || true ;;
+    apk) apk add --no-cache python3 >/dev/null 2>&1 || true ;;
+    zypper) zypper --non-interactive install -y python3 >/dev/null 2>&1 || true ;;
+  esac
+  have_python3
+}
+
+ensure_python3() {
+  if have_python3; then
+    python3 -c 'import sqlite3' >/dev/null 2>&1 \
+      || die "python3 is present but its sqlite3 module is missing; install python3-sqlite3 (or python3-full) and rerun"
+    return 0
+  fi
+  install_python3 || true
+  if ! have_python3; then
+    die "python3 (stdlib only) is required to generate the license and verify the kernel; install it and rerun, e.g. apt install -y python3"
+  fi
+  python3 -c 'import sqlite3' >/dev/null 2>&1 \
+    || die "python3 installed but its sqlite3 module is missing; install python3-sqlite3 (or python3-full) and rerun"
+  log "python3 ready: $(command -v python3) ($(python3 -V 2>&1))"
 }
 
 usage() {
@@ -494,6 +539,9 @@ backup_binary() {
 PREFLIGHT="$(mktemp -d "${TMPDIR:-/tmp}/xpack-preflight.XXXXXX")"
 trap 'rm -rf -- "$PREFLIGHT"' EXIT
 mkdir -p "$PERSIST" "$BACKUP"
+
+# restore 只用 shell 覆盖文件；install/verify 需要 python3，先自查再动手。
+[ "$MODE" = restore ] || ensure_python3
 
 if [ "$MODE" = restore ]; then
   CORE_ORIG="$BACKUP/1panel-core.previous"

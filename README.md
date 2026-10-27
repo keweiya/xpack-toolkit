@@ -23,6 +23,23 @@ curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/keweiya/xpack-to
 - 先存成文件再跑（没有 curl 命令行可读）→ 走「官方直连」那一支
 - 需要强制加速：`GH_MIRROR_FORCE=1 sudo -E bash unlock.sh install`；要换前缀：`GH_MIRROR=https://…/`
 
+## 前置依赖
+
+目标机需要 `python3`（只用标准库，无需第三方包）和 `sqlite3` 模块：
+
+- 脚本启动时自查，缺就按发行版自动装（`apt-get` / `dnf` / `yum` / `apk` / `zypper`）；
+- 装不上直接退出并说明原因，不会留下半成品。
+
+为什么预构建了破解内核还要 python：
+
+| 用途 | 位置 | 能否用 shell 替代 |
+| --- | --- | --- |
+| 读 `db/core.db` 的 `SystemVersion` 判断已装版本 | `detect_installed_version` | 需要 sqlite3 客户端 |
+| 生成企业版授权证书（AES + 三段式结构、写 `licenses` 表、绑定主节点） | `tools/gen_license.py` | 需要 openssl + sqlite3 命令行，依赖不比 python 少 |
+| 校验 Release 资产 sha256 / ELF 架构、回读确认补丁 | `tools/patch_core.py`、`patch_agent.py` | 需要解析 Go pclntab |
+
+Release 里的 `core` / `agent` 已经是打过补丁的成品，但授权证书是**按机器现场生成**（节点绑定、写库、离线签名），所以生成证书这一步必须在目标机上跑，而不是随资产下发。
+
 脚本自动完成：
 
 1. **版本检测与升级**：读取宿主机 1Panel 版本与仓库最高稳定 Release；若 Release 版本较新，先通过官方安装包把宿主机 1Panel 升级到与 Release 一致（数据库迁移随官方内核启动自动完成）。
