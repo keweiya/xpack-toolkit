@@ -310,6 +310,30 @@ class RestoreTests(unittest.TestCase):
             self.assertFalse(os.path.exists(backup), "backup should be removed after restore")
 
 
+class KvmHelperTests(unittest.TestCase):
+    """1panel-kvm 是 xpack VM 模块的 helper，面板启动会重新释放，删掉后要用目录占位。"""
+
+    def test_removes_binary_and_blocks_reextraction(self):
+        fn = shell_function("remove_kvm_helper")
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, "1panel-kvm")
+            Path(target).write_text("FAKE-KVM")
+            body = 'log() { :; }\nKVM_HELPER=%s\nremove_kvm_helper\n' % target
+            result = run_shell([fn], body)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(os.path.isdir(target), "helper path should be a directory placeholder")
+            # 幂等
+            again = run_shell([fn], body)
+            self.assertEqual(again.returncode, 0, again.stderr)
+            self.assertTrue(os.path.isdir(target))
+
+    def test_flag_is_wired(self):
+        script = UNLOCK.read_text()
+        self.assertIn("--remove-kvm-helper", script)
+        self.assertIn("REMOVE_KVM_HELPER=1", script)
+        self.assertIn("remove_kvm_helper", script)
+
+
 class VersionGateTests(unittest.TestCase):
     """升级后数据库版本还没迁移完时，门禁要认 1pctl 里的包版本。"""
 

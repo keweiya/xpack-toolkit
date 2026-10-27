@@ -89,6 +89,34 @@ arm64 的 sha 目前留空：arm64 机器若没有系统 sqlite3，则只生成�
 
 `verify` 模式同样会清理：它临时下载的内置 sqlite3 用完即删。
 
+## 关于 `/usr/local/bin/1panel-kvm`
+
+这是 1Panel v2 **KVM 虚拟机模块**（xpack 专业版功能）的 helper 二进制：Go + cgo 链接 libvirt，负责虚拟机的创建/启动/快照/磁盘操作，由面板从自身内嵌资源里释放出来。
+
+日志里能看到它的来源：
+
+```
+[xpack] embedded kvm helper synced: /usr/local/bin/1panel-kvm
+[xpack] skip VM resource sync on startup: kvm not found      # 指 /dev/kvm 设备，不是这个文件
+```
+
+**直接 `rm` 没用**：面板每次启动都会重新释放。要彻底去掉，删掉后放一个同名目录占位，让释放动作写不进去：
+
+```bash
+systemctl stop 1panel-agent
+rm -f /usr/local/bin/1panel-kvm
+mkdir -p /usr/local/bin/1panel-kvm
+systemctl start 1panel-agent
+```
+
+或者装的时候直接带参数，脚本会顺手做掉：
+
+```bash
+sudo bash unlock.sh install --remove-kvm-helper
+```
+
+代价是 VM 模块不可用（本来也需要宿主机 `/dev/kvm` 才能跑），启动日志会多一行 `[xpack] sync embedded kvm helper failed`。面板其余功能不受影响。
+
 ## 选项
 
 ```bash
