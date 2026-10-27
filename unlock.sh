@@ -43,7 +43,8 @@ detect_bootstrap_route() {
     case "$comm" in curl|wget) ;; *) continue ;; esac
     while IFS= read -r -d '' arg; do
       case "$arg" in
-        http://*unlock.sh|https://*unlock.sh) found="$arg" ;;
+        # 允许带 ?v=… 缓存穿透参数：raw.githubusercontent 对分支 URL 有 5 分钟 CDN 缓存。
+        http://*unlock.sh*|https://*unlock.sh*) found="${arg%%\?*}" ;;
       esac
     done < "$pid/cmdline" 2>/dev/null || true
     [ -n "$found" ] && break
