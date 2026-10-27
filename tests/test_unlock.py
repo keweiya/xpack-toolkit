@@ -224,10 +224,10 @@ class CleanupTests(unittest.TestCase):
                      os.path.join(paths["PERSIST"], "tools"),
                      paths["BACKUP"]):
             os.makedirs(path, exist_ok=True)
-        open(os.path.join(paths["PERSIST"], "tools", "sqlite3mini"), "w").write("x")
-        open(os.path.join(paths["PERSIST"], "license.txt"), "w").write("cert")
-        open(paths["XPACK_DB"] + ".pre-license", "w").write("bak")
-        open(os.path.join(paths["BACKUP"], "1panel-core.previous"), "w").write("bin")
+        Path(paths["PERSIST"], "tools", "sqlite3mini").write_text("x")
+        Path(paths["PERSIST"], "license.txt").write_text("cert")
+        Path(paths["XPACK_DB"] + ".pre-license").write_text("bak")
+        Path(paths["BACKUP"], "1panel-core.previous").write_text("bin")
         body = "\n".join("%s=%s" % (k, v) for k, v in paths.items())
         body += "\nKEEP_BACKUP=%d\nlog() { :; }\ncleanup_artifacts\n" % keep_backup
         return run_shell([self.fn], body)
@@ -240,8 +240,8 @@ class CleanupTests(unittest.TestCase):
             self.assertFalse(os.path.exists(os.path.join(tmp, "unlock", "tools")))
             self.assertFalse(os.path.exists(os.path.join(tmp, "crack")))
             self.assertFalse(os.path.exists(os.path.join(tmp, "xpack.db.pre-license")))
-            # 证书本身保留
-            self.assertTrue(os.path.exists(os.path.join(tmp, "unlock", "license.txt")))
+            # 证书文件与状态标记也一并清掉，工作目录不留空壳
+            self.assertFalse(os.path.exists(os.path.join(tmp, "unlock")))
 
     def test_keep_backup_preserves_rollback_images(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -308,30 +308,6 @@ class RestoreTests(unittest.TestCase):
             self.assertEqual(run.returncode, 0, run.stderr)
             self.assertEqual(Path(core).read_text(), "ORIG-CORE")
             self.assertFalse(os.path.exists(backup), "backup should be removed after restore")
-
-
-class KvmHelperTests(unittest.TestCase):
-    """1panel-kvm 是 xpack VM 模块的 helper，面板启动会重新释放，删掉后要用目录占位。"""
-
-    def test_removes_binary_and_blocks_reextraction(self):
-        fn = shell_function("remove_kvm_helper")
-        with tempfile.TemporaryDirectory() as tmp:
-            target = os.path.join(tmp, "1panel-kvm")
-            Path(target).write_text("FAKE-KVM")
-            body = 'log() { :; }\nKVM_HELPER=%s\nremove_kvm_helper\n' % target
-            result = run_shell([fn], body)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertTrue(os.path.isdir(target), "helper path should be a directory placeholder")
-            # 幂等
-            again = run_shell([fn], body)
-            self.assertEqual(again.returncode, 0, again.stderr)
-            self.assertTrue(os.path.isdir(target))
-
-    def test_flag_is_wired(self):
-        script = UNLOCK.read_text()
-        self.assertIn("--remove-kvm-helper", script)
-        self.assertIn("REMOVE_KVM_HELPER=1", script)
-        self.assertIn("remove_kvm_helper", script)
 
 
 class VersionGateTests(unittest.TestCase):

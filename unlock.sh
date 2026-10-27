@@ -435,14 +435,12 @@ usage() {
     '  --skip-agent                Replace only the core, keep the current agent' \
     '  --prompt-unbind             Prompt before releasing an existing master binding' \
     '  --keep-backup               Keep the pre-replacement binaries (default: deleted on success)' \
-    '  --remove-kvm-helper         Delete /usr/local/bin/1panel-kvm and block the panel from re-extracting it' \
     '  --help                      Show this help'
 }
 
 SKIP_AGENT=0
 PROMPT_UNBIND=0
 KEEP_BACKUP=0
-REMOVE_KVM_HELPER=0
 MODE_SET=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -458,7 +456,6 @@ while [ "$#" -gt 0 ]; do
     --skip-agent) SKIP_AGENT=1 ;;
     --prompt-unbind) PROMPT_UNBIND=1 ;;
     --keep-backup) KEEP_BACKUP=1 ;;
-    --remove-kvm-helper) REMOVE_KVM_HELPER=1 ;;
     --help|-h) usage; exit 0 ;;
     *) usage >&2; die "Unknown installation argument" ;;
   esac
@@ -815,8 +812,10 @@ backup_binary() {
 #   · --keep-backup 可保留 $BACKUP，用于 bash unlock.sh restore 回滚
 # ---------------------------------------------------------------------------
 cleanup_artifacts() {
-  local removed=0
-  for path in "$RUN" "$PREFLIGHT" "$PERSIST/tools"; do
+  # 只删脚本自己下载/生成的东西；面板自身文件与第三方文件一概不动。
+  local removed=0 path
+  for path in "$RUN" "$PREFLIGHT" "$PERSIST/tools" \
+              "$PERSIST/license.txt" "$PERSIST/license.status"; do
     [ -e "$path" ] || continue
     rm -rf -- "$path" && removed=$((removed + 1))
   done
@@ -833,42 +832,14 @@ cleanup_artifacts() {
     [ -d "$BACKUP" ] && log "Pre-replacement binaries kept in $BACKUP (rollback: bash unlock.sh restore)"
   elif [ -e "$BACKUP" ]; then
     rm -rf -- "$BACKUP" && removed=$((removed + 1))
-    # 顺带清掉空的父目录（$PANEL_ROOT/crack），不留空壳
     rmdir -- "$(dirname "$BACKUP")" 2>/dev/null || true
     log "Pre-replacement binaries removed; rollback images are gone"
   fi
-  if [ -f "$PERSIST/license.txt" ]; then
-    log "Cleaned $removed artifact path(s); kept $PERSIST/license.txt"
-  else
-    log "Cleaned $removed artifact path(s)"
-  fi
+  # 工作目录空了就一并删掉，不留空壳
+  rmdir -- "$PERSIST" 2>/dev/null || true
+  log "Cleaned $removed artifact path(s); nothing left behind"
 }
 
-# ---------------------------------------------------------------------------
-# 1Panel v2 的 KVM 虚拟机模块（xpack）helper
-#   · 面板启动时把内嵌的 helper 释放到 /usr/local/bin/1panel-kvm
-#     （日志：[xpack] embedded kvm helper synced: ...）
-#   · 直接 rm 会在下次启动被重新释放，所以这里删掉后放一个同名目录占位，
-#     让释放动作写不进去；VM 模块本来也需要 /dev/kvm 才能用
-# ---------------------------------------------------------------------------
-KVM_HELPER="${KVM_HELPER:-/usr/local/bin/1panel-kvm}"
-
-remove_kvm_helper() {
-  local blocked=0
-  if [ -f "$KVM_HELPER" ]; then
-    rm -f -- "$KVM_HELPER" && log "Removed $KVM_HELPER"
-  fi
-  if [ ! -e "$KVM_HELPER" ]; then
-    mkdir -p -- "$KVM_HELPER" && blocked=1
-  elif [ -d "$KVM_HELPER" ]; then
-    blocked=1
-  fi
-  if [ "$blocked" = 1 ]; then
-    log "Blocked re-extraction: $KVM_HELPER is now a directory (VM module stays disabled)"
-  else
-    log "Could not block $KVM_HELPER; the panel may re-create it on next start"
-  fi
-}
 
 # ---------------------------------------------------------------------------
 # 主流程
@@ -1093,9 +1064,6 @@ fi
 
 log "Kernel replaced (all license checks removed)"
 log "Third-party certificates preserved; any prior master binding was released first"
-
-# 可选：移除 KVM 虚拟机 helper（xpack 模块，需要 /dev/kvm）
-[ "$REMOVE_KVM_HELPER" = 1 ] && remove_kvm_helper
 
 # 清理下载内容、内置 sqlite3、临时目录与备份（--keep-backup 可保留回滚镜像）
 cleanup_artifacts
