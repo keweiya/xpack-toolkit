@@ -46,21 +46,66 @@ CONTAINER_PORT = 9999
 
 BASE_IMAGE = "ubuntu:24.04"
 
-DOCKERFILE = """FROM ubuntu:24.04
-ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update \\
- && apt-get install -y --no-install-recommends ca-certificates tzdata procps \\
- && rm -rf /var/lib/apt/lists/*
-COPY core /usr/local/bin/1panel-core
-COPY agent /usr/local/bin/1panel-agent
-COPY 1pctl /usr/local/bin/1pctl
-COPY entrypoint.sh /entrypoint.sh
-RUN chmod 755 /usr/local/bin/1panel-core /usr/local/bin/1panel-agent \\
-        /usr/local/bin/1pctl /entrypoint.sh \\
- && mkdir -p /opt/1panel /etc/1panel
-EXPOSE 9999
-ENTRYPOINT ["/entrypoint.sh"]
-"""
+# 基础镜像里已有 procps（ps/pgrep/top/free），缺的只有 tzdata 与 ca-certificates。
+# 这两样在跑冒烟的宿主机上本来就有，直接拷进镜像，构建期就完全不碰 Ubuntu 源：
+# runner 上 `apt-get update` 曾在构建网络命名空间里整段 exit 100（68s 后失败），
+# 把接口冒烟这条门禁卡死在一个跟被测对象无关的环节上。
+ZONEINFO_DIR = Path("/usr/share/zoneinfo")
+CA_BUNDLE = Path("/etc/ssl/certs/ca-certificates.crt")
+
+# 宿主机两样都缺时（例如 macOS 上跑冒烟）才回落到 apt：先试 Azure 内网镜像
+# （GitHub runner 与它同云，最快最稳），再回落到公共源，每一步都带重试。
+APT_MIRRORS = ("azure.archive.ubuntu.com", "archive.ubuntu.com")
+
+
+def _apt_step(packages):
+    """宿主机缺运行时文件时的兜底安装步骤：镜像轮换 + 重试，失败才整体失败。"""
+    return (
+        "RUN set -eu; \\\n"
+        "    for mirror in {mirrors}; do \\\n"
+        "        sed -i -E \"s#https?://[^/ ]+/ubuntu#http://$mirror/ubuntu#g\""
+        " /etc/apt/sources.list.d/ubuntu.sources; \\\n"
+        "        if apt-get update -o Acquire::Retries=3 \\\n"
+        "           && apt-get install -y --no-install-recommends {packages}; then \\\n"
+        "            rm -rf /var/lib/apt/lists/*; \\\n"
+        "            exit 0; \\\n"
+        "        fi; \\\n"
+        "        echo \"!! apt via $mirror failed, next mirror\"; \\\n"
+        "        rm -rf /var/lib/apt/lists/*; \\\n"
+        "    done; \\\n"
+        "    echo \"!! every Ubuntu mirror failed\" >&2; \\\n"
+        "    exit 1"
+    ).format(mirrors=" ".join(APT_MIRRORS), packages=packages)
+
+
+def render_dockerfile(extras=()):
+    """冒烟镜像的 Dockerfile：宿主机已有的运行时文件走 COPY，缺的才走 apt。"""
+    lines = ["FROM " + BASE_IMAGE, "ENV DEBIAN_FRONTEND=noninteractive"]
+    missing = []
+    if "zoneinfo" in extras:
+        lines.append("COPY zoneinfo /usr/share/zoneinfo/")
+    else:
+        missing.append("tzdata")
+    if "cacerts" in extras:
+        lines.append("COPY ca-certificates.crt /etc/ssl/certs/ca-certificates.crt")
+    else:
+        missing.append("ca-certificates")
+    if missing:
+        lines.append(_apt_step(" ".join(missing)))
+    lines += [
+        "COPY core /usr/local/bin/1panel-core",
+        "COPY agent /usr/local/bin/1panel-agent",
+        "COPY 1pctl /usr/local/bin/1pctl",
+        "COPY entrypoint.sh /entrypoint.sh",
+        "RUN chmod 755 /usr/local/bin/1panel-core /usr/local/bin/1panel-agent \\",
+        "        /usr/local/bin/1pctl /entrypoint.sh \\",
+        " && mkdir -p /opt/1panel /etc/1panel",
+        "EXPOSE 9999",
+        'ENTRYPOINT ["/entrypoint.sh"]',
+        "",
+    ]
+    return "\n".join(lines)
+
 
 # core 启动时会创建 /etc/1panel/.1panel，agent 依赖它，所以必须先起 core。
 ENTRYPOINT = """#!/bin/sh
@@ -202,15 +247,43 @@ def extract_1pctl(package):
     raise SmokeError("1pctl not found in official package: " + str(package))
 
 
+def stage_runtime_extras(context):
+    """把宿主机已有的 tzdata / 根证书拷进构建上下文，让镜像构建不依赖网络。"""
+    extras = []
+    if (ZONEINFO_DIR / "UTC").is_file():
+        shutil.copytree(ZONEINFO_DIR, context / "zoneinfo", symlinks=True)
+        extras.append("zoneinfo")
+    else:
+        print("== 宿主机没有 {}，冒烟镜像回落到 apt 装 tzdata".format(ZONEINFO_DIR), flush=True)
+    if CA_BUNDLE.is_file() and CA_BUNDLE.stat().st_size > 0:
+        shutil.copyfile(CA_BUNDLE, context / "ca-certificates.crt")
+        extras.append("cacerts")
+    else:
+        print("== 宿主机没有 {}，冒烟镜像回落到 apt 装 ca-certificates".format(CA_BUNDLE), flush=True)
+    return extras
+
+
 def build_image(context, tag, arch="amd64"):
     platform = "linux/" + arch
     print("== building smoke image {} ({})".format(tag, platform), flush=True)
     # 同一台机器先后跑 amd64 / arm64 时，基础镜像 tag 会被另一次 pull 覆盖，
     # 所以按平台重新 pull，并禁用层缓存，避免命中另一架构的中间层。
-    subprocess.run(["docker", "pull", "-q", "--platform", platform, BASE_IMAGE],
-                   text=True, capture_output=True)
-    run(["docker", "build", "-q", "--no-cache", "--platform", platform,
-         "-t", tag, str(context)], timeout=1800)
+    pulled = subprocess.run(["docker", "pull", "-q", "--platform", platform, BASE_IMAGE],
+                            text=True, capture_output=True)
+    if pulled.returncode != 0:
+        reason = (pulled.stderr or pulled.stdout or "").strip().splitlines()
+        print("== 基础镜像 pull 失败，改用本地缓存继续：{}".format(reason[-1] if reason else "(无输出)"),
+              flush=True)
+    # --network=host：RUN 只借宿主机的 DNS/出口，免得 BuildKit 自带网络命名空间解析不了源。
+    # 失败时把最后几十行构建输出打出来，别让 apt 的具体报错淹在 -q 里。
+    result = subprocess.run(
+        ["docker", "build", "--no-cache", "--network=host", "--platform", platform,
+         "-t", tag, str(context)],
+        text=True, capture_output=True)
+    if result.returncode != 0:
+        output = (result.stderr or result.stdout or "").strip().splitlines()
+        raise SmokeError("docker build failed ({}):\n{}".format(tag, "\n".join(output[-40:])))
+    return result.stdout
 
 
 class Panel:
@@ -497,9 +570,12 @@ def prepare_context(release, package, arch, workdir):
     stage_agent(release, arch, context / "agent")
     (context / "1pctl").write_text(patch_1pctl(extract_1pctl(package), CONTAINER_PORT))
     (context / "entrypoint.sh").write_text(ENTRYPOINT)
-    (context / "Dockerfile").write_text(DOCKERFILE)
+    extras = stage_runtime_extras(context)
+    (context / "Dockerfile").write_text(render_dockerfile(extras))
     for name in ("core", "agent", "1pctl", "entrypoint.sh"):
         (context / name).chmod(0o755)
+    print("== 镜像构建期运行时文件：{}".format(
+        ", ".join(extras) if extras else "全部走 apt（宿主机没有 zoneinfo/根证书）"), flush=True)
     return context
 
 

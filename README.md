@@ -246,7 +246,7 @@ amd64 的代码模式表允许一个站点挂多组候选 `((orig, patch), ...)`
 2. **单测**——`python3 -m unittest discover -s tests`。
 3. **构建**（`tools/release.py --build-only`）——按 SHA 校验官方包后逐平台打补丁，不发布。
 4. **资产自检**（`tools/verify_release.py`）——manifest 大小/哈希与实际文件一致、内核 8/8 补丁已打、Agent 原件能完整复现 8/8、等长覆盖不改体积。
-5. **接口冒烟**（`tools/smoke_test.py`，需 root/sudo：容器内面板以 root 建库，`db` 目录 0700，冒烟直接使用 Release 里发布的那两个二进制）——**只在 Docker 容器里跑**，绝不碰宿主机的 1Panel，`amd64` / `arm64` 各跑一遍（arm64 走 qemu 模拟）：启动面板 → 登录 → 自制证书上传（官方内核此处失败、破解内核通过）→ 落库绑定 → `licenses/master/status` 为 `Bound`、节点 `isXpack=true` → 专业版接口放行。
+5. **接口冒烟**（`tools/smoke_test.py`，需 root/sudo：容器内面板以 root 建库，`db` 目录 0700，冒烟直接使用 Release 里发布的那两个二进制）——**只在 Docker 容器里跑**，绝不碰宿主机的 1Panel，`amd64` / `arm64` 各跑一遍（arm64 走 qemu 模拟）：启动面板 → 登录 → 自制证书上传（官方内核此处失败、破解内核通过）→ 落库绑定 → `licenses/master/status` 为 `Bound`、节点 `isXpack=true` → 专业版接口放行。冒烟镜像构建**不碰 Ubuntu 源**：宿主机已有的 tzdata 与根证书直接 COPY 进镜像（基础镜像自带 `procps`），只有宿主机缺这两样时才回落到 apt，且先试 Azure 内网镜像再试公共源——`apt-get update` 曾在 runner 的构建网络里整段 `exit 100`，把这条门禁卡在跟被测内核无关的环节上。
 6. **发布**——前 5 步全绿才执行 `release.py --publish`，原子替换同名 Release。
 
 `build.yml` 是唯一一条发布流水线，既能手动触发（`workflow_dispatch`，版本号由人填），也被 `upstream-watch.yml` 通过 `uses:` 复用（`workflow_call`），两边跑的是完全相同的门禁步骤。

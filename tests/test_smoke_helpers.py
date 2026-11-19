@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tools"))
@@ -79,6 +80,55 @@ class FailureMarkerTest(unittest.TestCase):
     def test_unrelated_error_is_not_a_cert_failure(self):
         self.assertFalse(any(marker in "服务内部错误: 许可证格式错误，请检查后重试！"
                              for marker in smoke.CERT_FAILURE_MARKERS))
+
+
+class DockerfileTest(unittest.TestCase):
+    def test_host_extras_keep_build_offline(self):
+        text = smoke.render_dockerfile(("zoneinfo", "cacerts"))
+        self.assertIn("COPY zoneinfo /usr/share/zoneinfo/\n", text)
+        self.assertIn("COPY ca-certificates.crt /etc/ssl/certs/ca-certificates.crt\n", text)
+        self.assertNotIn("apt-get", text)
+
+    def test_missing_extras_fall_back_to_mirrored_apt(self):
+        text = smoke.render_dockerfile()
+        self.assertIn("for mirror in azure.archive.ubuntu.com archive.ubuntu.com", text)
+        self.assertIn("Acquire::Retries=3", text)
+        self.assertIn("--no-install-recommends tzdata ca-certificates", text)
+        # ubuntu:24.04 自带 procps，不该再装一遍
+        self.assertNotIn("procps", text)
+
+    def test_partial_extras_only_install_the_missing_package(self):
+        text = smoke.render_dockerfile(("zoneinfo",))
+        self.assertIn("COPY zoneinfo /usr/share/zoneinfo/\n", text)
+        self.assertIn("--no-install-recommends ca-certificates", text)
+        self.assertNotIn("tzdata", text)
+
+
+class BuildImageTest(unittest.TestCase):
+    def test_build_uses_host_network_and_keeps_logs(self):
+        commands = []
+
+        def fake_run(command, **kwargs):
+            commands.append(command)
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with mock.patch.object(smoke.subprocess, "run", fake_run):
+            smoke.build_image(Path("/tmp/ctx"), "tag:1", "arm64")
+        build = commands[-1]
+        self.assertIn("--network=host", build)
+        self.assertNotIn("-q", build)
+        self.assertIn("linux/arm64", build)
+
+    def test_build_failure_surfaces_last_lines(self):
+        def fake_run(command, **kwargs):
+            if command[1] == "build":
+                return subprocess.CompletedProcess(command, 1, "", "step 1/5\nE: boom\nERROR: exit code 100")
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with mock.patch.object(smoke.subprocess, "run", fake_run):
+            with self.assertRaises(smoke.SmokeError) as raised:
+                smoke.build_image(Path("/tmp/ctx"), "tag:1")
+        self.assertIn("exit code 100", str(raised.exception))
 
 
 if __name__ == "__main__":
